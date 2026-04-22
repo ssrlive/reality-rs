@@ -15,8 +15,9 @@ pub use crate::webpki::{
 
 pub(crate) mod config;
 pub use config::{
-    CipherSuiteSelector, ClientHello, InvalidSniPolicy, PreferClientOrder, PreferServerOrder,
-    ServerConfig, ServerCredentialResolver, StoresServerSessions, WantsServerCert,
+    CipherSuiteSelector, ClientHello, ClientHelloVerifier, InvalidSniPolicy, PreferClientOrder,
+    PreferServerOrder, ServerConfig, ServerCredentialResolver, StoresServerSessions,
+    WantsServerCert,
 };
 
 mod connection;
@@ -41,11 +42,10 @@ pub(crate) use tls13::TLS13_HANDLER;
 use tls13::Tls13ServerSessionValue;
 
 /// Dangerous configuration that should be audited and used with extreme care.
-pub mod danger {
-    pub use crate::verify::{
-        ClientIdentity, ClientVerifier, PeerVerified, SignatureVerificationInput,
-    };
-}
+pub use config::danger;
+
+mod reality;
+pub use reality::RealityClientHello;
 
 #[cfg(test)]
 mod test;

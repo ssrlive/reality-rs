@@ -48,6 +48,8 @@ use rustls::{Tls12CipherSuite, Tls13CipherSuite};
 
 /// Hybrid public key encryption (HPKE).
 pub mod hpke;
+/// REALITY session ID sealing helpers.
+pub mod reality;
 /// Using software keys for authentication.
 pub mod sign;
 use sign::{EcdsaSigner, Ed25519Signer, RsaSigningKey};
@@ -355,21 +357,6 @@ pub static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
     kx_group::MLKEM768,
     kx_group::MLKEM1024,
 ];
-
-/// Compatibility shims between ring 0.16.x and 0.17.x API
-mod ring_shim {
-    use aws_lc_rs::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey};
-    use rustls::crypto::kx::SharedSecret;
-
-    pub(super) fn agree_ephemeral(
-        priv_key: EphemeralPrivateKey,
-        peer_key: &UnparsedPublicKey<&[u8]>,
-    ) -> Result<SharedSecret, ()> {
-        agreement::agree_ephemeral(priv_key, peer_key, (), |secret| {
-            Ok(SharedSecret::from(secret))
-        })
-    }
-}
 
 /// Are we in FIPS mode?
 fn fips() -> FipsStatus {

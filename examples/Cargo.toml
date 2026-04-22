@@ -17,8 +17,13 @@ rustls = { path = "../rustls", features = ["log"] }
 rustls-aws-lc-rs = { path = "../rustls-aws-lc-rs" }
 rustls-util = { path = "../rustls-util" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
+toml = "0.8"
 webpki-roots = { workspace = true }
+
+[dev-dependencies]
+aws-lc-rs = { workspace = true, features = ["prebuilt-nasm"] }
 
 [lints]
 workspace = true

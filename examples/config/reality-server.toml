@@ -1,0 +1,14 @@
+[reality]
+shortId = "aabbcc"
+privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
+version = "010203"
+serverNames = ["test"]
+fallbackAddress = "::1"
+fallbackPort = 9446
+
+[[reality.fallbackRules]]
+serverNames = ["decoy.example"]
+alpns = ["http/1.1"]
+namedGroups = ["x25519"]
+fallbackAddress = "::1"
+fallbackPort = 9447

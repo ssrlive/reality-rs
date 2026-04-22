@@ -4,17 +4,24 @@ use alloc::vec::Vec;
 use core::hash::Hasher;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::vec;
 
 use pki_types::{CertificateDer, FipsStatus, ServerName, UnixTime};
 
 use super::{Tls12Session, Tls13ClientSessionInput, Tls13Session};
-use crate::client::{ClientConfig, Resumption, Tls12Resumption};
+use crate::client::{
+    ClientConfig, ClientHelloCallback, ClientHelloCallbackContext,
+    PlaintextRealitySessionIdGenerator, RealityClientHello, RealitySessionIdGenerator,
+    RealitySessionIdSealer, Resumption, SealingRealitySessionIdGenerator, Tls12Resumption,
+};
 use crate::crypto::cipher::{EncodedMessage, MessageEncrypter, Payload};
 use crate::crypto::kx::{self, NamedGroup, SharedSecret, StartedKeyExchange, SupportedKxGroup};
-use crate::crypto::test_provider::FakeKeyExchangeGroup;
+use crate::crypto::test_provider::{
+    FAKE_HMAC, FakeKeyExchangeGroup, REALITY_AUTH_KEY, REALITY_SERVER_PUB_KEY,
+};
 use crate::crypto::tls13::OkmBlock;
+use crate::crypto::tls13::{Hkdf, HkdfUsingHmac};
 use crate::crypto::{
     CipherSuite, Credentials, CryptoProvider, Identity, SignatureScheme, SingleCredential,
     TEST_PROVIDER, tls12_only, tls13_only, tls13_suite,
@@ -32,6 +39,7 @@ use crate::msgs::{
 use crate::pki_types::PrivateKeyDer;
 use crate::pki_types::pem::PemObject;
 use crate::sync::Arc;
+use crate::time_provider::TimeProvider;
 use crate::tls13::key_schedule::{derive_traffic_iv, derive_traffic_key};
 use crate::verify::{
     HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
@@ -757,6 +765,297 @@ fn client_hello_sent_for_config(config: ClientConfig) -> Result<ClientHelloPaylo
         } => Ok(ch),
         other => panic!("unexpected message {other:?}"),
     }
+}
+
+#[derive(Debug, Default)]
+struct RecordingClientHelloCallback {
+    invoked: AtomicBool,
+    saw_key_share: AtomicBool,
+    saw_raw_client_hello: AtomicBool,
+}
+
+impl ClientHelloCallback for RecordingClientHelloCallback {
+    fn modify_client_hello(&self, hello: &mut ClientHelloCallbackContext<'_>) -> Result<(), Error> {
+        self.invoked
+            .store(true, Ordering::SeqCst);
+        assert!(!hello.is_retry());
+        match hello.server_name() {
+            ServerName::DnsName(name) => assert_eq!(name.as_ref(), "localhost"),
+            other => panic!("unexpected server name {other:?}"),
+        }
+        let active_key_exchange = hello
+            .active_key_exchange()
+            .expect("missing key share");
+        assert!(!active_key_exchange.pub_key().is_empty());
+        let raw_client_hello = hello
+            .raw_client_hello()
+            .expect("missing raw client hello");
+        assert_eq!(&raw_client_hello[39..71], &[0u8; 32]);
+        self.saw_raw_client_hello
+            .store(true, Ordering::SeqCst);
+        self.saw_key_share
+            .store(true, Ordering::SeqCst);
+        hello.set_session_id(&[0x5a; 32])
+    }
+
+    fn hash_config(&self, h: &mut dyn Hasher) {
+        h.write(&[0x5a]);
+    }
+}
+
+#[test]
+fn test_client_hello_callback_can_override_session_id() {
+    let callback = Arc::new(RecordingClientHelloCallback::default());
+    let mut config = ClientConfig::builder(Arc::new(tls13_only(TEST_PROVIDER.clone())))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    config
+        .dangerous()
+        .set_client_hello_callback(Some(callback.clone()));
+
+    let ch = client_hello_sent_for_config(config).unwrap();
+
+    assert!(callback.invoked.load(Ordering::SeqCst));
+    assert!(
+        callback
+            .saw_key_share
+            .load(Ordering::SeqCst)
+    );
+    assert!(
+        callback
+            .saw_raw_client_hello
+            .load(Ordering::SeqCst)
+    );
+    assert_eq!(ch.session_id.as_ref(), &[0x5a; 32]);
+}
+
+#[derive(Debug, Default)]
+struct RecordingRealitySessionIdGenerator {
+    invoked: AtomicBool,
+    saw_key_share: AtomicBool,
+}
+
+impl RealitySessionIdGenerator for RecordingRealitySessionIdGenerator {
+    fn generate_session_id(&self, hello: &RealityClientHello<'_>) -> Result<[u8; 32], Error> {
+        self.invoked
+            .store(true, Ordering::SeqCst);
+        assert!(!hello.is_retry());
+        match hello.server_name() {
+            ServerName::DnsName(name) => assert_eq!(name.as_ref(), "localhost"),
+            other => panic!("unexpected server name {other:?}"),
+        }
+        assert!(
+            !hello
+                .active_key_exchange()
+                .pub_key()
+                .is_empty()
+        );
+        assert_eq!(
+            &hello
+                .raw_client_hello()
+                .expect("missing raw client hello")[39..71],
+            &[0u8; 32]
+        );
+        self.saw_key_share
+            .store(true, Ordering::SeqCst);
+        Ok([0xa5; 32])
+    }
+
+    fn hash_config(&self, h: &mut dyn Hasher) {
+        h.write(&[0xa5]);
+    }
+}
+
+#[test]
+fn test_reality_session_id_generator_sets_session_id() {
+    let generator = Arc::new(RecordingRealitySessionIdGenerator::default());
+    let mut config = ClientConfig::builder(Arc::new(tls13_only(TEST_PROVIDER.clone())))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    config
+        .dangerous()
+        .set_reality_session_id_generator(Some(generator.clone()));
+
+    let ch = client_hello_sent_for_config(config).unwrap();
+
+    assert!(generator.invoked.load(Ordering::SeqCst));
+    assert!(
+        generator
+            .saw_key_share
+            .load(Ordering::SeqCst)
+    );
+    assert_eq!(ch.session_id.as_ref(), &[0xa5; 32]);
+}
+
+#[derive(Debug, Default)]
+struct ExtractingRealitySessionIdGenerator {
+    invoked: AtomicBool,
+}
+
+impl RealitySessionIdGenerator for ExtractingRealitySessionIdGenerator {
+    fn generate_session_id(&self, hello: &RealityClientHello<'_>) -> Result<[u8; 32], Error> {
+        self.invoked
+            .store(true, Ordering::SeqCst);
+        let reality_key = hello
+            .extract_reality_key(REALITY_SERVER_PUB_KEY)
+            .expect("missing reality key");
+        assert_eq!(reality_key.as_slice(), REALITY_AUTH_KEY);
+
+        let mut session_id = [0u8; 32];
+        session_id[..REALITY_AUTH_KEY.len()].copy_from_slice(REALITY_AUTH_KEY);
+        Ok(session_id)
+    }
+}
+
+#[test]
+fn test_reality_generator_can_extract_reality_key() {
+    let generator = Arc::new(ExtractingRealitySessionIdGenerator::default());
+    let mut config = ClientConfig::builder(Arc::new(tls13_only(TEST_PROVIDER.clone())))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    config
+        .dangerous()
+        .set_reality_session_id_generator(Some(generator.clone()));
+
+    let ch = client_hello_sent_for_config(config).unwrap();
+
+    assert!(generator.invoked.load(Ordering::SeqCst));
+    assert_eq!(
+        &ch.session_id.as_ref()[..REALITY_AUTH_KEY.len()],
+        REALITY_AUTH_KEY
+    );
+}
+
+#[derive(Debug, Default)]
+struct RecordingRealitySealer {
+    observed_key: Mutex<Option<Vec<u8>>>,
+    observed_nonce: Mutex<Option<[u8; 12]>>,
+    observed_plaintext: Mutex<Option<[u8; 16]>>,
+    observed_aad_len: Mutex<Option<usize>>,
+}
+
+impl RealitySessionIdSealer for RecordingRealitySealer {
+    fn seal(
+        &self,
+        key: &[u8],
+        nonce: &[u8; 12],
+        aad: &[u8],
+        plaintext: &[u8; 16],
+    ) -> Result<[u8; 32], Error> {
+        *self.observed_key.lock().unwrap() = Some(key.to_vec());
+        *self.observed_nonce.lock().unwrap() = Some(*nonce);
+        *self.observed_plaintext.lock().unwrap() = Some(*plaintext);
+        *self.observed_aad_len.lock().unwrap() = Some(aad.len());
+        assert_eq!(&aad[39..71], &[0u8; 32]);
+        Ok([0x33; 32])
+    }
+
+    fn hash_config(&self, h: &mut dyn Hasher) {
+        h.write(&[0x33]);
+    }
+}
+
+#[derive(Debug)]
+struct FixedTimeProvider(UnixTime);
+
+impl TimeProvider for FixedTimeProvider {
+    fn current_time(&self) -> Option<UnixTime> {
+        Some(self.0)
+    }
+}
+
+#[test]
+fn test_sealing_reality_generator_derives_key_and_seals_session_id() {
+    let sealer = Arc::new(RecordingRealitySealer::default());
+    let generator = Arc::new(
+        SealingRealitySessionIdGenerator::new(
+            [1, 2, 3],
+            &[0xaa, 0xbb, 0xcc],
+            REALITY_SERVER_PUB_KEY.to_vec(),
+            Arc::new(FixedTimeProvider(UnixTime::since_unix_epoch(
+                Duration::from_secs(0x01020304),
+            ))),
+            FAKE_HMAC,
+            sealer.clone(),
+        )
+        .unwrap(),
+    );
+    let mut config = ClientConfig::builder(Arc::new(tls13_only(TEST_PROVIDER.clone())))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    config
+        .dangerous()
+        .set_reality_session_id_generator(Some(generator));
+
+    let ch = client_hello_sent_for_config(config).unwrap();
+
+    assert_eq!(ch.session_id.as_ref(), &[0x33; 32]);
+
+    let expander =
+        HkdfUsingHmac(FAKE_HMAC).extract_from_secret(Some(&ch.random.0[..20]), REALITY_AUTH_KEY);
+    let mut expected_key = vec![0u8; REALITY_AUTH_KEY.len()];
+    expander
+        .expand_slice(&[b"REALITY"], &mut expected_key)
+        .unwrap();
+    assert_eq!(
+        sealer
+            .observed_key
+            .lock()
+            .unwrap()
+            .as_deref(),
+        Some(expected_key.as_slice())
+    );
+
+    let mut expected_nonce = [0u8; 12];
+    expected_nonce.copy_from_slice(&ch.random.0[20..32]);
+    assert_eq!(*sealer.observed_nonce.lock().unwrap(), Some(expected_nonce));
+    assert_eq!(
+        *sealer
+            .observed_plaintext
+            .lock()
+            .unwrap(),
+        Some([1, 2, 3, 0, 1, 2, 3, 4, 0xaa, 0xbb, 0xcc, 0, 0, 0, 0, 0,])
+    );
+    assert!(
+        sealer
+            .observed_aad_len
+            .lock()
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn test_plaintext_reality_generator_encodes_header_layout() {
+    let generator = Arc::new(
+        PlaintextRealitySessionIdGenerator::new(
+            [1, 2, 3],
+            &[0xaa, 0xbb, 0xcc],
+            Arc::new(FixedTimeProvider(UnixTime::since_unix_epoch(
+                Duration::from_secs(0x01020304),
+            ))),
+        )
+        .unwrap(),
+    );
+    let mut config = ClientConfig::builder(Arc::new(tls13_only(TEST_PROVIDER.clone())))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    config
+        .dangerous()
+        .set_reality_session_id_generator(Some(generator));
+
+    let ch = client_hello_sent_for_config(config).unwrap();
+
+    assert_eq!(&ch.session_id.as_ref()[..3], &[1, 2, 3]);
+    assert_eq!(ch.session_id.as_ref()[3], 0);
+    assert_eq!(&ch.session_id.as_ref()[4..8], &[1, 2, 3, 4]);
+    assert_eq!(&ch.session_id.as_ref()[8..11], &[0xaa, 0xbb, 0xcc]);
+    assert_eq!(&ch.session_id.as_ref()[11..], &[0u8; 21]);
 }
 
 const HYBRID_PROVIDER: CryptoProvider = CryptoProvider {

@@ -1,5 +1,6 @@
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::fmt::Debug;
 use core::marker::PhantomData;
 
@@ -8,6 +9,7 @@ use pki_types::PrivateKeyDer;
 use pki_types::{DnsName, FipsStatus, UnixTime};
 
 use super::hs::ClientHelloInput;
+use super::reality::RealityClientHello;
 use super::{ServerSessionKey, handy};
 use crate::builder::{ConfigBuilder, WantsVerifier};
 #[cfg(doc)]
@@ -122,6 +124,9 @@ pub struct ServerConfig {
 
     /// How to verify client certificates.
     pub(super) verifier: Arc<dyn ClientVerifier>,
+
+    /// Optional verifier for raw client hello policy checks before certificate selection.
+    pub(super) client_hello_verifier: Option<Arc<dyn ClientHelloVerifier>>,
 
     /// How to output key material for debugging.  The default
     /// does nothing.
@@ -299,6 +304,20 @@ impl ServerConfig {
             .current_time()
             .ok_or(Error::FailedToGetCurrentTime)
     }
+
+    /// Accessor for dangerous configuration options.
+    pub fn dangerous(&mut self) -> danger::DangerousServerConfig<'_> {
+        danger::DangerousServerConfig { cfg: self }
+    }
+}
+
+/// Verifies an incoming `ClientHello` before certificate selection and key exchange proceed.
+pub trait ClientHelloVerifier: Debug + Send + Sync + Any {
+    /// Reject the handshake by returning an error.
+    fn verify_client_hello(&self, client_hello: &RealityClientHello<'_>) -> Result<(), Error>;
+
+    /// Include verifier configuration in the server config hash.
+    fn hash_config(&self, _h: &mut dyn core::hash::Hasher) {}
 }
 
 /// A trait for the ability to store server session data.
@@ -680,6 +699,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
             cert_resolver,
             alpn_protocols: Vec::new(),
             verifier: self.state.verifier,
+            client_hello_verifier: None,
             key_log: Arc::new(NoKeyLog {}),
             enable_secret_extraction: false,
             max_early_data_size: 0,
@@ -715,6 +735,44 @@ impl CipherSuiteSelector for PreferClientOrder {
         server: &[&'static Tls13CipherSuite],
     ) -> Option<&'static Tls13CipherSuite> {
         self.select(client, server)
+    }
+}
+
+/// Dangerous configuration that should be audited and used with extreme care.
+pub mod danger {
+    use super::{ClientHelloVerifier, ServerConfig};
+    use crate::sync::Arc;
+    pub use crate::verify::{
+        ClientIdentity, ClientVerifier, PeerVerified, SignatureVerificationInput,
+    };
+
+    /// Accessor for dangerous server configuration options.
+    #[derive(Debug)]
+    pub struct DangerousServerConfig<'a> {
+        /// The underlying ServerConfig.
+        pub(super) cfg: &'a mut ServerConfig,
+    }
+
+    impl DangerousServerConfig<'_> {
+        /// Installs a custom verifier for incoming client hellos.
+        ///
+        /// Passing `None` disables any previously configured verifier.
+        pub fn set_client_hello_verifier(
+            &mut self,
+            verifier: Option<Arc<dyn ClientHelloVerifier>>,
+        ) {
+            self.cfg.client_hello_verifier = verifier;
+        }
+
+        /// Installs a REALITY-oriented client hello verifier.
+        ///
+        /// Passing `None` disables any previously configured verifier.
+        pub fn set_reality_client_hello_verifier(
+            &mut self,
+            verifier: Option<Arc<dyn ClientHelloVerifier>>,
+        ) {
+            self.set_client_hello_verifier(verifier);
+        }
     }
 }
 

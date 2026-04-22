@@ -15,13 +15,14 @@ use crate::builder::{ConfigBuilder, WantsVerifier};
 use crate::client::connection::ClientConnectionBuilder;
 #[cfg(doc)]
 use crate::crypto;
-use crate::crypto::kx::NamedGroup;
+use crate::crypto::kx::{ActiveKeyExchange, NamedGroup};
 use crate::crypto::{CipherSuite, CryptoProvider, SelectedCredential, SignatureScheme, hash};
 #[cfg(feature = "webpki")]
 use crate::crypto::{Credentials, Identity, SingleCredential};
 use crate::enums::{ApplicationProtocol, CertificateType, ProtocolVersion};
 use crate::error::{ApiMisuse, Error};
 use crate::key_log::NoKeyLog;
+use crate::msgs::{Codec, Reader, SessionId};
 use crate::suites::SupportedCipherSuite;
 use crate::sync::Arc;
 use crate::time_provider::{DefaultTimeProvider, TimeProvider};
@@ -82,6 +83,7 @@ pub struct ClientConfig {
     /// - are the same type (determined by hashing their `TypeId`), and
     /// - input the same data into [`ServerVerifier::hash_config()`] and
     ///   [`ClientCredentialResolver::hash_config()`].
+    /// - use the same [`ClientHelloCallback`] type and callback configuration.
     ///
     /// To illustrate, imagine two `ClientConfig`s `A` and `B`.  `A` fully validates
     /// the server certificate, `B` does not.  If `A` and `B` shared a resumption store,
@@ -264,6 +266,12 @@ impl ClientConfig {
         &self.domain.verifier
     }
 
+    pub(super) fn client_hello_callback(&self) -> Option<&Arc<dyn ClientHelloCallback>> {
+        self.domain
+            .client_hello_callback
+            .as_ref()
+    }
+
     pub(crate) fn supports_version(&self, v: ProtocolVersion) -> bool {
         self.domain.provider.supports_version(v)
     }
@@ -408,6 +416,102 @@ pub trait ClientCredentialResolver: fmt::Debug + Send + Sync {
     fn hash_config(&self, h: &mut dyn Hasher);
 }
 
+/// Dangerous hook for mutating a `ClientHello` immediately before it is encoded.
+///
+/// This is intended for advanced integrations that need to customize the outgoing
+/// hello while still using rustls for the rest of the handshake state machine.
+/// Implementations should preserve protocol invariants across retries.
+pub trait ClientHelloCallback: fmt::Debug + Send + Sync + Any {
+    /// Mutate the pending `ClientHello`.
+    fn modify_client_hello(&self, hello: &mut ClientHelloCallbackContext<'_>) -> Result<(), Error>;
+
+    /// Include callback configuration in the client config hash.
+    fn hash_config(&self, _h: &mut dyn Hasher) {}
+}
+
+/// Mutable view of the `ClientHello` information exposed to a [`ClientHelloCallback`].
+pub struct ClientHelloCallbackContext<'a> {
+    server_name: &'a ServerName<'static>,
+    client_random: &'a [u8; 32],
+    session_id: &'a mut SessionId,
+    active_key_exchange: Option<&'a dyn ActiveKeyExchange>,
+    raw_client_hello: Option<&'a [u8]>,
+    is_retry: bool,
+}
+
+impl<'a> ClientHelloCallbackContext<'a> {
+    pub(super) fn new(
+        server_name: &'a ServerName<'static>,
+        client_random: &'a [u8; 32],
+        session_id: &'a mut SessionId,
+        active_key_exchange: Option<&'a dyn ActiveKeyExchange>,
+        raw_client_hello: Option<&'a [u8]>,
+        is_retry: bool,
+    ) -> Self {
+        Self {
+            server_name,
+            client_random,
+            session_id,
+            active_key_exchange,
+            raw_client_hello,
+            is_retry,
+        }
+    }
+
+    /// Returns the server name associated with this connection attempt.
+    pub fn server_name(&self) -> &ServerName<'static> {
+        self.server_name
+    }
+
+    /// Returns the client random that will be sent in this hello.
+    pub fn client_random(&self) -> &[u8; 32] {
+        self.client_random
+    }
+
+    /// Returns the current session ID bytes.
+    pub fn session_id(&self) -> &[u8] {
+        self.session_id.as_ref()
+    }
+
+    /// Replaces the session ID that will be sent in this hello.
+    ///
+    /// TLS limits the session ID to at most 32 bytes.
+    pub fn set_session_id(&mut self, session_id: &[u8]) -> Result<(), Error> {
+        if session_id.len() > 32 {
+            return Err(Error::ApiMisuse(
+                ApiMisuse::ClientHelloCallbackSessionIdTooLong {
+                    actual: session_id.len(),
+                },
+            ));
+        }
+
+        let mut encoded = Vec::with_capacity(session_id.len() + 1);
+        encoded.push(session_id.len() as u8);
+        encoded.extend_from_slice(session_id);
+        *self.session_id = SessionId::read(&mut Reader::new(&encoded))
+            .map_err(|_| Error::Unreachable("validated SessionId encoding rejected"))?;
+        Ok(())
+    }
+
+    /// Returns the in-progress key exchange, if this hello carries a TLS 1.3 key share.
+    pub fn active_key_exchange(&self) -> Option<&dyn ActiveKeyExchange> {
+        self.active_key_exchange
+    }
+
+    /// Returns a pre-encoded `ClientHello` snapshot suitable for REALITY-style sealing.
+    ///
+    /// When available, this snapshot is encoded with a 32-byte zero session ID placeholder and is
+    /// captured before PSK binders are filled in.
+    pub fn raw_client_hello(&self) -> Option<&[u8]> {
+        self.raw_client_hello
+    }
+
+    /// Returns whether this hello is being emitted after a `HelloRetryRequest`.
+    pub fn is_retry(&self) -> bool {
+        self.is_retry
+    }
+}
+
 /// Context from the server to inform client credential selection.
 pub struct CredentialRequest<'a> {
     pub(super) negotiated_type: CertificateType,
@@ -464,6 +568,9 @@ pub(super) struct SecurityDomain {
     /// How to decide what client auth certificate/keys to use.
     client_auth_cert_resolver: Arc<dyn ClientCredentialResolver>,
 
+    /// Optional last-moment `ClientHello` mutator.
+    client_hello_callback: Option<Arc<dyn ClientHelloCallback>>,
+
     config_hash: [u8; 32],
 }
 
@@ -472,6 +579,7 @@ impl SecurityDomain {
         provider: Arc<CryptoProvider>,
         client_auth_cert_resolver: Arc<dyn ClientCredentialResolver + 'static>,
         verifier: Arc<dyn verify::ServerVerifier + 'static>,
+        client_hello_callback: Option<Arc<dyn ClientHelloCallback>>,
         time_provider: Arc<dyn TimeProvider + 'static>,
     ) -> Self {
         // Use a hash function that outputs at least 32 bytes.
@@ -496,6 +604,13 @@ impl SecurityDomain {
             .hash(&mut DynHasher(&mut adapter));
         verifier.hash_config(&mut adapter);
 
+        if let Some(client_hello_callback) = &client_hello_callback {
+            client_hello_callback
+                .type_id()
+                .hash(&mut DynHasher(&mut adapter));
+            client_hello_callback.hash_config(&mut adapter);
+        }
+
         time_provider
             .type_id()
             .hash(&mut DynHasher(&mut adapter));
@@ -509,6 +624,7 @@ impl SecurityDomain {
             provider,
             verifier,
             client_auth_cert_resolver,
+            client_hello_callback,
             config_hash,
         }
     }
@@ -519,12 +635,35 @@ impl SecurityDomain {
             provider,
             verifier: _,
             client_auth_cert_resolver,
+            client_hello_callback,
             config_hash: _,
         } = self;
         Self::new(
             provider.clone(),
             client_auth_cert_resolver.clone(),
             verifier,
+            client_hello_callback.clone(),
+            time_provider.clone(),
+        )
+    }
+
+    fn with_client_hello_callback(
+        &self,
+        client_hello_callback: Option<Arc<dyn ClientHelloCallback>>,
+    ) -> Self {
+        let Self {
+            time_provider,
+            provider,
+            verifier,
+            client_auth_cert_resolver,
+            client_hello_callback: _,
+            config_hash: _,
+        } = self;
+        Self::new(
+            provider.clone(),
+            client_auth_cert_resolver.clone(),
+            verifier.clone(),
+            client_hello_callback,
             time_provider.clone(),
         )
     }
@@ -747,6 +886,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
                 self.provider,
                 client_auth_cert_resolver,
                 self.state.verifier,
+                None,
                 self.time_provider,
             ),
             cert_decompressors: compress::default_cert_decompressors().to_vec(),
@@ -761,6 +901,8 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
 pub(super) mod danger {
     use core::marker::PhantomData;
 
+    use super::super::reality::{RealityClientHelloCallback, RealitySessionIdGenerator};
+    use super::ClientHelloCallback;
     use crate::client::WantsClientCert;
     use crate::client::config::ClientConfig;
     use crate::sync::Arc;
@@ -778,6 +920,32 @@ pub(super) mod danger {
         /// Overrides the default `ServerVerifier` with something else.
         pub fn set_certificate_verifier(&mut self, verifier: Arc<dyn ServerVerifier>) {
             self.cfg.domain = self.cfg.domain.with_verifier(verifier);
+        }
+
+        /// Overrides the default `ClientHello` mutation callback.
+        ///
+        /// Passing `None` disables any previously configured callback.
+        pub fn set_client_hello_callback(
+            &mut self,
+            callback: Option<Arc<dyn ClientHelloCallback>>,
+        ) {
+            self.cfg.domain = self
+                .cfg
+                .domain
+                .with_client_hello_callback(callback);
+        }
+
+        /// Installs a REALITY-oriented session ID generator.
+        ///
+        /// This replaces any previously configured generic `ClientHello` callback.
+        /// Passing `None` disables any previously configured generator.
+        pub fn set_reality_session_id_generator(
+            &mut self,
+            generator: Option<Arc<dyn RealitySessionIdGenerator>>,
+        ) {
+            self.set_client_hello_callback(generator.map(|generator| {
+                Arc::new(RealityClientHelloCallback::new(generator)) as Arc<dyn ClientHelloCallback>
+            }));
         }
     }
 

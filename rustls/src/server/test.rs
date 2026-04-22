@@ -6,8 +6,8 @@ use pki_types::UnixTime;
 
 use super::hs::ClientHelloInput;
 use super::{
-    CommonServerSessionValue, ServerConfig, ServerConnection, ServerSessionValue,
-    Tls13ServerSessionValue,
+    ClientHelloVerifier, CommonServerSessionValue, ServerConfig, ServerConnection,
+    ServerSessionValue, Tls13ServerSessionValue,
 };
 use crate::conn::{Connection, Input};
 use crate::crypto::cipher::FakeAead;
@@ -30,6 +30,7 @@ use crate::msgs::{
 };
 use crate::pki_types::pem::PemObject;
 use crate::pki_types::{CertificateDer, FipsStatus, PrivateKeyDer};
+use crate::server::RealityClientHello;
 use crate::suites::CipherSuiteCommon;
 use crate::sync::Arc;
 use crate::tls12::Tls12CipherSuite;
@@ -216,6 +217,84 @@ fn test_server_rejects_no_extended_master_secret_extension_when_require_ems_or_f
             PeerIncompatible::ExtendedMasterSecretExtensionRequired
         ))
     );
+}
+
+#[derive(Debug)]
+struct RejectingClientHelloVerifier;
+
+impl ClientHelloVerifier for RejectingClientHelloVerifier {
+    fn verify_client_hello(&self, _client_hello: &RealityClientHello<'_>) -> Result<(), Error> {
+        Err(Error::General(
+            "client hello rejected by test verifier".into(),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct RecordingRealityVerifier;
+
+impl ClientHelloVerifier for RecordingRealityVerifier {
+    fn verify_client_hello(&self, client_hello: &RealityClientHello<'_>) -> Result<(), Error> {
+        assert_eq!(client_hello.version(), ProtocolVersion::TLSv1_3);
+        assert_eq!(client_hello.session_id().len(), 32);
+        assert!(
+            client_hello
+                .raw_client_hello()
+                .is_some()
+        );
+        assert!(
+            client_hello
+                .key_share(NamedGroup::X25519)
+                .is_some()
+        );
+        Ok(())
+    }
+}
+
+#[test]
+fn configured_client_hello_verifier_can_reject_handshake() {
+    let mut config = ServerConfig::builder(Arc::new(TEST_PROVIDER.clone()))
+        .with_no_client_auth()
+        .with_single_cert(server_identity(), server_key())
+        .unwrap();
+    config
+        .dangerous()
+        .set_client_hello_verifier(Some(Arc::new(RejectingClientHelloVerifier)));
+
+    let mut conn = ServerConnection::new(config.into()).unwrap();
+    let ch = Message {
+        version: ProtocolVersion::TLSv1_3,
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ClientHello(
+            minimal_client_hello(),
+        ))),
+    };
+    conn.read_tls(&mut ch.into_wire_bytes().as_slice())
+        .unwrap();
+
+    let err = conn.process_new_packets().unwrap_err();
+    assert!(matches!(err, Error::General(message) if message.contains("test verifier")));
+}
+
+#[test]
+fn configured_reality_verifier_observes_tls13_client_hello() {
+    let mut config = ServerConfig::builder(Arc::new(TEST_PROVIDER.clone()))
+        .with_no_client_auth()
+        .with_single_cert(server_identity(), server_key())
+        .unwrap();
+    config
+        .dangerous()
+        .set_reality_client_hello_verifier(Some(Arc::new(RecordingRealityVerifier)));
+
+    let mut conn = ServerConnection::new(config.into()).unwrap();
+    let ch = Message {
+        version: ProtocolVersion::TLSv1_3,
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ClientHello(
+            minimal_client_hello(),
+        ))),
+    };
+    conn.read_tls(&mut ch.into_wire_bytes().as_slice())
+        .unwrap();
+    conn.process_new_packets().unwrap();
 }
 
 #[test]

@@ -7,7 +7,7 @@ use core::ops::Deref;
 
 use pki_types::ServerName;
 
-use super::config::{ClientSessionKey, Tls12Resumption};
+use super::config::{ClientHelloCallbackContext, ClientSessionKey, Tls12Resumption};
 use super::ech::{EchMode, EchState, EchStatus};
 use super::{
     ClientHelloDetails, ClientSessionCommon, Retrieved, Tls12Session, Tls13Session, tls12, tls13,
@@ -27,10 +27,10 @@ use crate::kernel::KernelState;
 use crate::log::{debug, trace};
 use crate::msgs::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
-    ClientSessionTicket, Compression, EncryptedClientHello, ExtensionType, HandshakeMessagePayload,
-    HandshakePayload, HelloRetryRequest, KeyShareEntry, Message, MessagePayload,
-    PskKeyExchangeModes, Random, ServerHelloPayload, ServerNamePayload, SessionId,
-    SupportedEcPointFormats, SupportedProtocolVersions, TransportParameters,
+    ClientSessionTicket, Codec, Compression, EncryptedClientHello, ExtensionType,
+    HandshakeMessagePayload, HandshakePayload, HelloRetryRequest, KeyShareEntry, Message,
+    MessagePayload, PskKeyExchangeModes, Random, Reader, ServerHelloPayload, ServerNamePayload,
+    SessionId, SupportedEcPointFormats, SupportedProtocolVersions, TransportParameters,
 };
 use crate::sealed::Sealed;
 use crate::suites::{PartiallyExtractedSecrets, Suite, SupportedCipherSuite};
@@ -39,6 +39,12 @@ use crate::tls12::Tls12CipherSuite;
 use crate::tls13::Tls13CipherSuite;
 use crate::tls13::key_schedule::{KeyScheduleEarlyClient, KeyScheduleTrafficSend};
 use crate::{ClientConfig, bs_debug};
+
+fn zero_session_id() -> SessionId {
+    let mut encoded = [0u8; 33];
+    encoded[0] = 32;
+    SessionId::read(&mut Reader::new(&encoded)).expect("fixed zero SessionId encoding rejected")
+}
 
 #[expect(private_interfaces)]
 pub(crate) enum ClientState {
@@ -791,6 +797,48 @@ fn emit_client_hello_for_retry(
     input.hello.sent_extensions = chp_payload.collect_used();
 
     let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload));
+
+    if let Some(callback) = config.client_hello_callback() {
+        let raw_client_hello = if key_share.is_some() {
+            let original_session_id = {
+                let HandshakePayload::ClientHello(chp_inner) = &mut chp.0 else {
+                    return Err(Error::Unreachable(
+                        "client callback invoked on non-ClientHello",
+                    ));
+                };
+                let original_session_id = chp_inner.session_id;
+                chp_inner.session_id = zero_session_id();
+                original_session_id
+            };
+            let raw_client_hello = chp.get_encoding();
+            let HandshakePayload::ClientHello(chp_inner) = &mut chp.0 else {
+                return Err(Error::Unreachable(
+                    "client callback invoked on non-ClientHello",
+                ));
+            };
+            chp_inner.session_id = original_session_id;
+            Some(raw_client_hello)
+        } else {
+            None
+        };
+
+        let HandshakePayload::ClientHello(chp_inner) = &mut chp.0 else {
+            return Err(Error::Unreachable(
+                "client callback invoked on non-ClientHello",
+            ));
+        };
+        let mut callback_context = ClientHelloCallbackContext::new(
+            &input.session_key.server_name,
+            &chp_inner.random.0,
+            &mut chp_inner.session_id,
+            key_share
+                .as_ref()
+                .map(|key_share| &*key_share.share as _),
+            raw_client_hello.as_deref(),
+            retryreq.is_some(),
+        );
+        callback.modify_client_hello(&mut callback_context)?;
+    }
 
     let tls13_early_data_key_schedule = match (ech_state.as_mut(), tls13_session) {
         // If we're performing ECH and resuming, then the PSK binder will have been dealt with

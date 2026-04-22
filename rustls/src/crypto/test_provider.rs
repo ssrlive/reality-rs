@@ -283,6 +283,13 @@ impl crypto::kx::ActiveKeyExchange for ActiveKeyExchange {
         }
     }
 
+    fn extract_reality_key(&self, server_pub_key: &[u8]) -> Option<Vec<u8>> {
+        match server_pub_key {
+            REALITY_SERVER_PUB_KEY => Some(REALITY_AUTH_KEY.to_vec()),
+            _ => None,
+        }
+    }
+
     fn pub_key(&self) -> &[u8] {
         KX_PEER_SHARE
     }
@@ -311,6 +318,8 @@ impl SupportedKxGroup for FakeKeyExchangeGroup {
 
 const KX_PEER_SHARE: &[u8] = b"KxPeerShareKxPeerShareKxPeerShare";
 const KX_SHARED_SECRET: &[u8] = b"KxSharedSecretKxSharedSecret";
+pub(crate) const REALITY_SERVER_PUB_KEY: &[u8] = b"RealityServerStaticPublicKeyValue";
+pub(crate) const REALITY_AUTH_KEY: &[u8] = b"RealityAuthKeyMaterialForTests!!!!";
 
 struct Aead;
 

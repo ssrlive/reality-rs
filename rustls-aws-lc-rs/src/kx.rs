@@ -181,8 +181,8 @@ struct KxGroup {
 
 impl SupportedKxGroup for KxGroup {
     fn start(&self) -> Result<StartedKeyExchange, Error> {
-        let rng = SystemRandom::new();
-        let priv_key = agreement::EphemeralPrivateKey::generate(self.agreement_algorithm, &rng)
+        let _rng = SystemRandom::new();
+        let priv_key = agreement::PrivateKey::generate(self.agreement_algorithm)
             .map_err(|_| GetRandomFailed)?;
 
         let pub_key = priv_key
@@ -259,7 +259,7 @@ fn uncompressed_point(point: &[u8]) -> bool {
 struct KeyExchange {
     name: NamedGroup,
     agreement_algorithm: &'static agreement::Algorithm,
-    priv_key: agreement::EphemeralPrivateKey,
+    priv_key: agreement::PrivateKey,
     pub_key: agreement::PublicKey,
     pub_key_validator: fn(&[u8]) -> bool,
 }
@@ -271,8 +271,22 @@ impl ActiveKeyExchange for KeyExchange {
             return Err(PeerMisbehaved::InvalidKeyShare.into());
         }
         let peer_key = agreement::UnparsedPublicKey::new(self.agreement_algorithm, peer);
-        super::ring_shim::agree_ephemeral(self.priv_key, &peer_key)
-            .map_err(|_| PeerMisbehaved::InvalidKeyShare.into())
+        agreement::agree(
+            &self.priv_key,
+            peer_key,
+            PeerMisbehaved::InvalidKeyShare,
+            |secret| Ok(SharedSecret::from(secret)),
+        )
+        .map_err(Error::from)
+    }
+
+    fn extract_reality_key(&self, server_pub_key: &[u8]) -> Option<Vec<u8>> {
+        if !(self.pub_key_validator)(server_pub_key) {
+            return None;
+        }
+
+        let peer_key = agreement::UnparsedPublicKey::new(self.agreement_algorithm, server_pub_key);
+        agreement::agree(&self.priv_key, peer_key, (), |secret| Ok(Vec::from(secret))).ok()
     }
 
     /// Return the group being used.

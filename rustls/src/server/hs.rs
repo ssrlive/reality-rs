@@ -7,6 +7,7 @@ use core::fmt;
 use pki_types::DnsName;
 
 use super::config::{CipherSuiteSelector, VersionSuiteSelector};
+use super::reality::RealityClientHello;
 use super::{ClientHello, CommonServerSessionValue, ServerConfig, tls12, tls13};
 use crate::SupportedCipherSuite;
 use crate::common_state::{Event, Output, OutputEvent, Protocol};
@@ -521,6 +522,14 @@ impl ExpectClientHello {
             .invalid_sni_policy
             .accept(input.client_hello.server_name.as_ref())?;
         output.emit(Event::ReceivedServerName(sni.clone()));
+
+        if let Some(verifier) = &self.config.client_hello_verifier {
+            verifier.verify_client_hello(&RealityClientHello::new(
+                &input,
+                sni.as_ref(),
+                T::VERSION,
+            )?)?;
+        }
 
         if self.done_retry {
             let ch_sni = input

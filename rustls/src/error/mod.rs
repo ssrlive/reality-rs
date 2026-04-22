@@ -1502,6 +1502,30 @@ pub enum ApiMisuse {
     /// [`ServerConnection::set_resumption_data()`]: crate::server::ServerConnection::set_resumption_data()
     ResumptionDataProvidedTooLate,
 
+    /// A [`ClientHelloCallback`][crate::client::ClientHelloCallback] tried to set a
+    /// session ID longer than TLS permits.
+    ClientHelloCallbackSessionIdTooLong {
+        /// The supplied session ID length.
+        actual: usize,
+    },
+
+    /// A REALITY session ID generator was used for a hello that did not carry a key share.
+    RealitySessionIdGeneratorRequiresKeyShare,
+
+    /// A REALITY short ID exceeded the current maximum encoded size.
+    RealityShortIdTooLong {
+        /// The supplied short ID length.
+        actual: usize,
+        /// The maximum supported short ID length.
+        maximum: usize,
+    },
+
+    /// A REALITY sealing generator was used without access to the pre-encoded raw ClientHello.
+    RealitySealingGeneratorRequiresRawClientHello,
+
+    /// A REALITY sealing generator could not derive the REALITY shared key from the active key exchange.
+    RealitySealingGeneratorRequiresRealityKey,
+
     /// [`KernelConnection::update_tx_secret()`] and associated are not available for TLS1.2 connections.
     ///
     /// [`KernelConnection::update_tx_secret()`]: crate::conn::kernel::KernelConnection::update_tx_secret()

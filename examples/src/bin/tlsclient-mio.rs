@@ -19,16 +19,21 @@
 //!
 //! [mio]: https://docs.rs/mio/latest/mio/
 
+use core::error::Error as StdError;
 use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::net::ToSocketAddrs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::{process, str};
+
+#[path = "../common/reality_config.rs"]
+mod reality_config;
 
 use clap::Parser;
 use mio::net::TcpStream;
 use rustls::client::Tls12Resumption;
-use rustls::crypto::kx::SupportedKxGroup;
+use rustls::crypto::kx::{NamedGroup, SupportedKxGroup};
 use rustls::crypto::{CryptoProvider, Identity};
 use rustls::enums::{ApplicationProtocol, ProtocolVersion};
 use rustls::pki_types::pem::PemObject;
@@ -36,6 +41,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, Connection, RootCertStore};
 use rustls_aws_lc_rs as provider;
 use rustls_util::KeyLogFile;
+
+use reality_config::{RealityClientConfig as RealityFileConfig, load_reality_document};
 
 const CLIENT: mio::Token = mio::Token(0);
 
@@ -266,6 +273,26 @@ struct Args {
     #[clap(long)]
     insecure: bool,
 
+    /// Load REALITY fields from a JSON or TOML file.
+    #[clap(long)]
+    reality_config: Option<PathBuf>,
+
+    /// Override the TLS server name used for SNI and certificate verification.
+    #[clap(long)]
+    server_name: Option<String>,
+
+    /// Enable REALITY using this Xray-style short_id hex value.
+    #[clap(long, requires_all = ["reality_public_key", "reality_version"])]
+    reality_short_id: Option<String>,
+
+    /// Enable REALITY using this Xray-style public_key base64/base64url value.
+    #[clap(long, requires_all = ["reality_short_id", "reality_version"])]
+    reality_public_key: Option<String>,
+
+    /// REALITY version encoded as 6 hex digits, for example 010203.
+    #[clap(long, requires_all = ["reality_short_id", "reality_public_key"])]
+    reality_version: Option<String>,
+
     /// Read client authentication key from KEY.
     #[clap(long)]
     auth_key: Option<String>,
@@ -280,26 +307,56 @@ struct Args {
 }
 
 impl Args {
-    fn provider(&self) -> CryptoProvider {
-        let kx_groups = match self.key_exchange.as_slice() {
-            [] => Cow::Borrowed(provider::DEFAULT_KX_GROUPS),
-            items => Cow::Owned(
-                items
-                    .iter()
-                    .map(|kx| find_key_exchange(kx))
-                    .collect::<Vec<&'static dyn SupportedKxGroup>>(),
-            ),
-        };
+    fn validate(&self, reality: Option<&RealityFileConfig>) -> Result<(), String> {
+        if reality.is_none() {
+            return Ok(());
+        }
 
-        let provider = match lookup_versions(&self.protover).as_slice() {
-            [ProtocolVersion::TLSv1_2] => provider::DEFAULT_TLS12_PROVIDER,
-            [ProtocolVersion::TLSv1_3] => provider::DEFAULT_TLS13_PROVIDER,
-            _ => provider::DEFAULT_PROVIDER,
-        };
+        let versions = lookup_versions(&self.protover);
+        if !versions.is_empty() && versions.as_slice() != [ProtocolVersion::TLSv1_3] {
+            return Err("REALITY mode requires TLS1.3".into());
+        }
 
-        let provider = CryptoProvider {
-            kx_groups,
-            ..provider
+        let custom_kx = self
+            .key_exchange
+            .iter()
+            .map(|kx| find_key_exchange(kx))
+            .collect::<Vec<&'static dyn SupportedKxGroup>>();
+        if !custom_kx.is_empty()
+            && custom_kx
+                .iter()
+                .any(|kx| kx.name() != NamedGroup::X25519)
+        {
+            return Err("REALITY mode currently requires X25519 key exchange".into());
+        }
+
+        Ok(())
+    }
+
+    fn provider(&self, reality: Option<&RealityFileConfig>) -> CryptoProvider {
+        let provider = if reality.is_some() {
+            provider::reality::default_x25519_tls13_reality_provider()
+        } else {
+            let kx_groups = match self.key_exchange.as_slice() {
+                [] => Cow::Borrowed(provider::DEFAULT_KX_GROUPS),
+                items => Cow::Owned(
+                    items
+                        .iter()
+                        .map(|kx| find_key_exchange(kx))
+                        .collect::<Vec<&'static dyn SupportedKxGroup>>(),
+                ),
+            };
+
+            let provider = match lookup_versions(&self.protover).as_slice() {
+                [ProtocolVersion::TLSv1_2] => provider::DEFAULT_TLS12_PROVIDER,
+                [ProtocolVersion::TLSv1_3] => provider::DEFAULT_TLS13_PROVIDER,
+                _ => provider::DEFAULT_PROVIDER,
+            };
+
+            CryptoProvider {
+                kx_groups,
+                ..provider
+            }
         };
 
         match self.suite.as_slice() {
@@ -307,6 +364,66 @@ impl Args {
             _ => filter_suites(provider, &self.suite),
         }
     }
+}
+
+fn resolve_reality_config(args: &Args) -> Result<Option<RealityFileConfig>, Box<dyn StdError>> {
+    let file_config = if let Some(path) = args.reality_config.as_deref() {
+        Some(load_reality_document::<RealityFileConfig>(path)?.reality)
+    } else {
+        None
+    };
+
+    let short_id = args
+        .reality_short_id
+        .clone()
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .map(|config| config.short_id.clone())
+        });
+    let public_key = args
+        .reality_public_key
+        .clone()
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .map(|config| config.public_key.clone())
+        });
+    let version = args
+        .reality_version
+        .clone()
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .map(|config| config.version.clone())
+        });
+    let server_name = args.server_name.clone().or_else(|| {
+        file_config
+            .as_ref()
+            .and_then(|config| config.server_name.clone())
+    });
+
+    match (short_id, public_key, version) {
+        (None, None, None) => Ok(None),
+        (Some(short_id), Some(public_key), Some(version)) => Ok(Some(RealityFileConfig {
+            short_id,
+            public_key,
+            version,
+            server_name,
+        })),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "REALITY requires short_id, public_key, and version via CLI flags or --reality-config",
+        )
+        .into()),
+    }
+}
+
+fn resolve_tls_server_name(args: &Args, reality: Option<&RealityFileConfig>) -> String {
+    args.server_name
+        .clone()
+        .or_else(|| reality.and_then(|config| config.server_name.clone()))
+        .unwrap_or_else(|| args.hostname.clone())
 }
 
 /// Find a key exchange with the given name
@@ -464,7 +581,7 @@ mod danger {
 }
 
 /// Build a `ClientConfig` from our arguments
-fn make_config(args: &Args) -> Arc<ClientConfig> {
+fn make_config(args: &Args, reality: Option<&RealityFileConfig>) -> Arc<ClientConfig> {
     let mut root_store = RootCertStore::empty();
 
     if let Some(cafile) = args.cafile.as_ref() {
@@ -481,7 +598,8 @@ fn make_config(args: &Args) -> Arc<ClientConfig> {
         );
     }
 
-    let config = ClientConfig::builder(args.provider().into()).with_root_certificates(root_store);
+    let config =
+        ClientConfig::builder(args.provider(reality).into()).with_root_certificates(root_store);
 
     let mut config = match (&args.auth_key, &args.auth_certs) {
         (Some(key_file), Some(certs_file)) => {
@@ -524,13 +642,57 @@ fn make_config(args: &Args) -> Arc<ClientConfig> {
             )));
     }
 
+    if let Some(reality) = reality {
+        provider::reality::install_reality_session_id_generator_from_xray_fields(
+            &mut config,
+            parse_reality_version(&reality.version),
+            &reality.short_id,
+            &reality.public_key,
+        )
+        .unwrap();
+    }
+
     Arc::new(config)
+}
+
+fn parse_reality_version(version: &str) -> [u8; 3] {
+    let version = version.trim();
+    assert_eq!(
+        version.len(),
+        6,
+        "REALITY version must be exactly 6 hex digits, for example 010203"
+    );
+
+    let mut parsed = [0u8; 3];
+    for (index, chunk) in version
+        .as_bytes()
+        .chunks_exact(2)
+        .enumerate()
+    {
+        parsed[index] = parse_hex_byte(chunk[0], chunk[1]);
+    }
+    parsed
+}
+
+fn parse_hex_byte(high: u8, low: u8) -> u8 {
+    (parse_hex_nibble(high) << 4) | parse_hex_nibble(low)
+}
+
+fn parse_hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        b'A'..=b'F' => value - b'A' + 10,
+        _ => panic!("REALITY version must contain only hexadecimal digits"),
+    }
 }
 
 /// Parse some arguments, then make a TLS client connection
 /// somewhere.
 fn main() {
     let args = Args::parse();
+    let reality = resolve_reality_config(&args).unwrap();
+    args.validate(reality.as_ref()).unwrap();
 
     if args.verbose {
         env_logger::Builder::new()
@@ -538,7 +700,7 @@ fn main() {
             .init();
     }
 
-    let config = make_config(&args);
+    let config = make_config(&args, reality.as_ref());
 
     let sock_addr = (args.hostname.as_str(), args.port)
         .to_socket_addrs()
@@ -546,7 +708,8 @@ fn main() {
         .next()
         .unwrap();
     let sock = TcpStream::connect(sock_addr).unwrap();
-    let server_name = ServerName::try_from(args.hostname.as_str())
+    let tls_server_name = resolve_tls_server_name(&args, reality.as_ref());
+    let server_name = ServerName::try_from(tls_server_name.as_str())
         .expect("invalid DNS name")
         .to_owned();
     let mut tlsclient = TlsClient::new(sock, server_name, config);
@@ -555,7 +718,7 @@ fn main() {
         let httpreq = format!(
             "GET / HTTP/1.0\r\nHost: {}\r\nConnection: \
                                close\r\nAccept-Encoding: identity\r\n\r\n",
-            args.hostname
+            tls_server_name
         );
         tlsclient
             .write_all(httpreq.as_bytes())
@@ -585,5 +748,216 @@ fn main() {
             tlsclient.ready(ev);
             tlsclient.reregister(poll.registry());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_lc_rs::agreement;
+
+    fn test_config_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("config")
+            .join(name)
+    }
+
+    #[test]
+    fn parse_reality_version_hex() {
+        assert_eq!(parse_reality_version("010203"), [1, 2, 3]);
+        assert_eq!(parse_reality_version("a0B1c2"), [0xa0, 0xb1, 0xc2]);
+    }
+
+    #[test]
+    fn clap_rejects_partial_reality_arguments() {
+        let parse =
+            Args::try_parse_from(["tlsclient-mio", "--reality-short-id", "aabbcc", "localhost"]);
+
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn validate_rejects_reality_with_tls12() {
+        let args = Args {
+            port: 443,
+            http: true,
+            verbose: false,
+            protover: vec!["1.2".to_string()],
+            suite: vec![],
+            key_exchange: vec![],
+            proto: vec![],
+            max_frag_size: None,
+            cafile: None,
+            no_tickets: false,
+            no_sni: false,
+            insecure: false,
+            reality_config: None,
+            server_name: None,
+            reality_short_id: Some("aabbcc".to_string()),
+            reality_public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+            reality_version: Some("010203".to_string()),
+            auth_key: None,
+            auth_certs: None,
+            hostname: "localhost".to_string(),
+        };
+
+        let reality = resolve_reality_config(&args).unwrap();
+        assert_eq!(
+            args.validate(reality.as_ref())
+                .unwrap_err(),
+            "REALITY mode requires TLS1.3"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_reality_with_non_x25519_kx() {
+        let args = Args {
+            port: 443,
+            http: true,
+            verbose: false,
+            protover: vec!["1.3".to_string()],
+            suite: vec![],
+            key_exchange: vec!["secp256r1".to_string()],
+            proto: vec![],
+            max_frag_size: None,
+            cafile: None,
+            no_tickets: false,
+            no_sni: false,
+            insecure: false,
+            reality_config: None,
+            server_name: None,
+            reality_short_id: Some("aabbcc".to_string()),
+            reality_public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+            reality_version: Some("010203".to_string()),
+            auth_key: None,
+            auth_certs: None,
+            hostname: "localhost".to_string(),
+        };
+
+        let reality = resolve_reality_config(&args).unwrap();
+        assert_eq!(
+            args.validate(reality.as_ref())
+                .unwrap_err(),
+            "REALITY mode currently requires X25519 key exchange"
+        );
+    }
+
+    #[test]
+    fn make_config_supports_reality_arguments() {
+        let server_private_key = agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let server_public_key = server_private_key
+            .compute_public_key()
+            .unwrap();
+
+        let args = Args {
+            port: 443,
+            http: true,
+            verbose: false,
+            protover: vec!["1.3".to_string()],
+            suite: vec![],
+            key_exchange: vec!["x25519".to_string()],
+            proto: vec![],
+            max_frag_size: None,
+            cafile: None,
+            no_tickets: false,
+            no_sni: false,
+            insecure: false,
+            reality_config: None,
+            server_name: None,
+            reality_short_id: Some("aabbcc".to_string()),
+            reality_public_key: Some(encode_base64url_unpadded(server_public_key.as_ref())),
+            reality_version: Some("010203".to_string()),
+            auth_key: None,
+            auth_certs: None,
+            hostname: "localhost".to_string(),
+        };
+
+        let reality = resolve_reality_config(&args).unwrap();
+        let mut conn = make_config(&args, reality.as_ref())
+            .connect(
+                ServerName::try_from(resolve_tls_server_name(&args, reality.as_ref()))
+                    .unwrap()
+                    .to_owned(),
+            )
+            .build()
+            .unwrap();
+        let mut bytes = Vec::new();
+        conn.write_tls(&mut bytes).unwrap();
+
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn tls_server_name_defaults_to_hostname() {
+        let args = Args::try_parse_from(["tlsclient-mio", "localhost"]).unwrap();
+        let reality = resolve_reality_config(&args).unwrap();
+        assert_eq!(
+            resolve_tls_server_name(&args, reality.as_ref()),
+            "localhost"
+        );
+    }
+
+    #[test]
+    fn tls_server_name_can_be_overridden() {
+        let args =
+            Args::try_parse_from(["tlsclient-mio", "--server-name", "test", "localhost"]).unwrap();
+        let reality = resolve_reality_config(&args).unwrap();
+        assert_eq!(resolve_tls_server_name(&args, reality.as_ref()), "test");
+    }
+
+    #[test]
+    fn resolve_reality_supports_json_file() {
+        let args = Args::try_parse_from([
+            "tlsclient-mio",
+            "--reality-config",
+            test_config_path("reality-client.json")
+                .to_str()
+                .unwrap(),
+            "localhost",
+        ])
+        .unwrap();
+
+        let reality = resolve_reality_config(&args)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reality.short_id, "aabbcc");
+        assert_eq!(reality.server_name.as_deref(), Some("test"));
+    }
+
+    fn encode_base64url_unpadded(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+        let mut output = String::with_capacity((bytes.len() * 4).div_ceil(3));
+        let mut index = 0;
+        while index + 3 <= bytes.len() {
+            let a = bytes[index];
+            let b = bytes[index + 1];
+            let c = bytes[index + 2];
+            output.push(ALPHABET[(a >> 2) as usize] as char);
+            output.push(ALPHABET[((a & 0x03) << 4 | (b >> 4)) as usize] as char);
+            output.push(ALPHABET[((b & 0x0f) << 2 | (c >> 6)) as usize] as char);
+            output.push(ALPHABET[(c & 0x3f) as usize] as char);
+            index += 3;
+        }
+
+        match bytes.len() - index {
+            0 => {}
+            1 => {
+                let a = bytes[index];
+                output.push(ALPHABET[(a >> 2) as usize] as char);
+                output.push(ALPHABET[((a & 0x03) << 4) as usize] as char);
+            }
+            2 => {
+                let a = bytes[index];
+                let b = bytes[index + 1];
+                output.push(ALPHABET[(a >> 2) as usize] as char);
+                output.push(ALPHABET[((a & 0x03) << 4 | (b >> 4)) as usize] as char);
+                output.push(ALPHABET[((b & 0x0f) << 2) as usize] as char);
+            }
+            _ => unreachable!(),
+        }
+
+        output
     }
 }

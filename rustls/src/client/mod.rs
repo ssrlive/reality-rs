@@ -25,8 +25,9 @@ use crate::{Tls12CipherSuite, Tls13CipherSuite, compress};
 
 mod config;
 pub use config::{
-    ClientConfig, ClientCredentialResolver, ClientSessionKey, ClientSessionStore,
-    CredentialRequest, Resumption, Tls12Resumption, WantsClientCert,
+    ClientConfig, ClientCredentialResolver, ClientHelloCallback, ClientHelloCallbackContext,
+    ClientSessionKey, ClientSessionStore, CredentialRequest, Resumption, Tls12Resumption,
+    WantsClientCert,
 };
 
 mod connection;
@@ -37,6 +38,12 @@ pub use ech::{EchConfig, EchGreaseConfig, EchMode, EchStatus};
 
 mod handy;
 pub use handy::ClientSessionMemoryCache;
+
+mod reality;
+pub use reality::{
+    PlaintextRealitySessionIdGenerator, RealityClientHello, RealitySessionIdGenerator,
+    RealitySessionIdSealer, SealingRealitySessionIdGenerator,
+};
 
 mod hs;
 pub(crate) use hs::ClientHandler;
@@ -50,6 +57,10 @@ pub(crate) use tls13::TLS13_HANDLER;
 /// Dangerous configuration that should be audited and used with extreme care.
 pub mod danger {
     pub use super::config::danger::{DangerousClientConfig, DangerousClientConfigBuilder};
+    pub use super::reality::{
+        PlaintextRealitySessionIdGenerator, RealityClientHello, RealitySessionIdGenerator,
+        RealitySessionIdSealer, SealingRealitySessionIdGenerator,
+    };
     pub use crate::verify::{
         HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
         SignatureVerificationInput,

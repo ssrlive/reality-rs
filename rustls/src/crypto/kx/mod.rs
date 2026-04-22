@@ -362,6 +362,14 @@ pub trait ActiveKeyExchange: Send + Sync {
     /// This consumes and so terminates the [`ActiveKeyExchange`].
     fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error>;
 
+    /// Optionally derives a REALITY-specific shared key using the provided server static public key.
+    ///
+    /// The default implementation returns `None`. Providers that can safely derive an additional
+    /// shared secret without consuming the in-progress handshake state may override this.
+    fn extract_reality_key(&self, _server_pub_key: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Completes the key exchange for the given TLS version, given the peer's public key.
     ///
     /// Note that finite-field Diffie–Hellman key exchange has different requirements for the derived
