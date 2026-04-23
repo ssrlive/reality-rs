@@ -25,6 +25,8 @@ We recommend new users start by looking at `simpleclient.rs` and `simpleserver.r
 
 ## REALITY Mapping
 
+For a longer Chinese write-up that explains both the protocol intuition and the current Rustls implementation boundary, see [examples/REALITY.md](REALITY.md).
+
 The REALITY-capable example programs now support both CLI flags and `--reality-config` files in JSON or TOML.
 
 `tlsserver-mio.rs` also supports `--reality-fallback-address <addr>` plus `--reality-fallback-port <port>`, or `reality.fallbackAddress` plus `reality.fallbackPort` in the config file, to raw-forward connections whose pre-read `ClientHello` SNI falls outside the configured `serverNames` allowlist to `addr:port`. The address defaults to `localhost` if only a port is set. CLI wins if both are set. The config file can also define ordered `reality.fallbackRules` entries to route specific SNI values, optional ALPN offerings, and optional key-exchange group offerings via `namedGroups`, to alternate decoy targets before the global fallback target is used. Each rule must include at least one matcher (`serverNames`, `alpns`, or `namedGroups`), and all fallback ports must be non-zero so invalid decoy targets fail at startup instead of later at connect time. This is an initial probe-diversion step for decoy handling, not a full Xray-equivalent cryptographic discriminator.
