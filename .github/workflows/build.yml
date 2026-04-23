@@ -27,6 +27,7 @@ jobs:
     name: Build+test
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         rust:
           - stable
@@ -75,36 +76,43 @@ jobs:
           go-version: "stable"
 
       - name: cargo build (debug; default features)
-        run: cargo build --locked
+        if: ${{ !cancelled() }}
+        run: cargo build
 
       # nb. feature sets that include "fips" should be --release --
       # this is required for fips on windows.
       # nb. "--all-targets" does not include doctests
       - name: cargo test (release; all features)
-        run: cargo test --locked --release --all-features --all-targets
+        if: ${{ !cancelled() }}
+        run: cargo test --release --all-features --all-targets
         env:
           RUST_BACKTRACE: 1
 
       # nb. this is separate since `--doc` option cannot be combined with other target option(s) ref:
       # - https://doc.rust-lang.org/cargo/commands/cargo-test.html
       - name: cargo test --doc (release; all-features)
-        run: cargo test --locked --release --all-features --doc
+        if: ${{ !cancelled() }}
+        run: cargo test --release --all-features --doc
         env:
           RUST_BACKTRACE: 1
 
       - name: cargo build (debug; no-std)
+        if: ${{ !cancelled() }}
         run: |
-          cargo build --locked --lib -p rustls $(admin/all-features-except std,brotli rustls)
-          cargo build --locked --lib -p rustls-ring --no-default-features
-          cargo build --locked --lib -p rustls-aws-lc-rs --no-default-features --features aws-lc-sys
+          cargo build --lib -p rustls $(admin/all-features-except std,brotli rustls)
+          cargo build --lib -p rustls-ring --no-default-features
+          cargo build --lib -p rustls-aws-lc-rs --no-default-features --features aws-lc-sys
 
       - name: cargo build (debug; rustls-provider-test)
-        run: cargo build --locked -p rustls-provider-test
+        if: ${{ !cancelled() }}
+        run: cargo build -p rustls-provider-test
 
       - name: cargo test (debug; rustls-provider-test; all features)
-        run: cargo test --locked --all-features -p rustls-provider-test
+        if: ${{ !cancelled() }}
+        run: cargo test --all-features -p rustls-provider-test
 
       - name: cargo package --all-features -p rustls
+        if: ${{ !cancelled() }}
         run: cargo package --all-features -p rustls
 
   msrv:
@@ -120,7 +128,7 @@ jobs:
         with:
           toolchain: "1.85"
 
-      - run: cargo check --locked --lib --all-features -p rustls
+      - run: cargo check --lib --all-features -p rustls
 
   features:
     name: Features
@@ -138,29 +146,29 @@ jobs:
 
       - name: cargo build (debug; default features)
         run: |
-          cargo build --locked -p rustls
-          cargo build --locked -p rustls-ring
-          cargo build --locked -p rustls-aws-lc-rs
+          cargo build -p rustls
+          cargo build -p rustls-ring
+          cargo build -p rustls-aws-lc-rs
 
       - name: cargo test (debug; default features)
-        run: cargo test --locked
+        run: cargo test
         working-directory: rustls
         env:
           RUST_BACKTRACE: 1
 
       - name: cargo test (debug; no default features)
         run: |
-          cargo test --locked -p rustls --no-default-features
-          cargo test --locked -p rustls-ring --no-default-features
-          cargo test --locked -p rustls-aws-lc-rs --no-default-features --features aws-lc-sys
+          cargo test -p rustls --no-default-features
+          cargo test -p rustls-ring --no-default-features
+          cargo test -p rustls-aws-lc-rs --no-default-features --features aws-lc-sys
 
       - name: cargo test (debug; no default features; std)
         run: |
-          cargo test --locked -p rustls-ring --no-default-features --features std
-          cargo test --locked -p rustls-aws-lc-rs --no-default-features --features std --features aws-lc-sys
+          cargo test -p rustls-ring --no-default-features --features std
+          cargo test -p rustls-aws-lc-rs --no-default-features --features std --features aws-lc-sys
 
       - name: cargo test (release; no run)
-        run: cargo test --locked --release --no-run
+        run: cargo test --release --no-run
         working-directory: rustls
 
   bogo:
@@ -238,16 +246,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Smoke-test benchmark program (ring)
-        run: cargo run -p rustls-bench --profile=bench --locked --features ring -- --multiplier 0.1
+        run: cargo run -p rustls-bench --profile=bench --features ring -- --multiplier 0.1
 
       - name: Smoke-test benchmark program (aws-lc-rs)
-        run: cargo run -p rustls-bench --profile=bench --locked --features aws-lc-rs -- --multiplier 0.1
+        run: cargo run -p rustls-bench --profile=bench --features aws-lc-rs -- --multiplier 0.1
 
       - name: Smoke-test benchmark program (fips)
-        run: cargo run -p rustls-bench --profile=bench --locked --features fips -- --provider aws-lc-rs-fips --multiplier 0.1
+        run: cargo run -p rustls-bench --profile=bench --features fips -- --provider aws-lc-rs-fips --multiplier 0.1
 
       - name: Run micro-benchmarks
-        run: cargo bench --locked --all-features
+        run: cargo bench --all-features
         env:
           RUSTFLAGS: --cfg=bench
           # unit-benchmarks are permanantly unstable
@@ -267,13 +275,13 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: cargo doc (rustls; all features)
-        run: cargo doc --locked --all-features --no-deps --document-private-items --package rustls
+        run: cargo doc --all-features --no-deps --document-private-items --package rustls
         env:
           RUSTDOCFLAGS: -Dwarnings
 
       - name: Check README.md
         run: |
-          cargo build --locked --all-features
+          cargo build --all-features
           ./admin/pull-readme
           git diff --exit-code
 
@@ -344,6 +352,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'merge_group'
     strategy:
+      fail-fast: false
       matrix:
         target:
           # 32-bit Android (Linux) targets:
@@ -375,8 +384,12 @@ jobs:
           git: https://github.com/cross-rs/cross
           # known-working main in feb 2025, bump as needed
           rev: c7dee4d
-      - run: cross test --package rustls --target ${{ matrix.target }}
-      - run: cross test --package rustls-test --features aws-lc-rs --no-default-features --target ${{ matrix.target }}
+      - name: Run cross tests
+        if: ${{ !cancelled() }}
+        run: cross test --package rustls --target ${{ matrix.target }}
+      - name: Run cross tests (rustls-test)
+        if: ${{ !cancelled() }}
+        run: cross test --package rustls-test --features aws-lc-rs --no-default-features --target ${{ matrix.target }}
 
   semver:
     name: Check semver compatibility
@@ -532,7 +545,7 @@ jobs:
 
       - name: cargo test (in openssl-tests/)
         working-directory: openssl-tests/
-        run: cargo test --locked -- --include-ignored
+        run: cargo test -- --include-ignored
         env:
           RUST_BACKTRACE: 1
 
