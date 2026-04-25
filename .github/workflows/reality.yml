@@ -1,0 +1,64 @@
+name: "REALITY smoke tests"
+
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: "--deny warnings"
+  AWS_LC_SYS_NO_JITTER_ENTROPY: 1
+
+jobs:
+  reality-smoke:
+    name: "REALITY smoke (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NASM for aws-lc-rs on Windows
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install ninja-build tool for aws-lc-fips-sys on Windows
+        if: runner.os == 'Windows'
+        uses: seanmiddleditch/gha-setup-ninja@v6
+
+      - name: Run REALITY smoke test (Linux/macOS)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: bash ./admin/reality-smoke.sh --build-with-cargo
+
+      - name: Run REALITY smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./admin/reality-smoke.ps1 -BuildWithCargo
+
+      - name: Upload REALITY smoke logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reality-smoke-logs-${{ matrix.os }}
+          path: target/tmp/
+          if-no-files-found: ignore
