@@ -10,6 +10,8 @@ Use the sample config in [config/reality-server.toml](config/reality-server.toml
 cargo run -p server -- --cert .\bogo\keys\cert.pem --key .\bogo\keys\key.pem --listen 127.0.0.1:9445 --reality-config .\server\config\reality-server.toml
 ```
 
+Both TOML and JSON config files are supported. An equivalent JSON sample is available in [config/reality-server.json](config/reality-server.json).
+
 ## Local tunnel smoke test
 
 One simple local target is a tiny HTTP listener on port `18080`. Once that target is up and the formal client is also running, the request path is:

@@ -10,6 +10,8 @@ Use the sample config in [config/reality-client.json](config/reality-client.json
 cargo run -p client -- --listen 127.0.0.1:1081 --server-addr 127.0.0.1:9445 --reality-config .\client\config\reality-client.json --ca-file .\bogo\keys\cert.pem --insecure
 ```
 
+Both JSON and TOML config files are supported. An equivalent TOML sample is available in [config/reality-client.toml](config/reality-client.toml).
+
 The `--insecure` flag is only for the local test path here, because the bundled `bogo/keys/cert.pem` certificate is not provisioned to match the sample REALITY `serverName` value.
 
 ## End-to-end smoke test
