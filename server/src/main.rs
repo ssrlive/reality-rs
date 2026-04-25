@@ -9,6 +9,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHelloVerifier, RealityClientHello};
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
+use socks5_impl::protocol::{Address, StreamOperation};
 use std::hash::Hasher;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -66,12 +67,6 @@ struct RealityServerConfigResolved {
     short_id: String,
     version: String,
     server_names: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-struct TunnelTarget {
-    host: String,
-    port: u16,
 }
 
 #[derive(Debug)]
@@ -155,8 +150,8 @@ fn handle_connection_blocking(
     let mut tls_stream = StreamOwned::new(conn, stream);
     let target =
         read_target_header_blocking(&mut tls_stream).context("read tunnel target header")?;
-    let upstream = std::net::TcpStream::connect((target.host.as_str(), target.port))
-        .with_context(|| format!("connect upstream {}:{}", target.host, target.port))?;
+    let upstream = std::net::TcpStream::connect(target.clone())
+        .with_context(|| format!("connect upstream {}:{}", target.domain(), target.port()))?;
     upstream.set_nodelay(true)?;
 
     relay_plain_and_tls(upstream, tls_stream).context("relay tunnel traffic")
@@ -259,7 +254,7 @@ where
     }
 }
 
-fn read_target_header_blocking<R>(reader: &mut R) -> Result<TunnelTarget>
+fn read_target_header_blocking<R>(reader: &mut R) -> Result<Address>
 where
     R: Read,
 {
@@ -269,35 +264,7 @@ where
         bail!("invalid tunnel header magic")
     }
 
-    let mut address_type = [0u8; 1];
-    reader.read_exact(&mut address_type)?;
-    let host = match address_type[0] {
-        1 => {
-            let mut octets = [0u8; 4];
-            reader.read_exact(&mut octets)?;
-            std::net::Ipv4Addr::from(octets).to_string()
-        }
-        3 => {
-            let mut length = [0u8; 1];
-            reader.read_exact(&mut length)?;
-            let mut bytes = vec![0u8; length[0] as usize];
-            reader.read_exact(&mut bytes)?;
-            String::from_utf8(bytes).context("target host is not valid UTF-8")?
-        }
-        4 => {
-            let mut octets = [0u8; 16];
-            reader.read_exact(&mut octets)?;
-            std::net::Ipv6Addr::from(octets).to_string()
-        }
-        other => bail!("unsupported tunnel address type: {other}"),
-    };
-
-    let mut port = [0u8; 2];
-    reader.read_exact(&mut port)?;
-    Ok(TunnelTarget {
-        host,
-        port: u16::from_be_bytes(port),
-    })
+    Ok(Address::retrieve_from_stream(reader)?)
 }
 
 fn relay_plain_and_tls<C>(

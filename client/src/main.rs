@@ -13,7 +13,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
-use socks5_impl::protocol::{Address, Reply};
+use socks5_impl::protocol::{Address, Reply, StreamOperation};
 use socks5_impl::server::Server;
 use socks5_impl::server::auth::NoAuth;
 use socks5_impl::server::connection::ClientConnection as SocksClientConnection;
@@ -76,12 +76,6 @@ struct RealityClientConfigResolved {
     short_id: String,
     version: String,
     server_name: String,
-}
-
-#[derive(Clone, Debug)]
-struct TunnelTarget {
-    host: String,
-    port: u16,
 }
 
 #[derive(Debug)]
@@ -168,7 +162,7 @@ async fn handle_connection(
 
     match authenticated.wait_request().await? {
         SocksClientConnection::Connect(connect, address) => {
-            let target = decode_address(&address)?;
+            let target = address.clone();
             let established = tokio::task::spawn_blocking({
                 let tls_config = Arc::clone(&tls_config);
                 let server_addr = server_addr.clone();
@@ -314,13 +308,6 @@ where
     }
 }
 
-fn decode_address(address: &Address) -> Result<TunnelTarget> {
-    Ok(TunnelTarget {
-        host: address.domain(),
-        port: address.port(),
-    })
-}
-
 fn parse_reality_version(version: &str) -> [u8; 3] {
     let version = version.trim();
     assert_eq!(version.len(), 6, "REALITY version must be 6 hex digits");
@@ -353,7 +340,7 @@ fn establish_tls_client(
     tls_config: Arc<ClientConfig>,
     server_addr: &str,
     tls_server_name: &str,
-    target: &TunnelTarget,
+    target: &Address,
 ) -> Result<EstablishedTlsClient> {
     let mut upstream = std::net::TcpStream::connect(server_addr)
         .with_context(|| format!("connect REALITY server {server_addr}"))?;
@@ -466,34 +453,12 @@ where
     Ok(())
 }
 
-fn write_target_header_blocking<W>(writer: &mut W, target: &TunnelTarget) -> Result<()>
+fn write_target_header_blocking<W>(writer: &mut W, target: &Address) -> Result<()>
 where
     W: Write,
 {
     writer.write_all(b"RLY1")?;
-
-    if let Ok(ipv4) = target
-        .host
-        .parse::<std::net::Ipv4Addr>()
-    {
-        writer.write_all(&[1])?;
-        writer.write_all(&ipv4.octets())?;
-    } else if let Ok(ipv6) = target
-        .host
-        .parse::<std::net::Ipv6Addr>()
-    {
-        writer.write_all(&[4])?;
-        writer.write_all(&ipv6.octets())?;
-    } else {
-        let host = target.host.as_bytes();
-        if host.len() > u8::MAX as usize {
-            bail!("target host is too long")
-        }
-        writer.write_all(&[3, host.len() as u8])?;
-        writer.write_all(host)?;
-    }
-
-    writer.write_all(&target.port.to_be_bytes())?;
+    target.write_to_stream(writer)?;
     writer.flush()?;
     Ok(())
 }
