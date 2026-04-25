@@ -370,11 +370,14 @@ client_listen="$(resolve_endpoint "$client_listen" 'Client')"
 target_listen="$(resolve_endpoint "$target_listen" 'Target')"
 target_uri="http://${target_listen}/"
 
+smoke_password='reality-smoke-password'
+
 server_args=(
     '--cert' './bogo/keys/cert.pem'
     '--key' './bogo/keys/key.pem'
     '--listen' "$server_listen"
     '--reality-config' './server/config/reality-server.toml'
+    '--password' "$smoke_password"
 )
 
 client_args=(
@@ -383,6 +386,7 @@ client_args=(
     '--reality-config' './client/config/reality-client.json'
     '--ca-file' './bogo/keys/cert.pem'
     '--insecure'
+    '--password' "$smoke_password"
 )
 
 if (( build_with_cargo == 1 )); then

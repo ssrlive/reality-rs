@@ -310,11 +310,14 @@ $ClientListen = Resolve-Endpoint -PreferredEndpoint $ClientListen -Label 'Client
 $TargetListen = Resolve-Endpoint -PreferredEndpoint $TargetListen -Label 'Target'
 $targetUri = "http://$TargetListen/"
 
+$smokePassword = 'reality-smoke-password'
+
 $serverArgs = @(
     '--cert', '.\bogo\keys\cert.pem',
     '--key', '.\bogo\keys\key.pem',
     '--listen', $ServerListen,
-    '--reality-config', '.\server\config\reality-server.toml'
+    '--reality-config', '.\server\config\reality-server.toml',
+    '--password', $smokePassword
 )
 
 $clientArgs = @(
@@ -322,7 +325,8 @@ $clientArgs = @(
     '--server-addr', $ServerListen,
     '--reality-config', '.\client\config\reality-client.json',
     '--ca-file', '.\bogo\keys\cert.pem',
-    '--insecure'
+    '--insecure',
+    '--password', $smokePassword
 )
 
 try {

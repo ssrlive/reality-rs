@@ -1,5 +1,35 @@
+//! REALITY-wrapped server speaking the **full AnyTLS protocol**.
+//!
+//! For each inbound TCP:
+//! 1. REALITY rustls handshake on a blocking worker thread.
+//! 2. Bridge into an async `DuplexStream`.
+//! 3. Read anytls auth header `sha256(password) || u16be(pad_len) || pad`.
+//! 4. Hand the carrier to `anytls::proxy::session::new_server_session` and
+//!    drive its `run()` loop. The library handles cmdSettings,
+//!    cmdServerSettings, cmdSYN/cmdSYNACK, cmdPSH/cmdFIN, cmdWaste etc.
+//! 5. For each opened anytls stream: read a SOCKS5-style `Address` (the
+//!    proxy target). If it is the AnyTLS UoT sentinel, follow with a
+//!    `UotRequest` and run a UDP-over-TCP relay. Otherwise dial the
+//!    address and bidirectionally relay between the upstream socket and
+//!    the anytls stream.
+//!
+//! Note: anytls's protocol mandates that clients implement session reuse
+//! and that the server be tolerant of any number of streams per session.
+//! We do nothing special on the server side for that — if a client opens
+//! many streams over one session, this server still serves them all.
+
+mod async_bridge;
+
 use anyhow::{Context, Result, bail};
+use anytls::core::PaddingFactory;
+use anytls::proxy::session::{Session, Stream as AnytlsStream, new_server_session};
+use anytls::runtime::DefaultPaddingFactory;
+use anytls::uot::{
+    UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream,
+    uot_get_request_from_stream, uot_is_sentinel_destination,
+};
 use clap::Parser;
+use core::hash::Hasher;
 use rustls::Connection;
 use rustls::ServerConfig;
 use rustls::ServerConnection;
@@ -9,13 +39,12 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHelloVerifier, RealityClientHello};
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
-use socks5_impl::protocol::{Address, StreamOperation};
-use std::hash::Hasher;
-use std::io::{self, Read, Write};
+use sha2::{Digest, Sha256};
+use socks5_impl::protocol::{Address, AsyncStreamOperation};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::net::{TcpListener, TcpStream as TokioTcpStream, UdpSocket};
 
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -43,6 +72,14 @@ struct Args {
 
     #[arg(long = "reality-server-name")]
     reality_server_name: Vec<String>,
+
+    /// AnyTLS shared password.
+    #[arg(long, env = "ANYTLS_PASSWORD")]
+    password: String,
+
+    /// Log filter (off/error/warn/info/debug/trace or env-style spec).
+    #[arg(long, default_value = "info")]
+    log: String,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -79,7 +116,7 @@ impl ClientHelloVerifier for ExampleRealityVerifier {
     fn verify_client_hello(
         &self,
         client_hello: &RealityClientHello<'_>,
-    ) -> std::result::Result<(), rustls::Error> {
+    ) -> core::result::Result<(), rustls::Error> {
         if !self.server_names.is_empty() {
             let server_name = client_hello
                 .server_name()
@@ -113,49 +150,257 @@ impl ClientHelloVerifier for ExampleRealityVerifier {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.clone()))
+        .init();
+
+    if args.password.is_empty() {
+        bail!("anytls password must not be empty (set --password or ANYTLS_PASSWORD)");
+    }
+
     let reality = resolve_reality_config(&args)?;
-    let config = Arc::new(build_server_config(&args, &reality)?);
+    let tls_config = Arc::new(build_server_config(&args, &reality)?);
+    let password_sha256: [u8; 32] = Sha256::digest(args.password.as_bytes()).into();
+    let padding = DefaultPaddingFactory::load();
+
     let listener = TcpListener::bind(&args.listen).await?;
+    log::info!("REALITY+anytls server listening on {}", args.listen);
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
-        let config = Arc::clone(&config);
-
+        let tls_config = tls_config.clone();
+        let padding = padding.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, config).await {
-                eprintln!("REALITY client {peer_addr} failed: {error:#}");
+            if let Err(error) =
+                handle_connection(stream, tls_config, password_sha256, padding).await
+            {
+                log::warn!("REALITY client {peer_addr} failed: {error:#}");
             }
         });
     }
 }
 
-async fn handle_connection(stream: TcpStream, config: Arc<ServerConfig>) -> Result<()> {
-    let stream = stream.into_std()?;
-    tokio::task::spawn_blocking(move || handle_connection_blocking(stream, config)).await??;
+async fn handle_connection(
+    stream: TokioTcpStream,
+    config: Arc<ServerConfig>,
+    password_sha256: [u8; 32],
+    padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
+) -> Result<()> {
+    stream.set_nodelay(true).ok();
+    let std_stream = stream.into_std()?;
+
+    // 1) REALITY blocking handshake on a worker thread.
+    let tls = tokio::task::spawn_blocking(
+        move || -> Result<StreamOwned<ServerConnection, std::net::TcpStream>> {
+            let mut sock = std_stream;
+            sock.set_nonblocking(false)?;
+            let mut conn = ServerConnection::new(config)?;
+            while conn.is_handshaking() {
+                complete_io(&mut sock, &mut conn).context("complete REALITY handshake")?;
+            }
+            Ok(StreamOwned::new(conn, sock))
+        },
+    )
+    .await??;
+
+    // 2) Bridge into async.
+    let mut bridge = async_bridge::into_async(tls)?;
+
+    // 3) Read anytls auth: 32 sha256(password) + u16be padding_len + padding.
+    let mut auth = [0u8; 34];
+    bridge
+        .read_exact(&mut auth)
+        .await
+        .context("read anytls auth header")?;
+    if auth[..32] != password_sha256[..] {
+        log::debug!("anytls auth failed for an inbound REALITY peer");
+        return Ok(());
+    }
+    let padding_len = u16::from_be_bytes([auth[32], auth[33]]);
+    if padding_len > 0 {
+        let mut padding_buf = vec![0u8; padding_len as usize];
+        bridge
+            .read_exact(&mut padding_buf)
+            .await
+            .context("read anytls padding")?;
+    }
+
+    // 4) Hand the carrier to anytls and run the session loop.
+    let session = new_server_session(
+        Box::new(bridge),
+        Box::new(|stream: Arc<AnytlsStream>| {
+            tokio::spawn(async move {
+                if let Err(error) = handle_stream(stream).await {
+                    log::debug!("stream error: {error:#}");
+                }
+            });
+        }),
+        padding,
+    )
+    .await;
+
+    let session: Session = session;
+    if let Err(error) = session.run().await {
+        log::debug!("anytls session ended: {error}");
+    }
     Ok(())
 }
 
-fn handle_connection_blocking(
-    stream: std::net::TcpStream,
-    config: Arc<ServerConfig>,
-) -> Result<()> {
-    let mut stream = stream;
-    stream.set_nonblocking(false)?;
-    stream.set_nodelay(true)?;
-    let mut conn = ServerConnection::new(config)?;
-    while conn.is_handshaking() {
-        complete_io(&mut stream, &mut conn).context("complete REALITY handshake")?;
+async fn handle_stream(stream: Arc<AnytlsStream>) -> Result<()> {
+    let mut reader = AnytlsStreamReader::new(stream.clone());
+    let destination = Address::retrieve_from_async_stream(&mut reader).await?;
+
+    if uot_is_sentinel_destination(&destination) {
+        let request = uot_get_request_from_stream(&mut reader).await?;
+        return match request.mode {
+            UotMode::Connected => handle_uot_connected(stream, &mut reader, &request).await,
+            UotMode::Datagram => handle_uot_datagram(stream, &mut reader).await,
+        };
     }
 
-    let mut tls_stream = StreamOwned::new(conn, stream);
-    let target =
-        read_target_header_blocking(&mut tls_stream).context("read tunnel target header")?;
-    let upstream = std::net::TcpStream::connect(target.clone())
-        .with_context(|| format!("connect upstream {}:{}", target.domain(), target.port()))?;
-    upstream.set_nodelay(true)?;
-
-    relay_plain_and_tls(upstream, tls_stream).context("relay tunnel traffic")
+    handle_tcp_stream(stream, destination).await
 }
+
+async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> Result<()> {
+    let dst = destination.to_string();
+    let mut outbound = match TokioTcpStream::connect(&dst).await {
+        Ok(s) => s,
+        Err(err) => {
+            log::debug!("connect upstream {dst} failed: {err}");
+            stream
+                .handshake_failure(&err.to_string())
+                .await?;
+            stream.close().await?;
+            return Err(err.into());
+        }
+    };
+    outbound.set_nodelay(true).ok();
+    stream.handshake_success().await?;
+
+    let (stream_read, stream_write) = stream.split_ref();
+    let (mut up_read, mut up_write) = outbound.split();
+
+    let s2u = async {
+        use tokio::io::AsyncWriteExt;
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match stream_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if up_write
+                        .write_all(&buf[..n])
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = up_write.shutdown().await;
+        Ok::<(), std::io::Error>(())
+    };
+
+    let u2s = async {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match up_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stream_write
+                        .write(&buf[..n])
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = stream_write.close().await;
+        Ok::<(), std::io::Error>(())
+    };
+
+    let _ = tokio::join!(s2u, u2s);
+    Ok(())
+}
+
+async fn handle_uot_datagram(
+    stream: Arc<AnytlsStream>,
+    reader: &mut AnytlsStreamReader,
+) -> Result<()> {
+    let udp = UdpSocket::bind("0.0.0.0:0").await?;
+    stream.handshake_success().await?;
+    let mut buf = vec![0u8; 65_535];
+
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                res = uot_get_packet_from_stream(UotMode::Datagram, reader) => {
+                    let (destination, payload) = res?;
+                    let dst = destination
+                        .ok_or_else(|| anyhow::anyhow!("UoT datagram missing destination"))?;
+                    udp.send_to(&payload, dst.to_string()).await?;
+                }
+                res = udp.recv_from(&mut buf) => {
+                    let (n, source) = res?;
+                    let frame = uot_encode_packet(
+                        UotMode::Datagram,
+                        Some(&Address::from(source)),
+                        &buf[..n],
+                    )?;
+                    stream.write(&frame).await?;
+                }
+            }
+        }
+    }
+    .await;
+
+    let _ = stream.close().await;
+    result
+}
+
+async fn handle_uot_connected(
+    stream: Arc<AnytlsStream>,
+    reader: &mut AnytlsStreamReader,
+    request: &UotRequest,
+) -> Result<()> {
+    let udp = UdpSocket::bind("0.0.0.0:0").await?;
+    let dst = request.destination.to_string();
+    if let Err(err) = udp.connect(&dst).await {
+        stream
+            .handshake_failure(&err.to_string())
+            .await?;
+        stream.close().await?;
+        return Err(err.into());
+    }
+    stream.handshake_success().await?;
+    let mut buf = vec![0u8; 65_535];
+
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                res = uot_get_packet_from_stream(UotMode::Connected, reader) => {
+                    let (_, payload) = res?;
+                    udp.send(&payload).await?;
+                }
+                res = udp.recv(&mut buf) => {
+                    let n = res?;
+                    let frame = uot_encode_packet(UotMode::Connected, None, &buf[..n])?;
+                    stream.write(&frame).await?;
+                }
+            }
+        }
+    }
+    .await;
+
+    let _ = stream.close().await;
+    result
+}
+
+// === helpers ===
 
 fn resolve_reality_config(args: &Args) -> Result<RealityServerConfigResolved> {
     let file_config = if let Some(path) = args.reality_config.as_deref() {
@@ -170,7 +415,7 @@ fn resolve_reality_config(args: &Args) -> Result<RealityServerConfigResolved> {
         .or_else(|| {
             file_config
                 .as_ref()
-                .map(|config| config.short_id.clone())
+                .map(|c| c.short_id.clone())
         });
     let private_key = args
         .reality_private_key
@@ -178,7 +423,7 @@ fn resolve_reality_config(args: &Args) -> Result<RealityServerConfigResolved> {
         .or_else(|| {
             file_config
                 .as_ref()
-                .map(|config| config.private_key.clone())
+                .map(|c| c.private_key.clone())
         });
     let version = args
         .reality_version
@@ -186,22 +431,22 @@ fn resolve_reality_config(args: &Args) -> Result<RealityServerConfigResolved> {
         .or_else(|| {
             file_config
                 .as_ref()
-                .map(|config| config.version.clone())
+                .map(|c| c.version.clone())
         });
     let server_names = if args.reality_server_name.is_empty() {
         file_config
             .as_ref()
-            .map(|config| config.server_names.clone())
+            .map(|c| c.server_names.clone())
             .unwrap_or_default()
     } else {
         args.reality_server_name.clone()
     };
 
     match (short_id, private_key, version) {
-        (Some(short_id), Some(private_key), Some(version)) => Ok(RealityServerConfigResolved {
-            private_key,
-            short_id,
-            version,
+        (Some(s), Some(p), Some(v)) => Ok(RealityServerConfigResolved {
+            short_id: s,
+            private_key: p,
+            version: v,
             server_names,
         }),
         _ => bail!(
@@ -213,7 +458,7 @@ fn resolve_reality_config(args: &Args) -> Result<RealityServerConfigResolved> {
 fn build_server_config(args: &Args, reality: &RealityServerConfigResolved) -> Result<ServerConfig> {
     let certs = CertificateDer::pem_file_iter(&args.cert)
         .context("open certificate file")?
-        .collect::<std::result::Result<Vec<_>, _>>()
+        .collect::<core::result::Result<Vec<_>, _>>()
         .context("read certificate chain")?;
     let private_key = PrivateKeyDer::from_pem_file(&args.key).context("read private key")?;
 
@@ -254,108 +499,9 @@ where
     }
 }
 
-fn read_target_header_blocking<R>(reader: &mut R) -> Result<Address>
-where
-    R: Read,
-{
-    let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic)?;
-    if &magic != b"RLY1" {
-        bail!("invalid tunnel header magic")
-    }
-
-    Ok(Address::retrieve_from_stream(reader)?)
-}
-
-fn relay_plain_and_tls<C>(
-    mut plain_stream: std::net::TcpStream,
-    mut tls_stream: StreamOwned<C, std::net::TcpStream>,
-) -> Result<()>
-where
-    C: Connection,
-{
-    plain_stream.set_nonblocking(true)?;
-    tls_stream.sock.set_nonblocking(true)?;
-
-    let mut plain_to_tls = Vec::new();
-    let mut tls_to_plain = Vec::new();
-    let mut plain_closed = false;
-    let mut tls_closed = false;
-    let mut buf = [0u8; 16 * 1024];
-
-    loop {
-        let mut progressed = false;
-
-        if !plain_closed && plain_to_tls.len() < 128 * 1024 {
-            match plain_stream.read(&mut buf) {
-                Ok(0) => {
-                    plain_closed = true;
-                    tls_stream.conn.send_close_notify();
-                    progressed = true;
-                }
-                Ok(read) => {
-                    plain_to_tls.extend_from_slice(&buf[..read]);
-                    progressed = true;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        if !plain_to_tls.is_empty() {
-            match tls_stream.write(&plain_to_tls) {
-                Ok(written) => {
-                    plain_to_tls.drain(..written);
-                    progressed = true;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
-            let _ = tls_stream.flush();
-        }
-
-        if !tls_closed && tls_to_plain.len() < 128 * 1024 {
-            match tls_stream.read(&mut buf) {
-                Ok(0) => {
-                    tls_closed = true;
-                    progressed = true;
-                }
-                Ok(read) => {
-                    tls_to_plain.extend_from_slice(&buf[..read]);
-                    progressed = true;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        if !tls_to_plain.is_empty() {
-            match plain_stream.write(&tls_to_plain) {
-                Ok(written) => {
-                    tls_to_plain.drain(..written);
-                    progressed = true;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        if (plain_closed || tls_closed) && plain_to_tls.is_empty() && tls_to_plain.is_empty() {
-            break;
-        }
-
-        if !progressed {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    Ok(())
-}
-
 fn parse_reality_version(version: &str) -> [u8; 3] {
     let version = version.trim();
     assert_eq!(version.len(), 6, "REALITY version must be 6 hex digits");
-
     let mut parsed = [0u8; 3];
     for (index, chunk) in version
         .as_bytes()
@@ -378,4 +524,67 @@ fn parse_hex_nibble(value: u8) -> u8 {
         b'A'..=b'F' => value - b'A' + 10,
         _ => panic!("REALITY version must contain only hexadecimal digits"),
     }
+}
+
+// === AsyncRead adapter for AnytlsStream ===
+
+struct AnytlsStreamReader {
+    inner: Arc<AnytlsStream>,
+    #[allow(clippy::type_complexity)]
+    read_fut: Option<
+        core::pin::Pin<
+            Box<dyn core::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>,
+        >,
+    >,
+}
+
+impl AnytlsStreamReader {
+    fn new(inner: Arc<AnytlsStream>) -> Self {
+        Self {
+            inner,
+            read_fut: None,
+        }
+    }
+}
+
+impl AsyncRead for AnytlsStreamReader {
+    fn poll_read(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        loop {
+            if let Some(fut) = self.read_fut.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    core::task::Poll::Ready(Ok((v, n))) => {
+                        self.read_fut = None;
+                        buf.put_slice(&v[..n]);
+                        return core::task::Poll::Ready(Ok(()));
+                    }
+                    core::task::Poll::Ready(Err(e)) => {
+                        self.read_fut = None;
+                        return core::task::Poll::Ready(Err(e));
+                    }
+                    core::task::Poll::Pending => return core::task::Poll::Pending,
+                }
+            }
+
+            let remaining = buf.remaining();
+            if remaining == 0 {
+                return core::task::Poll::Ready(Ok(()));
+            }
+
+            let inner = self.inner.clone();
+            self.read_fut = Some(Box::pin(async move {
+                let mut v = vec![0u8; remaining];
+                let n = inner.read(&mut v).await?;
+                Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
+            }));
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn _force_connection_in_scope(c: &ServerConnection) -> bool {
+    Connection::is_handshaking(c)
 }

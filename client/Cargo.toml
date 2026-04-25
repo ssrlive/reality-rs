@@ -6,14 +6,26 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+anytls = { workspace = true }
 clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
 rustls = { path = "../rustls", features = ["log"] }
 rustls-aws-lc-rs = { path = "../rustls-aws-lc-rs" }
 rustls-util = { path = "../rustls-util" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 socks5-impl = { workspace = true, features = ["server"] }
-tokio = { workspace = true, features = ["io-std", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 toml = { workspace = true }
 webpki-roots = { workspace = true }
 

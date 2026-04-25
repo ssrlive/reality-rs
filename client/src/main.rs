@@ -1,9 +1,38 @@
-use anyhow::{Context, Result, bail};
+//! REALITY-wrapped SOCKS5 client speaking the **full AnyTLS protocol**.
+//!
+//! Architecture:
+//!
+//! - All session-level concerns (cmdSettings/cmdServerSettings, cmdSYN/
+//!   cmdSYNACK, cmdPSH/cmdFIN, cmdWaste padding scheme, idle session pool,
+//!   stream multiplexing) are owned by `anytls::proxy::session::Client`.
+//!   We only provide a `dial_out` callback that returns a fresh
+//!   `Box<dyn AsyncReadWrite>` carrier on demand.
+//! - Each carrier = one REALITY-protected TCP connection. The blocking
+//!   rustls handshake runs on `std::net::TcpStream` via
+//!   `rustls_util::StreamOwned`, then is bridged into a tokio
+//!   `DuplexStream` so anytls can drive it asynchronously.
+//! - Idle anytls sessions are reused for subsequent SOCKS requests
+//!   (`Client::create_stream` picks an idle session under the
+//!   `MAX_STREAMS_PER_SESSION` limit, otherwise dials a new one).
+//! - SOCKS5 supports `CONNECT` (TCP) and `UDP ASSOCIATE` (anytls UoT
+//!   Datagram mode, see `anytls::uot`).
+
+mod async_bridge;
+
+use anyhow::{Context, Result, anyhow, bail};
+use anytls::AsyncReadWrite;
+use anytls::core::PaddingFactory;
+use anytls::proxy::session::{Client, Stream as AnytlsStream};
+use anytls::runtime::DefaultPaddingFactory;
+use anytls::uot::{
+    UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination,
+};
 use clap::Parser;
+use core::net::SocketAddr;
+use core::time::Duration;
 use rustls::ClientConfig;
 use rustls::Connection;
 use rustls::RootCertStore;
-use rustls::client::ClientConnection;
 use rustls::client::danger::{
     HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
     SignatureVerificationInput,
@@ -13,28 +42,37 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
-use socks5_impl::protocol::{Address, Reply, StreamOperation};
-use socks5_impl::server::Server;
+use sha2::{Digest, Sha256};
+use socks5_impl::protocol::{Address, Reply};
 use socks5_impl::server::auth::NoAuth;
-use socks5_impl::server::connection::ClientConnection as SocksClientConnection;
-use std::io::{self, Read, Write};
+use socks5_impl::server::connection::{
+    ClientConnection as SocksClientConnection, IncomingConnection, associate, connect,
+};
+use socks5_impl::server::{AssociatedUdpSocket, Server, UdpAssociate};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
+
+const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
 
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
+    /// SOCKS5 listen address.
     #[arg(long, default_value = "127.0.0.1:1080")]
     listen: String,
 
+    /// Upstream REALITY server address (`host:port`).
     #[arg(long)]
     server_addr: String,
 
+    /// SNI value sent inside the REALITY ClientHello. Falls back to the
+    /// `serverName` field in `--reality-config`.
     #[arg(long)]
     server_name: Option<String>,
 
+    /// Path to a REALITY client config (`.toml` or `.json`).
     #[arg(long)]
     reality_config: Option<PathBuf>,
 
@@ -47,11 +85,34 @@ struct Args {
     #[arg(long, requires_all = ["reality_short_id", "reality_public_key"])]
     reality_version: Option<String>,
 
+    /// Optional CA bundle for verifying the decoy certificate.
     #[arg(long)]
     ca_file: Option<PathBuf>,
 
+    /// Skip certificate verification (REALITY makes this safe; the server's
+    /// real identity is proven by the X25519 auth key).
     #[arg(long)]
     insecure: bool,
+
+    /// AnyTLS shared password.
+    #[arg(long, env = "ANYTLS_PASSWORD")]
+    password: String,
+
+    /// How often to reap idle anytls sessions (seconds).
+    #[arg(long, default_value_t = 30)]
+    idle_check_secs: u64,
+
+    /// Idle anytls session timeout before close (seconds).
+    #[arg(long, default_value_t = 30)]
+    idle_timeout_secs: u64,
+
+    /// Minimum number of warm idle anytls sessions to keep.
+    #[arg(long, default_value_t = 5)]
+    min_idle_sessions: usize,
+
+    /// Log filter (off/error/warn/info/debug/trace or env-style spec).
+    #[arg(long, default_value = "info")]
+    log: String,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -85,21 +146,21 @@ impl ServerVerifier for NoCertificateVerification {
     fn verify_identity(
         &self,
         _identity: &ServerIdentity<'_>,
-    ) -> std::result::Result<PeerVerified, rustls::Error> {
+    ) -> core::result::Result<PeerVerified, rustls::Error> {
         Ok(PeerVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
         _input: &SignatureVerificationInput<'_>,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+    ) -> core::result::Result<HandshakeSignatureValid, rustls::Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
 
     fn verify_tls13_signature(
         &self,
         _input: &SignatureVerificationInput<'_>,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+    ) -> core::result::Result<HandshakeSignatureValid, rustls::Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
 
@@ -121,78 +182,338 @@ impl ServerVerifier for NoCertificateVerification {
         false
     }
 
-    fn hash_config(&self, _: &mut dyn std::hash::Hasher) {}
+    fn hash_config(&self, _: &mut dyn core::hash::Hasher) {}
 }
 
-struct EstablishedTlsClient {
-    tls_stream: StreamOwned<ClientConnection, std::net::TcpStream>,
+#[derive(Clone)]
+struct DialCtx {
+    server_addr: String,
+    tls_config: Arc<ClientConfig>,
+    server_name: String,
+    password_sha256: [u8; 32],
+    padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.clone()))
+        .init();
+
+    if args.password.is_empty() {
+        bail!("anytls password must not be empty (set --password or ANYTLS_PASSWORD)");
+    }
+
     let reality = resolve_reality_config(&args)?;
-    let tls_server_name = reality.server_name.clone();
     let tls_config = Arc::new(build_client_config(&args, &reality)?);
-    let socks_server = Server::bind(args.listen.parse()?, Arc::new(NoAuth)).await?;
+    let server_addr = args.server_addr.clone();
+    let server_name = reality.server_name.clone();
+    let padding = DefaultPaddingFactory::load();
+
+    let dial_ctx = Arc::new(DialCtx {
+        server_addr: server_addr.clone(),
+        tls_config,
+        server_name: server_name.clone(),
+        password_sha256: Sha256::digest(args.password.as_bytes()).into(),
+        padding: padding.clone(),
+    });
+
+    // anytls Client owns the session pool and stream multiplexer. On every
+    // `create_stream()` it picks an idle session (under
+    // `MAX_STREAMS_PER_SESSION`) or invokes `dial_out` to build a new one.
+    let dial_ctx_for_dial = dial_ctx.clone();
+    let anytls_client = Arc::new(Client::new(
+        Box::new(move || {
+            let ctx = dial_ctx_for_dial.clone();
+            Box::pin(async move { dial_carrier(ctx).await })
+        }),
+        padding,
+        Duration::from_secs(args.idle_check_secs),
+        Duration::from_secs(args.idle_timeout_secs),
+        args.min_idle_sessions,
+    ));
+
+    log::info!(
+        "REALITY+anytls client: SOCKS5 {} -> {} (sni={})",
+        args.listen,
+        server_addr,
+        server_name
+    );
+
+    let listen: SocketAddr = args
+        .listen
+        .parse()
+        .context("parse --listen")?;
+    let socks_server = Server::bind(listen, Arc::new(NoAuth)).await?;
 
     loop {
         let (incoming, peer_addr) = socks_server.accept().await?;
-        let tls_config = Arc::clone(&tls_config);
-        let server_addr = args.server_addr.clone();
-        let tls_server_name = tls_server_name.clone();
-
+        let anytls_client = anytls_client.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                handle_connection(incoming, tls_config, server_addr, tls_server_name).await
-            {
-                eprintln!("SOCKS peer {peer_addr} failed: {error:#}");
+            if let Err(error) = handle_socks(incoming, anytls_client).await {
+                log::warn!("SOCKS peer {peer_addr} failed: {error:#}");
             }
         });
     }
 }
 
-async fn handle_connection(
-    incoming: socks5_impl::server::connection::IncomingConnection<()>,
-    tls_config: Arc<ClientConfig>,
-    server_addr: String,
-    tls_server_name: String,
-) -> Result<()> {
+/// One-shot REALITY+TLS+anytls-auth dialer. Returns a fresh transport
+/// `Box<dyn AsyncReadWrite>` ready to be wrapped in a brand-new anytls
+/// session. Called by `Client` whenever the idle-session pool is empty.
+async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWrite>> {
+    // 1) Plain TCP connect.
+    let tokio_tcp = TcpStream::connect(&ctx.server_addr).await?;
+    tokio_tcp.set_nodelay(true).ok();
+    let std_tcp = tokio_tcp.into_std()?;
+
+    // 2) Blocking REALITY rustls handshake on a worker thread (our forked
+    //    rustls cannot use tokio-rustls).
+    let tls_config = ctx.tls_config.clone();
+    let server_name = ctx.server_name.clone();
+    let tls = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+        std_tcp.set_nonblocking(false)?;
+        let server_name = ServerName::try_from(server_name)
+            .map_err(|err| std::io::Error::other(format!("invalid sni: {err}")))?;
+        let mut conn = tls_config
+            .connect(server_name)
+            .build()
+            .map_err(|err| std::io::Error::other(format!("rustls build: {err}")))?;
+        let mut sock = std_tcp;
+        while conn.is_handshaking() {
+            complete_io(&mut sock, &mut conn)
+                .map_err(|err| std::io::Error::other(format!("reality handshake: {err}")))?;
+        }
+        Ok(StreamOwned::new(conn, sock))
+    })
+    .await
+    .map_err(|err| std::io::Error::other(format!("join handshake task: {err}")))??;
+
+    // 3) Bridge blocking TLS into an async duplex carrier.
+    let mut bridge = async_bridge::into_async(tls)
+        .map_err(|err| std::io::Error::other(format!("async bridge: {err}")))?;
+
+    // 4) Send anytls auth header:
+    //    sha256(password) || u16be(padding_len) || padding_len zero bytes
+    let padding_factory = ctx.padding.read().await;
+    let padding_sizes = padding_factory.generate_record_payload_sizes(0);
+    drop(padding_factory);
+    let padding_len: u16 = padding_sizes
+        .first()
+        .copied()
+        .map(|v| u16::try_from(v).unwrap_or(0))
+        .unwrap_or(0);
+
+    let mut auth = Vec::with_capacity(34 + padding_len as usize);
+    auth.extend_from_slice(&ctx.password_sha256);
+    auth.extend_from_slice(&padding_len.to_be_bytes());
+    if padding_len > 0 {
+        auth.resize(auth.len() + padding_len as usize, 0);
+    }
+    bridge.write_all(&auth).await?;
+
+    Ok(Box::new(bridge) as Box<dyn AsyncReadWrite>)
+}
+
+async fn handle_socks(incoming: IncomingConnection<()>, client: Arc<Client>) -> Result<()> {
     let (authenticated, _) = incoming.authenticate().await?;
+    let request = authenticated.wait_request().await?;
 
-    match authenticated.wait_request().await? {
-        SocksClientConnection::Connect(connect, address) => {
-            let target = address.clone();
-            let established = tokio::task::spawn_blocking({
-                let tls_config = Arc::clone(&tls_config);
-                let server_addr = server_addr.clone();
-                let tls_server_name = tls_server_name.clone();
-                let target = target.clone();
-                move || establish_tls_client(tls_config, &server_addr, &tls_server_name, &target)
-            })
-            .await??;
-
-            let bind_addr = Address::from(connect.local_addr()?);
-            let connect = connect
-                .reply(Reply::Succeeded, bind_addr)
-                .await?;
-            let local_stream: TcpStream = connect.into();
-            let local_stream = local_stream.into_std()?;
-
-            tokio::task::spawn_blocking(move || relay_tls_client(local_stream, established))
-                .await??;
-            Ok(())
+    match request {
+        SocksClientConnection::Connect(connect_req, target) => {
+            handle_tcp_connect(connect_req, target, &client).await
         }
-        SocksClientConnection::Bind(bind, _) => {
-            let _ = bind;
-            bail!("SOCKS BIND is not supported")
+        SocksClientConnection::UdpAssociate(associate_req, _) => {
+            handle_udp_associate(associate_req, &client).await
         }
-        SocksClientConnection::UdpAssociate(associate, _) => {
-            let _ = associate;
-            bail!("SOCKS UDP ASSOCIATE is not supported")
-        }
+        SocksClientConnection::Bind(_, _) => bail!("SOCKS BIND is not supported"),
     }
 }
+
+async fn handle_tcp_connect(
+    connect_req: connect::Connect<connect::NeedReply>,
+    target: Address,
+    client: &Client,
+) -> Result<()> {
+    let bind_addr = Address::from(connect_req.local_addr()?);
+
+    // Open the anytls stream *before* confirming success to the SOCKS client.
+    let stream = match client.create_stream().await {
+        Ok(s) => s,
+        Err(err) => {
+            if let Ok(mut failed) = connect_req
+                .reply(Reply::GeneralFailure, Address::unspecified())
+                .await
+            {
+                let _ = failed.shutdown().await;
+            }
+            return Err(err.into());
+        }
+    };
+
+    // First user payload on this stream: target address in SOCKS5 SocksAddr
+    // format. Becomes the data of the first cmdPSH frame.
+    let addr_bytes: Vec<u8> = target.clone().into();
+    if let Err(err) = stream.write(&addr_bytes).await {
+        let _ = stream.close().await;
+        if let Ok(mut failed) = connect_req
+            .reply(Reply::GeneralFailure, Address::unspecified())
+            .await
+        {
+            let _ = failed.shutdown().await;
+        }
+        return Err(err.into());
+    }
+
+    // Stream is open and the address is en-route; now confirm success to the
+    // local SOCKS client.
+    let ready = connect_req
+        .reply(Reply::Succeeded, bind_addr)
+        .await?;
+
+    let (mut local_read, mut local_write) = ready.into_split();
+    let stream_w = stream.clone();
+    let stream_r = stream.clone();
+
+    let l2r = tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match local_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stream_w.write(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = stream_w.close().await;
+    });
+
+    let r2l = tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match stream_r.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if local_write
+                        .write_all(&buf[..n])
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = local_write.shutdown().await;
+    });
+
+    let _ = tokio::join!(l2r, r2l);
+    let _ = stream.close().await;
+    log::debug!("tcp tunnel to {target} closed");
+    Ok(())
+}
+
+async fn handle_udp_associate(
+    associate_req: UdpAssociate<associate::NeedReply>,
+    client: &Client,
+) -> Result<()> {
+    let listen_ip = associate_req.local_addr()?.ip();
+    let udp = match UdpSocket::bind(SocketAddr::from((listen_ip, 0))).await {
+        Ok(socket) => socket,
+        Err(err) => {
+            let mut reply = associate_req
+                .reply(Reply::GeneralFailure, Address::unspecified())
+                .await?;
+            reply.shutdown().await?;
+            return Err(err.into());
+        }
+    };
+    let listen_addr = udp.local_addr()?;
+
+    let stream = match client.create_stream().await {
+        Ok(s) => s,
+        Err(err) => {
+            let mut reply = associate_req
+                .reply(Reply::GeneralFailure, Address::unspecified())
+                .await?;
+            reply.shutdown().await?;
+            return Err(err.into());
+        }
+    };
+
+    // Mark this stream as a UoT stream:
+    //   sentinel address (SocksAddr) + UotRequest{Datagram, unspecified}
+    if let Err(err) = setup_uot_request(&stream).await {
+        let _ = stream.close().await;
+        let mut reply = associate_req
+            .reply(Reply::GeneralFailure, Address::unspecified())
+            .await?;
+        reply.shutdown().await?;
+        return Err(err);
+    }
+
+    let mut reply = associate_req
+        .reply(Reply::Succeeded, Address::from(listen_addr))
+        .await?;
+    let listen_udp = Arc::new(AssociatedUdpSocket::from((udp, MAX_UDP_RELAY_PACKET_SIZE)));
+    // Pin the UDP association to the first sender; ignore packets from other sources.
+    let incoming_addr = Arc::new(tokio::sync::Mutex::new(Option::<SocketAddr>::None));
+    let stream_writer = stream.clone();
+    let mut stream_reader = AnytlsStreamReader::new(stream.clone());
+
+    let result: Result<()> = loop {
+        tokio::select! {
+            res = listen_udp.recv_from() => {
+                let (pkt, frag, destination, src_addr) = res?;
+                if frag != 0 {
+                    break Err(anyhow!("SOCKS UDP fragmentation is not supported"));
+                }
+                let mut guard = incoming_addr.lock().await;
+                match *guard {
+                    None => *guard = Some(src_addr),
+                    Some(pinned) if pinned != src_addr => {
+                        log::debug!("UDP ASSOCIATE: dropping packet from {src_addr} (pinned to {pinned})");
+                        drop(guard);
+                        continue;
+                    }
+                    Some(_) => {}
+                }
+                drop(guard);
+                let frame = uot_encode_packet(UotMode::Datagram, Some(&destination), &pkt)?;
+                stream_writer.write(&frame).await?;
+            }
+            res = uot_get_packet_from_stream(UotMode::Datagram, &mut stream_reader) => {
+                let (source, payload) = res?;
+                let Some(incoming) = *incoming_addr.lock().await else {
+                    continue;
+                };
+                let source = source.ok_or_else(|| anyhow!("UoT datagram missing source"))?;
+                listen_udp.send_to(&payload, 0, source, incoming).await?;
+            }
+            res = reply.wait_until_closed() => {
+                res?;
+                break Ok(());
+            }
+        }
+    };
+
+    let _ = stream.close().await;
+    let _ = reply.shutdown().await;
+    result
+}
+
+async fn setup_uot_request(stream: &Arc<AnytlsStream>) -> Result<()> {
+    let sentinel: Vec<u8> = uot_sentinel_destination().into();
+    stream.write(&sentinel).await?;
+    let request_bytes: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified()).into();
+    stream.write(&request_bytes).await?;
+    Ok(())
+}
+
+// === helpers ===
 
 fn resolve_reality_config(args: &Args) -> Result<RealityClientConfigResolved> {
     let file_config = if let Some(path) = args.reality_config.as_deref() {
@@ -207,7 +528,7 @@ fn resolve_reality_config(args: &Args) -> Result<RealityClientConfigResolved> {
         .or_else(|| {
             file_config
                 .as_ref()
-                .map(|config| config.short_id.clone())
+                .map(|c| c.short_id.clone())
         });
     let public_key = args
         .reality_public_key
@@ -215,7 +536,7 @@ fn resolve_reality_config(args: &Args) -> Result<RealityClientConfigResolved> {
         .or_else(|| {
             file_config
                 .as_ref()
-                .map(|config| config.public_key.clone())
+                .map(|c| c.public_key.clone())
         });
     let version = args
         .reality_version
@@ -223,23 +544,21 @@ fn resolve_reality_config(args: &Args) -> Result<RealityClientConfigResolved> {
         .or_else(|| {
             file_config
                 .as_ref()
-                .map(|config| config.version.clone())
+                .map(|c| c.version.clone())
         });
     let server_name = args.server_name.clone().or_else(|| {
         file_config
             .as_ref()
-            .and_then(|config| config.server_name.clone())
+            .and_then(|c| c.server_name.clone())
     });
 
     match (short_id, public_key, version, server_name) {
-        (Some(short_id), Some(public_key), Some(version), Some(server_name)) => {
-            Ok(RealityClientConfigResolved {
-                short_id,
-                public_key,
-                version,
-                server_name,
-            })
-        }
+        (Some(s), Some(p), Some(v), Some(n)) => Ok(RealityClientConfigResolved {
+            short_id: s,
+            public_key: p,
+            version: v,
+            server_name: n,
+        }),
         _ => bail!(
             "REALITY client requires short_id, public_key, version, and server_name via CLI or --reality-config"
         ),
@@ -276,7 +595,7 @@ fn load_root_store(ca_file: Option<&Path>) -> Result<RootCertStore> {
     if let Some(ca_file) = ca_file {
         let certs = CertificateDer::pem_file_iter(ca_file)
             .context("open CA file")?
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<core::result::Result<Vec<_>, _>>()
             .context("read CA certificates")?;
         for cert in certs {
             root_store.add(cert)?;
@@ -311,7 +630,6 @@ where
 fn parse_reality_version(version: &str) -> [u8; 3] {
     let version = version.trim();
     assert_eq!(version.len(), 6, "REALITY version must be 6 hex digits");
-
     let mut parsed = [0u8; 3];
     for (index, chunk) in version
         .as_bytes()
@@ -336,129 +654,60 @@ fn parse_hex_nibble(value: u8) -> u8 {
     }
 }
 
-fn establish_tls_client(
-    tls_config: Arc<ClientConfig>,
-    server_addr: &str,
-    tls_server_name: &str,
-    target: &Address,
-) -> Result<EstablishedTlsClient> {
-    let mut upstream = std::net::TcpStream::connect(server_addr)
-        .with_context(|| format!("connect REALITY server {server_addr}"))?;
-    upstream.set_nodelay(true)?;
+// === AsyncRead adapter for AnytlsStream (so UoT helpers can drive it) ===
 
-    let server_name = ServerName::try_from(tls_server_name.to_owned())?;
-    let mut conn = tls_config
-        .connect(server_name)
-        .build()?;
-    while conn.is_handshaking() {
-        complete_io(&mut upstream, &mut conn).context("complete REALITY handshake")?;
-    }
-
-    let mut tls_stream = StreamOwned::new(conn, upstream);
-    write_target_header_blocking(&mut tls_stream, target).context("write tunnel target header")?;
-    tls_stream.sock.set_nonblocking(true)?;
-
-    Ok(EstablishedTlsClient { tls_stream })
+struct AnytlsStreamReader {
+    inner: Arc<AnytlsStream>,
+    #[allow(clippy::type_complexity)]
+    read_fut: Option<
+        core::pin::Pin<
+            Box<dyn core::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>,
+        >,
+    >,
 }
 
-fn relay_tls_client(
-    local_stream: std::net::TcpStream,
-    established: EstablishedTlsClient,
-) -> Result<()> {
-    relay_plain_and_tls(local_stream, established.tls_stream)
-}
-
-fn relay_plain_and_tls<C>(
-    mut plain_stream: std::net::TcpStream,
-    mut tls_stream: StreamOwned<C, std::net::TcpStream>,
-) -> Result<()>
-where
-    C: Connection,
-{
-    plain_stream.set_nonblocking(true)?;
-    tls_stream.sock.set_nonblocking(true)?;
-
-    let mut plain_to_tls = Vec::new();
-    let mut tls_to_plain = Vec::new();
-    let mut plain_closed = false;
-    let mut tls_closed = false;
-    let mut buf = [0u8; 16 * 1024];
-
-    loop {
-        let mut progressed = false;
-
-        if !plain_closed && plain_to_tls.len() < 128 * 1024 {
-            match plain_stream.read(&mut buf) {
-                Ok(0) => {
-                    plain_closed = true;
-                    tls_stream.conn.send_close_notify();
-                    progressed = true;
-                }
-                Ok(read) => {
-                    plain_to_tls.extend_from_slice(&buf[..read]);
-                    progressed = true;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        if !plain_to_tls.is_empty() {
-            match tls_stream.write(&plain_to_tls) {
-                Ok(written) => {
-                    plain_to_tls.drain(..written);
-                    progressed = true;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
-            let _ = tls_stream.flush();
-        }
-
-        if !tls_closed && tls_to_plain.len() < 128 * 1024 {
-            match tls_stream.read(&mut buf) {
-                Ok(0) => {
-                    tls_closed = true;
-                    progressed = true;
-                }
-                Ok(read) => {
-                    tls_to_plain.extend_from_slice(&buf[..read]);
-                    progressed = true;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        if !tls_to_plain.is_empty() {
-            match plain_stream.write(&tls_to_plain) {
-                Ok(written) => {
-                    tls_to_plain.drain(..written);
-                    progressed = true;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        if (plain_closed || tls_closed) && plain_to_tls.is_empty() && tls_to_plain.is_empty() {
-            break;
-        }
-
-        if !progressed {
-            std::thread::sleep(Duration::from_millis(1));
+impl AnytlsStreamReader {
+    fn new(inner: Arc<AnytlsStream>) -> Self {
+        Self {
+            inner,
+            read_fut: None,
         }
     }
-
-    Ok(())
 }
 
-fn write_target_header_blocking<W>(writer: &mut W, target: &Address) -> Result<()>
-where
-    W: Write,
-{
-    writer.write_all(b"RLY1")?;
-    target.write_to_stream(writer)?;
-    writer.flush()?;
-    Ok(())
+impl AsyncRead for AnytlsStreamReader {
+    fn poll_read(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        loop {
+            if let Some(fut) = self.read_fut.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    core::task::Poll::Ready(Ok((v, n))) => {
+                        self.read_fut = None;
+                        buf.put_slice(&v[..n]);
+                        return core::task::Poll::Ready(Ok(()));
+                    }
+                    core::task::Poll::Ready(Err(e)) => {
+                        self.read_fut = None;
+                        return core::task::Poll::Ready(Err(e));
+                    }
+                    core::task::Poll::Pending => return core::task::Poll::Pending,
+                }
+            }
+
+            let remaining = buf.remaining();
+            if remaining == 0 {
+                return core::task::Poll::Ready(Ok(()));
+            }
+
+            let inner = self.inner.clone();
+            self.read_fut = Some(Box::pin(async move {
+                let mut v = vec![0u8; remaining];
+                let n = inner.read(&mut v).await?;
+                Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
+            }));
+        }
+    }
 }
