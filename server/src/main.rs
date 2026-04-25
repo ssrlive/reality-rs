@@ -145,19 +145,21 @@ fn handle_connection_blocking(
     config: Arc<ServerConfig>,
 ) -> Result<()> {
     let mut stream = stream;
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     let mut conn = ServerConnection::new(config)?;
     while conn.is_handshaking() {
-        complete_io(&mut stream, &mut conn)?;
+        complete_io(&mut stream, &mut conn).context("complete REALITY handshake")?;
     }
 
     let mut tls_stream = StreamOwned::new(conn, stream);
-    let target = read_target_header_blocking(&mut tls_stream)?;
+    let target =
+        read_target_header_blocking(&mut tls_stream).context("read tunnel target header")?;
     let upstream = std::net::TcpStream::connect((target.host.as_str(), target.port))
         .with_context(|| format!("connect upstream {}:{}", target.host, target.port))?;
     upstream.set_nodelay(true)?;
 
-    relay_plain_and_tls(upstream, tls_stream)
+    relay_plain_and_tls(upstream, tls_stream).context("relay tunnel traffic")
 }
 
 fn resolve_reality_config(args: &Args) -> Result<RealityServerConfigResolved> {

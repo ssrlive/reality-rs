@@ -364,11 +364,11 @@ fn establish_tls_client(
         .connect(server_name)
         .build()?;
     while conn.is_handshaking() {
-        complete_io(&mut upstream, &mut conn)?;
+        complete_io(&mut upstream, &mut conn).context("complete REALITY handshake")?;
     }
 
     let mut tls_stream = StreamOwned::new(conn, upstream);
-    write_target_header_blocking(&mut tls_stream, target)?;
+    write_target_header_blocking(&mut tls_stream, target).context("write tunnel target header")?;
     tls_stream.sock.set_nonblocking(true)?;
 
     Ok(EstablishedTlsClient { tls_stream })
