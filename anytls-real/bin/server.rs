@@ -18,7 +18,7 @@
 //! We do nothing special on the server side for that — if a client opens
 //! many streams over one session, this server still serves them all.
 
-mod async_bridge;
+use anytls_real::async_bridge;
 
 use anyhow::{Context, Result, bail};
 use anytls::core::PaddingFactory;

@@ -4,13 +4,13 @@ This binary accepts REALITY/TLS connections from the formal `client` binary, rea
 
 ## Quick start
 
-Use the sample config in [config/reality-server.toml](config/reality-server.toml) with the local test certificate:
+Use the sample config in [server/reality-server.toml](server/reality-server.toml) with the local test certificate:
 
 ```powershell
-cargo run -p server -- --cert .\bogo\keys\cert.pem --key .\bogo\keys\key.pem --listen 127.0.0.1:9445 --reality-config .\server\config\reality-server.toml
+cargo run -p anytls-real --bin anytls-real-server -- --cert .\bogo\keys\cert.pem --key .\bogo\keys\key.pem --listen 127.0.0.1:9445 --reality-config .\anytls-real\server\reality-server.toml
 ```
 
-Both TOML and JSON config files are supported. An equivalent JSON sample is available in [config/reality-server.json](config/reality-server.json).
+Both TOML and JSON config files are supported. An equivalent JSON sample is available in [server/reality-server.json](server/reality-server.json).
 
 ## Local tunnel smoke test
 

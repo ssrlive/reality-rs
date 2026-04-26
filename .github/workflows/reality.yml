@@ -55,6 +55,16 @@ jobs:
         shell: pwsh
         run: ./admin/reality-smoke.ps1 -BuildWithCargo
 
+      - name: Run REALITY UDP smoke test (Linux/macOS)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: bash ./admin/reality-smoke-udp.sh
+
+      - name: Run REALITY UDP smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./admin/reality-smoke-udp.ps1
+
       - name: Upload REALITY smoke logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

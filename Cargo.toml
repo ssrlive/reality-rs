@@ -1,9 +1,9 @@
 [workspace]
 members = [
+  # AnyTLS client & server implementations using REALITY protocol
+  "anytls-real",
   # Bogo test shim
   "bogo",
-  # REALITY client
-  "client",
   # CI benchmarks
   "ci-bench",
   # Network-based tests
@@ -28,8 +28,6 @@ members = [
   "rustls-provider-test",
   # rustls cryptography provider for fuzzing
   "rustls-fuzzing-provider",
-  # REALITY server
-  "server",
   # utility code
   "rustls-util",
 ]
@@ -47,6 +45,7 @@ default-members = [
   "rustls-aws-lc-rs",
   "rustls-ring",
   "rustls-test",
+  "anytls-real",
 ]
 resolver = "2"
 

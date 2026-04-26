@@ -211,7 +211,7 @@ run_cargo_build() {
 
     if ! (
         cd -- "$repo_root"
-        cargo build -p server -p client
+        cargo build -p anytls-real
     ) >"$LOG_PATH" 2>"$ERROR_PATH"
     then
         show_log_pair "$LOG_PATH" "$ERROR_PATH"
@@ -286,7 +286,7 @@ assert_file_exists() {
     local label="$2"
 
     if [[ ! -f "$file_path" ]]; then
-        die "$label binary not found at '$file_path'. Build it first with './admin/reality-smoke.sh --build-with-cargo' or 'cargo build -p server -p client'."
+        die "$label binary not found at '$file_path'. Build it first with './admin/reality-smoke.sh --build-with-cargo' or 'cargo build -p anytls-real'."
     fi
 }
 
@@ -362,8 +362,8 @@ done
 assert_command python3
 assert_command curl
 
-server_binary="$repo_root/target/debug/server"
-client_binary="$repo_root/target/debug/client"
+server_binary="$repo_root/target/debug/anytls-real-server"
+client_binary="$repo_root/target/debug/anytls-real-client"
 
 server_listen="$(resolve_endpoint "$server_listen" 'Server')"
 client_listen="$(resolve_endpoint "$client_listen" 'Client')"
@@ -376,14 +376,14 @@ server_args=(
     '--cert' './bogo/keys/cert.pem'
     '--key' './bogo/keys/key.pem'
     '--listen' "$server_listen"
-    '--reality-config' './server/config/reality-server.toml'
+    '--reality-config' './anytls-real/server/reality-server.toml'
     '--password' "$smoke_password"
 )
 
 client_args=(
     '--listen' "$client_listen"
     '--server-addr' "$server_listen"
-    '--reality-config' './client/config/reality-client.json'
+    '--reality-config' './anytls-real/client/reality-client.json'
     '--ca-file' './bogo/keys/cert.pem'
     '--insecure'
     '--password' "$smoke_password"

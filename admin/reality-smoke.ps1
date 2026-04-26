@@ -293,7 +293,7 @@ function Assert-FileExists {
     )
 
     if (-not (Test-Path $FilePath -PathType Leaf)) {
-        throw "$Label binary not found at '$FilePath'. Build it first with './admin/reality-smoke.ps1 -BuildWithCargo' or 'cargo build -p server -p client'."
+        throw "$Label binary not found at '$FilePath'. Build it first with './admin/reality-smoke.ps1 -BuildWithCargo' or 'cargo build -p anytls-real'."
     }
 }
 
@@ -302,8 +302,8 @@ $server = $null
 $client = $null
 
 $exeSuffix = if ($IsWindows) { '.exe' } else { '' }
-$serverBinary = Join-Path $repoRoot ("target\debug\server$exeSuffix")
-$clientBinary = Join-Path $repoRoot ("target\debug\client$exeSuffix")
+$serverBinary = Join-Path $repoRoot ("target\debug\anytls-real-server$exeSuffix")
+$clientBinary = Join-Path $repoRoot ("target\debug\anytls-real-client$exeSuffix")
 
 $ServerListen = Resolve-Endpoint -PreferredEndpoint $ServerListen -Label 'Server'
 $ClientListen = Resolve-Endpoint -PreferredEndpoint $ClientListen -Label 'Client'
@@ -316,14 +316,14 @@ $serverArgs = @(
     '--cert', '.\bogo\keys\cert.pem',
     '--key', '.\bogo\keys\key.pem',
     '--listen', $ServerListen,
-    '--reality-config', '.\server\config\reality-server.toml',
+    '--reality-config', '.\anytls-real\server\reality-server.toml',
     '--password', $smokePassword
 )
 
 $clientArgs = @(
     '--listen', $ClientListen,
     '--server-addr', $ServerListen,
-    '--reality-config', '.\client\config\reality-client.json',
+    '--reality-config', '.\anytls-real\client\reality-client.json',
     '--ca-file', '.\bogo\keys\cert.pem',
     '--insecure',
     '--password', $smokePassword
@@ -332,7 +332,7 @@ $clientArgs = @(
 try {
     if ($BuildWithCargo) {
         Write-Host 'Building formal server and client binaries with Cargo'
-        $build = Start-CargoProcess -Arguments @('build', '-p', 'server', '-p', 'client') -LogName 'reality-build'
+        $build = Start-CargoProcess -Arguments @('build', '-p', 'anytls-real') -LogName 'reality-build'
         $build.Process.WaitForExit()
         if ($build.Process.ExitCode -ne 0) {
             Show-Logs -Entries @($build)

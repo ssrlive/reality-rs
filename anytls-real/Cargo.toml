@@ -1,8 +1,16 @@
 [package]
-name = "server"
+name = "anytls-real"
 version = "0.1.0"
 edition = "2021"
 publish = false
+
+[[bin]]
+name = "anytls-real-client"
+path = "bin/client.rs"
+
+[[bin]]
+name = "anytls-real-server"
+path = "bin/server.rs"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -16,9 +24,18 @@ rustls-util = { path = "../rustls-util" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-socks5-impl = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+socks5-impl = { workspace = true, features = ["server"] }
+tokio = { workspace = true, features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 toml = { workspace = true }
+webpki-roots = { workspace = true }
 
 [lints]
 workspace = true

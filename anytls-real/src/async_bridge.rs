@@ -26,9 +26,7 @@ const RELAY_HIGH_WATER: usize = 256 * 1024;
 ///
 /// Must be called from inside a tokio runtime; the captured runtime
 /// handle is used by the worker thread to drive the async side.
-pub(crate) fn into_async<C>(
-    tls: StreamOwned<C, std::net::TcpStream>,
-) -> std::io::Result<DuplexStream>
+pub fn into_async<C>(tls: StreamOwned<C, std::net::TcpStream>) -> std::io::Result<DuplexStream>
 where
     C: Connection + Send + 'static,
 {
