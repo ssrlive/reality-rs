@@ -126,8 +126,8 @@ function Start-CargoProcess {
         [string]$LogName
     )
 
-    $logPath = Join-Path $repoRoot ("target\tmp\$LogName.log")
-    $errorPath = Join-Path $repoRoot ("target\tmp\$LogName.err.log")
+    $logPath = Join-Path $repoRoot ("target/tmp/$LogName.log")
+    $errorPath = Join-Path $repoRoot ("target/tmp/$LogName.err.log")
 
     New-Item -ItemType Directory -Path (Split-Path -Parent $logPath) -Force | Out-Null
     if (Test-Path $logPath) { Remove-Item $logPath -Force }
@@ -160,8 +160,8 @@ function Start-BinaryProcess {
         [string]$LogName
     )
 
-    $logPath = Join-Path $repoRoot ("target\tmp\$LogName.log")
-    $errorPath = Join-Path $repoRoot ("target\tmp\$LogName.err.log")
+    $logPath = Join-Path $repoRoot ("target/tmp/$LogName.log")
+    $errorPath = Join-Path $repoRoot ("target/tmp/$LogName.err.log")
 
     New-Item -ItemType Directory -Path (Split-Path -Parent $logPath) -Force | Out-Null
     if (Test-Path $logPath) { Remove-Item $logPath -Force }
@@ -191,9 +191,9 @@ function Start-HttpTargetProcess {
         [string]$LogName
     )
 
-    $scriptPath = Join-Path $repoRoot ("target\tmp\$LogName.ps1")
-    $logPath = Join-Path $repoRoot ("target\tmp\$LogName.log")
-    $errorPath = Join-Path $repoRoot ("target\tmp\$LogName.err.log")
+    $scriptPath = Join-Path $repoRoot ("target/tmp/$LogName.ps1")
+    $logPath = Join-Path $repoRoot ("target/tmp/$LogName.log")
+    $errorPath = Join-Path $repoRoot ("target/tmp/$LogName.err.log")
     $shellPath = (Get-Process -Id $PID).Path
 
     New-Item -ItemType Directory -Path (Split-Path -Parent $scriptPath) -Force | Out-Null
@@ -300,10 +300,12 @@ function Assert-FileExists {
 $httpTarget = $null
 $server = $null
 $client = $null
+$server_config_path = Join-Path $repoRoot 'target/tmp/reality-server.smoke.toml'
+$client_config_path = Join-Path $repoRoot 'target/tmp/reality-client.smoke.toml'
 
 $exeSuffix = if ($IsWindows) { '.exe' } else { '' }
-$serverBinary = Join-Path $repoRoot ("target\debug\anytls-real-server$exeSuffix")
-$clientBinary = Join-Path $repoRoot ("target\debug\anytls-real-client$exeSuffix")
+$serverBinary = Join-Path $repoRoot ("target/debug/anytls-real-server$exeSuffix")
+$clientBinary = Join-Path $repoRoot ("target/debug/anytls-real-client$exeSuffix")
 
 $ServerListen = Resolve-Endpoint -PreferredEndpoint $ServerListen -Label 'Server'
 $ClientListen = Resolve-Endpoint -PreferredEndpoint $ClientListen -Label 'Client'
@@ -311,23 +313,43 @@ $TargetListen = Resolve-Endpoint -PreferredEndpoint $TargetListen -Label 'Target
 $targetUri = "http://$TargetListen/"
 
 $smokePassword = 'reality-smoke-password'
+$null = New-Item -ItemType Directory -Path (Join-Path $repoRoot 'target/tmp') -Force
 
-$serverArgs = @(
-    '--cert', '.\bogo\keys\cert.pem',
-    '--key', '.\bogo\keys\key.pem',
-    '--listen', $ServerListen,
-    '--reality-config', '.\anytls-real\server\reality-server.toml',
-    '--password', $smokePassword
-)
+@"
+[reality]
+shortId = "aabbcc"
+privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
+version = "010203"
+serverNames = ["test"]
 
-$clientArgs = @(
-    '--listen', $ClientListen,
-    '--server-addr', $ServerListen,
-    '--reality-config', '.\anytls-real\client\reality-client.json',
-    '--ca-file', '.\bogo\keys\cert.pem',
-    '--insecure',
-    '--password', $smokePassword
-)
+[anytls]
+password = "$smokePassword"
+
+[server]
+listen = "$ServerListen"
+cert = "./bogo/keys/cert.pem"
+key = "./bogo/keys/key.pem"
+"@ | Set-Content -Path $server_config_path -Encoding UTF8
+
+@"
+[reality]
+shortId = "aabbcc"
+publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"
+serverName = "test"
+version = "010203"
+
+[anytls]
+password = "$smokePassword"
+idleCheckSecs = 30
+idleTimeoutSecs = 30
+minIdleSessions = 5
+
+[client]
+listen = "$ClientListen"
+serverAddr = "$ServerListen"
+caFile = "./bogo/keys/cert.pem"
+insecure = true
+"@ | Set-Content -Path $client_config_path -Encoding UTF8
 
 try {
     if ($BuildWithCargo) {
@@ -350,13 +372,13 @@ try {
     Wait-TcpEndpoint -Endpoint $TargetListen
 
     Write-Host "Starting formal server on $ServerListen"
-    $server = Start-BinaryProcess -FilePath $serverBinary -Arguments $serverArgs -LogName 'reality-server'
+    $server = Start-BinaryProcess -FilePath $serverBinary -Arguments @('--config', $server_config_path) -LogName 'reality-server'
     Start-Sleep -Milliseconds 500
     Assert-ProcessRunning -Entry $server -Label 'Formal server'
     Wait-TcpEndpoint -Endpoint $ServerListen
 
     Write-Host "Starting formal client on $ClientListen"
-    $client = Start-BinaryProcess -FilePath $clientBinary -Arguments $clientArgs -LogName 'reality-client'
+    $client = Start-BinaryProcess -FilePath $clientBinary -Arguments @('--config', $client_config_path) -LogName 'reality-client'
     Start-Sleep -Milliseconds 500
     Assert-ProcessRunning -Entry $client -Label 'Formal client'
     Wait-TcpEndpoint -Endpoint $ClientListen
@@ -397,6 +419,12 @@ finally {
 
         if ($null -ne $httpTarget -and (Test-Path $httpTarget.ScriptPath)) {
             Remove-Item $httpTarget.ScriptPath -Force -ErrorAction SilentlyContinue
+        }
+
+        foreach ($path in @($server_config_path, $client_config_path)) {
+            if (Test-Path $path) {
+                Remove-Item $path -Force -ErrorAction SilentlyContinue
+            }
         }
 
         Write-Host 'Done.'

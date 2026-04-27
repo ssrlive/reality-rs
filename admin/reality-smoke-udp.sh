@@ -30,6 +30,8 @@ echo_pid=''
 server_pid=''
 client_pid=''
 udp_echo_script=''
+server_config_path=''
+client_config_path=''
 
 declare -a entry_logs=()
 declare -a entry_errors=()
@@ -215,6 +217,7 @@ cleanup() {
             wait "$pid" 2>/dev/null || true
         fi
     done
+    rm -f -- "$server_config_path" "$client_config_path"
     if [[ -n "$udp_echo_script" && -f "$udp_echo_script" ]]; then
         rm -f -- "$udp_echo_script"
     fi
@@ -248,6 +251,8 @@ assert_command python3
 server_binary="$repo_root/target/debug/anytls-real-server"
 client_binary="$repo_root/target/debug/anytls-real-client"
 smoke_password='reality-smoke-password'
+server_config_path="$repo_root/target/tmp/reality-server.smoke.toml"
+client_config_path="$repo_root/target/tmp/reality-client.smoke.toml"
 
 server_listen="$(resolve_endpoint "$server_listen" 'Server')"
 client_listen="$(resolve_endpoint "$client_listen" 'Client')"
@@ -268,6 +273,42 @@ fi
 
 [[ -f "$server_binary" ]] || die "Server binary not found at '$server_binary'. Build first with '--build-with-cargo' or 'cargo build -p anytls-real'."
 [[ -f "$client_binary" ]] || die "Client binary not found at '$client_binary'. Build first with '--build-with-cargo' or 'cargo build -p anytls-real'."
+
+cat > "$server_config_path" <<EOF
+[reality]
+shortId = "aabbcc"
+privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
+version = "010203"
+serverNames = ["test"]
+
+[anytls]
+password = "$smoke_password"
+
+[server]
+listen = "$server_listen"
+cert = './bogo/keys/cert.pem'
+key = './bogo/keys/key.pem'
+EOF
+
+cat > "$client_config_path" <<EOF
+[reality]
+shortId = "aabbcc"
+publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"
+serverName = "test"
+version = "010203"
+
+[anytls]
+password = "$smoke_password"
+idleCheckSecs = 30
+idleTimeoutSecs = 30
+minIdleSessions = 5
+
+[client]
+listen = "$client_listen"
+serverAddr = "$server_listen"
+caFile = './bogo/keys/cert.pem'
+insecure = true
+EOF
 
 cleanup_message=1
 
@@ -302,11 +343,7 @@ sleep 0.25
 
 echo "Starting anytls-real-server on $server_listen"
 start_binary_process "$server_binary" 'reality-server' \
-    '--cert'           './bogo/keys/cert.pem' \
-    '--key'            './bogo/keys/key.pem' \
-    '--listen'         "$server_listen" \
-    '--reality-config' './anytls-real/server/reality-server.toml' \
-    '--password'       "$smoke_password"
+    --config "$server_config_path"
 server_pid="$START_PID"
 sleep 0.5
 assert_process_running "$server_pid" 'anytls-real-server' "$START_LOG_PATH" "$START_ERROR_PATH"
@@ -314,12 +351,7 @@ wait_tcp_endpoint "$server_listen"
 
 echo "Starting anytls-real-client on $client_listen"
 start_binary_process "$client_binary" 'reality-client' \
-    '--listen'         "$client_listen" \
-    '--server-addr'    "$server_listen" \
-    '--reality-config' './anytls-real/client/reality-client.json' \
-    '--ca-file'        './bogo/keys/cert.pem' \
-    '--insecure' \
-    '--password'       "$smoke_password"
+    --config "$client_config_path"
 client_pid="$START_PID"
 sleep 0.5
 assert_process_running "$client_pid" 'anytls-real-client' "$START_LOG_PATH" "$START_ERROR_PATH"

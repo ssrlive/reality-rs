@@ -3,3 +3,15 @@ shortId = "aabbcc"
 publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"
 serverName = "test"
 version = "010203"
+
+[anytls]
+password = "reality-smoke-password"
+idleCheckSecs = 30
+idleTimeoutSecs = 30
+minIdleSessions = 5
+
+[client]
+listen = "127.0.0.1:1081"
+serverAddr = "127.0.0.1:9445"
+caFile = "./bogo/keys/cert.pem"
+insecure = true

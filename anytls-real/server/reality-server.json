@@ -6,5 +6,13 @@
         "serverNames": [
             "test"
         ]
+    },
+    "anytls": {
+        "password": "reality-smoke-password"
+    },
+    "server": {
+        "listen": "127.0.0.1:9445",
+        "cert": "./bogo/keys/cert.pem",
+        "key": "./bogo/keys/key.pem"
     }
 }

@@ -59,56 +59,9 @@ const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
-    /// SOCKS5 listen address.
-    #[arg(long, default_value = "127.0.0.1:1080")]
-    listen: String,
-
-    /// Upstream REALITY server address (`host:port`).
+    /// Path to the grouped client config (`.toml` or `.json`).
     #[arg(long)]
-    server_addr: String,
-
-    /// SNI value sent inside the REALITY ClientHello. Falls back to the
-    /// `serverName` field in `--reality-config`.
-    #[arg(long)]
-    server_name: Option<String>,
-
-    /// Path to a REALITY client config (`.toml` or `.json`).
-    #[arg(long)]
-    reality_config: Option<PathBuf>,
-
-    #[arg(long, requires_all = ["reality_public_key", "reality_version"])]
-    reality_short_id: Option<String>,
-
-    #[arg(long, requires_all = ["reality_short_id", "reality_version"])]
-    reality_public_key: Option<String>,
-
-    #[arg(long, requires_all = ["reality_short_id", "reality_public_key"])]
-    reality_version: Option<String>,
-
-    /// Optional CA bundle for verifying the decoy certificate.
-    #[arg(long)]
-    ca_file: Option<PathBuf>,
-
-    /// Skip certificate verification (REALITY makes this safe; the server's
-    /// real identity is proven by the X25519 auth key).
-    #[arg(long)]
-    insecure: bool,
-
-    /// AnyTLS shared password.
-    #[arg(long, env = "ANYTLS_PASSWORD")]
-    password: String,
-
-    /// How often to reap idle anytls sessions (seconds).
-    #[arg(long, default_value_t = 30)]
-    idle_check_secs: u64,
-
-    /// Idle anytls session timeout before close (seconds).
-    #[arg(long, default_value_t = 30)]
-    idle_timeout_secs: u64,
-
-    /// Minimum number of warm idle anytls sessions to keep.
-    #[arg(long, default_value_t = 5)]
-    min_idle_sessions: usize,
+    config: PathBuf,
 
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
     #[arg(long, default_value = "info")]
@@ -117,22 +70,64 @@ struct Args {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RealityDocument<T> {
-    reality: T,
+struct ClientConfigFile {
+    #[serde(default)]
+    reality: Option<ClientRealityConfigFile>,
+    #[serde(default)]
+    anytls: Option<ClientAnytlsConfigFile>,
+    #[serde(default)]
+    client: Option<ClientRuntimeConfigFile>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RealityClientConfigFile {
-    public_key: String,
-    short_id: String,
-    version: String,
+struct ClientRealityConfigFile {
+    #[serde(default)]
+    public_key: Option<String>,
+    #[serde(default)]
+    short_id: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
     #[serde(default)]
     server_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientAnytlsConfigFile {
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    idle_check_secs: Option<u64>,
+    #[serde(default)]
+    idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    min_idle_sessions: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientRuntimeConfigFile {
+    #[serde(default)]
+    listen: Option<String>,
+    #[serde(default)]
+    server_addr: Option<String>,
+    #[serde(default)]
+    ca_file: Option<PathBuf>,
+    #[serde(default)]
+    insecure: Option<bool>,
+}
+
 #[derive(Clone, Debug)]
 struct RealityClientConfigResolved {
+    listen: String,
+    server_addr: String,
+    ca_file: Option<PathBuf>,
+    insecure: bool,
+    password: String,
+    idle_check_secs: u64,
+    idle_timeout_secs: u64,
+    min_idle_sessions: usize,
     public_key: String,
     short_id: String,
     version: String,
@@ -200,21 +195,17 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.clone()))
         .init();
 
-    if args.password.is_empty() {
-        bail!("anytls password must not be empty (set --password or ANYTLS_PASSWORD)");
-    }
-
-    let reality = resolve_reality_config(&args)?;
-    let tls_config = Arc::new(build_client_config(&args, &reality)?);
-    let server_addr = args.server_addr.clone();
-    let server_name = reality.server_name.clone();
+    let resolved = resolve_client_config(&args.config)?;
+    let tls_config = Arc::new(build_client_config(&resolved)?);
+    let server_addr = resolved.server_addr.clone();
+    let server_name = resolved.server_name.clone();
     let padding = DefaultPaddingFactory::load();
 
     let dial_ctx = Arc::new(DialCtx {
         server_addr: server_addr.clone(),
         tls_config,
         server_name: server_name.clone(),
-        password_sha256: Sha256::digest(args.password.as_bytes()).into(),
+        password_sha256: Sha256::digest(resolved.password.as_bytes()).into(),
         padding: padding.clone(),
     });
 
@@ -228,19 +219,19 @@ async fn main() -> Result<()> {
             Box::pin(async move { dial_carrier(ctx).await })
         }),
         padding,
-        Duration::from_secs(args.idle_check_secs),
-        Duration::from_secs(args.idle_timeout_secs),
-        args.min_idle_sessions,
+        Duration::from_secs(resolved.idle_check_secs),
+        Duration::from_secs(resolved.idle_timeout_secs),
+        resolved.min_idle_sessions,
     ));
 
     log::info!(
         "REALITY+anytls client: SOCKS5 {} -> {} (sni={})",
-        args.listen,
+        resolved.listen,
         server_addr,
         server_name
     );
 
-    let listen: SocketAddr = args
+    let listen: SocketAddr = resolved
         .listen
         .parse()
         .context("parse --listen")?;
@@ -515,57 +506,78 @@ async fn setup_uot_request(stream: &Arc<AnytlsStream>) -> Result<()> {
 
 // === helpers ===
 
-fn resolve_reality_config(args: &Args) -> Result<RealityClientConfigResolved> {
-    let file_config = if let Some(path) = args.reality_config.as_deref() {
-        Some(load_reality_document::<RealityClientConfigFile>(path)?.reality)
-    } else {
-        None
-    };
+fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolved> {
+    let file_config = load_client_config_file(config_path)?;
+    let reality = file_config
+        .reality
+        .as_ref()
+        .ok_or_else(|| anyhow!("client config requires a [reality] section"))?;
+    let anytls = file_config
+        .anytls
+        .as_ref()
+        .ok_or_else(|| anyhow!("client config requires an [anytls] section"))?;
+    let client = file_config
+        .client
+        .as_ref()
+        .ok_or_else(|| anyhow!("client config requires a [client] section"))?;
 
-    let short_id = args
-        .reality_short_id
+    let listen = client
+        .listen
         .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .map(|c| c.short_id.clone())
-        });
-    let public_key = args
-        .reality_public_key
+        .unwrap_or_else(|| "127.0.0.1:1080".to_string());
+    let server_addr = client
+        .server_addr
         .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .map(|c| c.public_key.clone())
-        });
-    let version = args
-        .reality_version
-        .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .map(|c| c.version.clone())
-        });
-    let server_name = args.server_name.clone().or_else(|| {
-        file_config
-            .as_ref()
-            .and_then(|c| c.server_name.clone())
-    });
+        .ok_or_else(|| anyhow!("client.serverAddr must be set in config"))?;
+    let ca_file = client.ca_file.clone();
+    let insecure = client.insecure.unwrap_or(false);
 
-    match (short_id, public_key, version, server_name) {
-        (Some(s), Some(p), Some(v), Some(n)) => Ok(RealityClientConfigResolved {
-            short_id: s,
-            public_key: p,
-            version: v,
-            server_name: n,
-        }),
-        _ => bail!(
-            "REALITY client requires short_id, public_key, version, and server_name via CLI or --reality-config"
-        ),
+    let password = anytls
+        .password
+        .clone()
+        .ok_or_else(|| anyhow!("anytls.password must be set in config"))?;
+    if password.is_empty() {
+        bail!("anytls.password must not be empty");
     }
+
+    let idle_check_secs = anytls.idle_check_secs.unwrap_or(30);
+    let idle_timeout_secs = anytls.idle_timeout_secs.unwrap_or(30);
+    let min_idle_sessions = anytls.min_idle_sessions.unwrap_or(5);
+
+    let short_id = reality
+        .short_id
+        .clone()
+        .ok_or_else(|| anyhow!("reality.shortId must be set in config"))?;
+    let public_key = reality
+        .public_key
+        .clone()
+        .ok_or_else(|| anyhow!("reality.publicKey must be set in config"))?;
+    let version = reality
+        .version
+        .clone()
+        .ok_or_else(|| anyhow!("reality.version must be set in config"))?;
+    let server_name = reality
+        .server_name
+        .clone()
+        .ok_or_else(|| anyhow!("reality.serverName must be set in config"))?;
+
+    Ok(RealityClientConfigResolved {
+        listen,
+        server_addr,
+        ca_file,
+        insecure,
+        password,
+        idle_check_secs,
+        idle_timeout_secs,
+        min_idle_sessions,
+        short_id,
+        public_key,
+        version,
+        server_name,
+    })
 }
 
-fn build_client_config(args: &Args, reality: &RealityClientConfigResolved) -> Result<ClientConfig> {
+fn build_client_config(args: &RealityClientConfigResolved) -> Result<ClientConfig> {
     let provider = provider::reality::default_x25519_tls13_reality_provider();
     let root_store = load_root_store(args.ca_file.as_deref())?;
 
@@ -581,9 +593,9 @@ fn build_client_config(args: &Args, reality: &RealityClientConfigResolved) -> Re
 
     provider::reality::install_reality_session_id_generator_from_xray_fields(
         &mut config,
-        parse_reality_version(&reality.version),
-        &reality.short_id,
-        &reality.public_key,
+        parse_reality_version(&args.version),
+        &args.short_id,
+        &args.public_key,
     )?;
 
     Ok(config)
@@ -611,10 +623,7 @@ fn load_root_store(ca_file: Option<&Path>) -> Result<RootCertStore> {
     Ok(root_store)
 }
 
-fn load_reality_document<T>(path: &Path) -> Result<RealityDocument<T>>
-where
-    T: serde::de::DeserializeOwned,
-{
+fn load_client_config_file(path: &Path) -> Result<ClientConfigFile> {
     let contents = std::fs::read_to_string(path)?;
     match path
         .extension()

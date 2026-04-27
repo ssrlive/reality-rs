@@ -14,40 +14,44 @@ UDP-over-TCP mode).
 
 ### Quick start
 
-Use the sample config in [client/reality-client.json](client/reality-client.json)
+Use the sample config in [client/reality-client.toml](client/reality-client.toml)
 together with the local test server (run from the repo root):
 
 ```powershell
-cargo run -p anytls-real --bin anytls-real-client -- `
-  --listen 127.0.0.1:1081 `
-  --server-addr 127.0.0.1:9445 `
-  --reality-config .\anytls-real\client\reality-client.json `
-  --ca-file .\bogo\keys\cert.pem `
-  --insecure `
-  --password YOUR_PASSWORD
+cargo run -p anytls-real --bin anytls-real-client -- --config ./anytls-real/client/reality-client.toml
 ```
 
 Both JSON and TOML config files are supported. An equivalent TOML sample is
 available in [client/reality-client.toml](client/reality-client.toml).
 
-The `--insecure` flag is only for the local test path here, because the
-bundled `bogo/keys/cert.pem` certificate is not provisioned to match the
-sample REALITY `serverName` value.
+The sample config includes the local-only `insecure = true` setting so the
+bundled `bogo/keys/cert.pem` certificate can be used without extra setup.
 
-### Config fields
+### Config layout
 
-- `reality.shortId`
-- `reality.publicKey`
-- `reality.serverName`
-- `reality.version`
+The sample client config uses three top-level sections:
 
-### Session-pool flags
+- `reality`: REALITY handshake material (`shortId`, `publicKey`,
+  `serverName`, `version`)
+- `anytls`: shared AnyTLS settings (`password`, plus the client-side
+  session-pool knobs)
+- `client`: client-only runtime defaults such as `listen`, `serverAddr`,
+  `caFile`, and `insecure`
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--idle-check-secs` | 30 | How often to reap idle AnyTLS sessions |
-| `--idle-timeout-secs` | 30 | Idle session lifetime before close |
-| `--min-idle-sessions` | 5 | Minimum warm idle sessions to keep |
+The binary now reads runtime values from the config file. The CLI only takes
+`--config` and `--log`.
+
+### AnyTLS settings
+
+The `anytls` section carries the shared password and the client-side pool
+knobs:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `password` | required | AnyTLS shared password |
+| `idleCheckSecs` | 30 | How often to reap idle AnyTLS sessions |
+| `idleTimeoutSecs` | 30 | Idle session lifetime before close |
+| `minIdleSessions` | 5 | Minimum warm idle sessions to keep |
 
 ---
 
@@ -67,23 +71,24 @@ Use the sample config in [server/reality-server.toml](server/reality-server.toml
 with the local test certificate (run from the repo root):
 
 ```powershell
-cargo run -p anytls-real --bin anytls-real-server -- `
-  --cert .\bogo\keys\cert.pem `
-  --key .\bogo\keys\key.pem `
-  --listen 127.0.0.1:9445 `
-  --reality-config .\anytls-real\server\reality-server.toml `
-  --password YOUR_PASSWORD
+cargo run -p anytls-real --bin anytls-real-server -- --config ./anytls-real/server/reality-server.toml
 ```
 
 Both TOML and JSON config files are supported. An equivalent JSON sample is
 available in [server/reality-server.json](server/reality-server.json).
 
-### Config fields
+### Config layout
 
-- `reality.shortId`
-- `reality.privateKey`
-- `reality.serverNames` (array)
-- `reality.version`
+The sample server config uses three top-level sections:
+
+- `reality`: REALITY handshake material (`shortId`, `privateKey`,
+  `serverNames`, `version`)
+- `anytls`: shared AnyTLS settings (`password`)
+- `server`: server-only runtime defaults such as `listen`, `cert`, and
+  `key`
+
+The binary now reads runtime values from the config file. The CLI only takes
+`--config` and `--log`.
 
 ---
 

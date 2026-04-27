@@ -220,26 +220,49 @@ $smokePassword = 'reality-smoke-password'
 
 $ServerListen = Resolve-Endpoint $ServerListen  'Server'
 $ClientListen = Resolve-Endpoint $ClientListen  'Client'
+$server_config_path = Join-Path $repoRoot 'target\tmp\reality-server.smoke.toml'
+$client_config_path = Join-Path $repoRoot 'target\tmp\reality-client.smoke.toml'
+$null = New-Item -ItemType Directory -Path (Join-Path $repoRoot 'target\tmp') -Force
 
 $echoEndpoint = Split-Endpoint $UdpEchoListen
 $echoHost = $echoEndpoint.HostName
 $echoPort = $echoEndpoint.Port
 
-$serverArgs = @(
-    '--cert', '.\bogo\keys\cert.pem'
-    '--key', '.\bogo\keys\key.pem'
-    '--listen', $ServerListen
-    '--reality-config', '.\anytls-real\server\reality-server.toml'
-    '--password', $smokePassword
-)
-$clientArgs = @(
-    '--listen', $ClientListen
-    '--server-addr', $ServerListen
-    '--reality-config', '.\anytls-real\client\reality-client.json'
-    '--ca-file', '.\bogo\keys\cert.pem'
-    '--insecure'
-    '--password', $smokePassword
-)
+@"
+[reality]
+shortId = "aabbcc"
+privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
+version = "010203"
+serverNames = ["test"]
+
+[anytls]
+password = "$smokePassword"
+
+[server]
+listen = "$ServerListen"
+cert = "./bogo/keys/cert.pem"
+key = "./bogo/keys/key.pem"
+"@ | Set-Content -Path $server_config_path -Encoding UTF8
+
+@"
+[reality]
+shortId = "aabbcc"
+publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"
+serverName = "test"
+version = "010203"
+
+[anytls]
+password = "$smokePassword"
+idleCheckSecs = 30
+idleTimeoutSecs = 30
+minIdleSessions = 5
+
+[client]
+listen = "$ClientListen"
+serverAddr = "$ServerListen"
+caFile = "./bogo/keys/cert.pem"
+insecure = true
+"@ | Set-Content -Path $client_config_path -Encoding UTF8
 
 # UDP echo helper script (written to target/tmp at runtime)
 $udpEchoScript = Join-Path $repoRoot 'target\tmp\udp-echo-helper.ps1'
@@ -303,14 +326,14 @@ try {
 
     # Start anytls-real-server
     Write-Host "Starting anytls-real-server on $ServerListen"
-    $serverEntry = Start-BinaryProcess $serverBinary $serverArgs 'reality-server'
+    $serverEntry = Start-BinaryProcess $serverBinary @('--config', $server_config_path) 'reality-server'
     Start-Sleep -Milliseconds 500
     Assert-ProcessRunning $serverEntry 'anytls-real-server'
     Wait-TcpEndpoint $ServerListen
 
     # Start anytls-real-client
     Write-Host "Starting anytls-real-client on $ClientListen"
-    $clientEntry = Start-BinaryProcess $clientBinary $clientArgs 'reality-client'
+    $clientEntry = Start-BinaryProcess $clientBinary @('--config', $client_config_path) 'reality-client'
     Start-Sleep -Milliseconds 500
     Assert-ProcessRunning $clientEntry 'anytls-real-client'
     Wait-TcpEndpoint $ClientListen
@@ -386,5 +409,8 @@ finally {
         }
     }
     if (Test-Path $udpEchoScript) { Remove-Item $udpEchoScript -Force -ErrorAction SilentlyContinue }
+    foreach ($path in @($server_config_path, $client_config_path)) {
+        if (Test-Path $path) { Remove-Item $path -Force -ErrorAction SilentlyContinue }
+    }
     Write-Host 'Done.'
 }

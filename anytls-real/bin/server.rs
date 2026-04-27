@@ -49,33 +49,9 @@ use tokio::net::{TcpListener, TcpStream as TokioTcpStream, UdpSocket};
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
-    #[arg(long, default_value = "[::]:443")]
-    listen: String,
-
+    /// Path to the grouped server config (`.toml` or `.json`).
     #[arg(long)]
-    cert: PathBuf,
-
-    #[arg(long)]
-    key: PathBuf,
-
-    #[arg(long)]
-    reality_config: Option<PathBuf>,
-
-    #[arg(long, requires_all = ["reality_private_key", "reality_version"])]
-    reality_short_id: Option<String>,
-
-    #[arg(long, requires_all = ["reality_short_id", "reality_version"])]
-    reality_private_key: Option<String>,
-
-    #[arg(long, requires_all = ["reality_short_id", "reality_private_key"])]
-    reality_version: Option<String>,
-
-    #[arg(long = "reality-server-name")]
-    reality_server_name: Vec<String>,
-
-    /// AnyTLS shared password.
-    #[arg(long, env = "ANYTLS_PASSWORD")]
-    password: String,
+    config: PathBuf,
 
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
     #[arg(long, default_value = "info")]
@@ -84,22 +60,52 @@ struct Args {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RealityDocument<T> {
-    reality: T,
+struct ServerConfigFile {
+    #[serde(default)]
+    reality: Option<ServerRealityConfigFile>,
+    #[serde(default)]
+    anytls: Option<ServerAnytlsConfigFile>,
+    #[serde(default)]
+    server: Option<ServerRuntimeConfigFile>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RealityServerConfigFile {
-    private_key: String,
-    short_id: String,
-    version: String,
+struct ServerRealityConfigFile {
     #[serde(default)]
-    server_names: Vec<String>,
+    private_key: Option<String>,
+    #[serde(default)]
+    short_id: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    server_names: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerAnytlsConfigFile {
+    #[serde(default)]
+    password: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerRuntimeConfigFile {
+    #[serde(default)]
+    listen: Option<String>,
+    #[serde(default)]
+    cert: Option<PathBuf>,
+    #[serde(default)]
+    key: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
-struct RealityServerConfigResolved {
+struct ServerConfigResolved {
+    listen: String,
+    cert: PathBuf,
+    key: PathBuf,
+    password: String,
     private_key: String,
     short_id: String,
     version: String,
@@ -153,17 +159,13 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.clone()))
         .init();
 
-    if args.password.is_empty() {
-        bail!("anytls password must not be empty (set --password or ANYTLS_PASSWORD)");
-    }
-
-    let reality = resolve_reality_config(&args)?;
-    let tls_config = Arc::new(build_server_config(&args, &reality)?);
-    let password_sha256: [u8; 32] = Sha256::digest(args.password.as_bytes()).into();
+    let resolved = resolve_server_config(&args.config)?;
+    let tls_config = Arc::new(build_server_config(&resolved)?);
+    let password_sha256: [u8; 32] = Sha256::digest(resolved.password.as_bytes()).into();
     let padding = DefaultPaddingFactory::load();
 
-    let listener = TcpListener::bind(&args.listen).await?;
-    log::info!("REALITY+anytls server listening on {}", args.listen);
+    let listener = TcpListener::bind(&resolved.listen).await?;
+    log::info!("REALITY+anytls server listening on {}", resolved.listen);
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
@@ -402,65 +404,77 @@ async fn handle_uot_connected(
 
 // === helpers ===
 
-fn resolve_reality_config(args: &Args) -> Result<RealityServerConfigResolved> {
-    let file_config = if let Some(path) = args.reality_config.as_deref() {
-        Some(load_reality_document::<RealityServerConfigFile>(path)?.reality)
-    } else {
-        None
-    };
+fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
+    let file_config = load_server_config_file(config_path)?;
+    let reality = file_config
+        .reality
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("server config requires a [reality] section"))?;
+    let anytls = file_config
+        .anytls
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("server config requires an [anytls] section"))?;
+    let server = file_config
+        .server
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("server config requires a [server] section"))?;
 
-    let short_id = args
-        .reality_short_id
+    let listen = server
+        .listen
         .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .map(|c| c.short_id.clone())
-        });
-    let private_key = args
-        .reality_private_key
+        .unwrap_or_else(|| "[::]:443".to_string());
+    let cert = server
+        .cert
         .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .map(|c| c.private_key.clone())
-        });
-    let version = args
-        .reality_version
+        .ok_or_else(|| anyhow::anyhow!("server.cert must be set in config"))?;
+    let key = server
+        .key
         .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .map(|c| c.version.clone())
-        });
-    let server_names = if args.reality_server_name.is_empty() {
-        file_config
-            .as_ref()
-            .map(|c| c.server_names.clone())
-            .unwrap_or_default()
-    } else {
-        args.reality_server_name.clone()
-    };
-
-    match (short_id, private_key, version) {
-        (Some(s), Some(p), Some(v)) => Ok(RealityServerConfigResolved {
-            short_id: s,
-            private_key: p,
-            version: v,
-            server_names,
-        }),
-        _ => bail!(
-            "REALITY server requires short_id, private_key, and version via CLI or --reality-config"
-        ),
+        .ok_or_else(|| anyhow::anyhow!("server.key must be set in config"))?;
+    let password = anytls
+        .password
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("anytls.password must be set in config"))?;
+    if password.is_empty() {
+        bail!("anytls.password must not be empty");
     }
+
+    let short_id = reality
+        .short_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("reality.shortId must be set in config"))?;
+    let private_key = reality
+        .private_key
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("reality.privateKey must be set in config"))?;
+    let version = reality
+        .version
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("reality.version must be set in config"))?;
+
+    let server_names = reality
+        .server_names
+        .clone()
+        .unwrap_or_default();
+
+    Ok(ServerConfigResolved {
+        listen,
+        cert,
+        key,
+        password,
+        private_key,
+        short_id,
+        version,
+        server_names,
+    })
 }
 
-fn build_server_config(args: &Args, reality: &RealityServerConfigResolved) -> Result<ServerConfig> {
-    let certs = CertificateDer::pem_file_iter(&args.cert)
+fn build_server_config(reality: &ServerConfigResolved) -> Result<ServerConfig> {
+    let certs = CertificateDer::pem_file_iter(&reality.cert)
         .context("open certificate file")?
         .collect::<core::result::Result<Vec<_>, _>>()
         .context("read certificate chain")?;
-    let private_key = PrivateKeyDer::from_pem_file(&args.key).context("read private key")?;
+    let private_key = PrivateKeyDer::from_pem_file(&reality.key).context("read private key")?;
 
     let provider = provider::reality::default_x25519_tls13_reality_provider();
     let mut config = ServerConfig::builder(Arc::new(provider))
@@ -483,10 +497,7 @@ fn build_server_config(args: &Args, reality: &RealityServerConfigResolved) -> Re
     Ok(config)
 }
 
-fn load_reality_document<T>(path: &Path) -> Result<RealityDocument<T>>
-where
-    T: serde::de::DeserializeOwned,
-{
+fn load_server_config_file(path: &Path) -> Result<ServerConfigFile> {
     let contents = std::fs::read_to_string(path)?;
     match path
         .extension()

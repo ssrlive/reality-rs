@@ -16,6 +16,8 @@ http_target_pid=''
 server_pid=''
 client_pid=''
 http_target_script=''
+server_config_path=''
+client_config_path=''
 
 declare -a entry_logs=()
 declare -a entry_errors=()
@@ -312,6 +314,10 @@ cleanup() {
         rm -f -- "$http_target_script"
     fi
 
+    if [[ -n "$server_config_path" ]]; then
+        rm -f -- "$server_config_path" "$client_config_path" 2>/dev/null || true
+    fi
+
     if (( cleanup_message == 1 )) && (( keep_running == 0 )); then
         echo 'Cleaning up background processes'
         if (( exit_code == 0 )); then
@@ -371,23 +377,46 @@ target_listen="$(resolve_endpoint "$target_listen" 'Target')"
 target_uri="http://${target_listen}/"
 
 smoke_password='reality-smoke-password'
+server_config_path="$repo_root/target/tmp/reality-server.smoke.toml"
+client_config_path="$repo_root/target/tmp/reality-client.smoke.toml"
 
-server_args=(
-    '--cert' './bogo/keys/cert.pem'
-    '--key' './bogo/keys/key.pem'
-    '--listen' "$server_listen"
-    '--reality-config' './anytls-real/server/reality-server.toml'
-    '--password' "$smoke_password"
-)
+mkdir -p "$repo_root/target/tmp"
 
-client_args=(
-    '--listen' "$client_listen"
-    '--server-addr' "$server_listen"
-    '--reality-config' './anytls-real/client/reality-client.json'
-    '--ca-file' './bogo/keys/cert.pem'
-    '--insecure'
-    '--password' "$smoke_password"
-)
+cat > "$server_config_path" <<EOF
+[reality]
+shortId = "aabbcc"
+privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
+version = "010203"
+serverNames = ["test"]
+
+[anytls]
+password = "$smoke_password"
+
+[server]
+listen = "$server_listen"
+cert = './bogo/keys/cert.pem'
+key = './bogo/keys/key.pem'
+EOF
+
+cat > "$client_config_path" <<EOF
+[reality]
+shortId = "aabbcc"
+publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"
+serverName = "test"
+version = "010203"
+
+[anytls]
+password = "$smoke_password"
+idleCheckSecs = 30
+idleTimeoutSecs = 30
+minIdleSessions = 5
+
+[client]
+listen = "$client_listen"
+serverAddr = "$server_listen"
+caFile = './bogo/keys/cert.pem'
+insecure = true
+EOF
 
 if (( build_with_cargo == 1 )); then
     assert_command cargo
@@ -408,14 +437,14 @@ assert_process_running "$http_target_pid" 'HTTP target' "$START_LOG_PATH" "$STAR
 wait_tcp_endpoint "$target_listen"
 
 echo "Starting formal server on $server_listen"
-start_binary_process "$server_binary" 'reality-server' "${server_args[@]}"
+start_binary_process "$server_binary" 'reality-server' --config "$server_config_path"
 server_pid="$START_PID"
 sleep 0.5
 assert_process_running "$server_pid" 'Formal server' "$START_LOG_PATH" "$START_ERROR_PATH"
 wait_tcp_endpoint "$server_listen"
 
 echo "Starting formal client on $client_listen"
-start_binary_process "$client_binary" 'reality-client' "${client_args[@]}"
+start_binary_process "$client_binary" 'reality-client' --config "$client_config_path"
 client_pid="$START_PID"
 sleep 0.5
 assert_process_running "$client_pid" 'Formal client' "$START_LOG_PATH" "$START_ERROR_PATH"

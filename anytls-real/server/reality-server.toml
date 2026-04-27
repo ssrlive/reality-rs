@@ -3,3 +3,11 @@ shortId = "aabbcc"
 privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
 version = "010203"
 serverNames = ["test"]
+
+[anytls]
+password = "reality-smoke-password"
+
+[server]
+listen = "127.0.0.1:9445"
+cert = "./bogo/keys/cert.pem"
+key = "./bogo/keys/key.pem"
