@@ -31,6 +31,7 @@ use anytls::uot::{
     uot_get_request_from_stream, uot_is_sentinel_destination,
 };
 use aws_lc_rs::agreement;
+use aws_lc_rs::encoding::{AsBigEndian, Curve25519SeedBin};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use clap::Parser;
@@ -61,8 +62,13 @@ use tokio::net::{TcpListener, TcpStream as TokioTcpStream, UdpSocket};
 #[command(version)]
 struct Args {
     /// Path to the grouped server config (`.toml` or `.json`).
+    /// Optional — not required when using `--gen-reality-keys`.
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
+
+    /// Generate an X25519 REALITY keypair (prints privateKey base64url and shortId hex) and exit
+    #[arg(long = "gen-reality-keys")]
+    gen_reality_keys: bool,
 
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
     #[arg(long, default_value = "info")]
@@ -170,7 +176,19 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.clone()))
         .init();
 
-    let resolved = resolve_server_config(&args.config)?;
+    if args.gen_reality_keys {
+        if args.config.is_some() {
+            bail!("--gen-reality-keys must not be used together with --config");
+        }
+        generate_reality_keypair()?;
+        return Ok(());
+    }
+
+    let config_path = args
+        .config
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--config is required"))?;
+    let resolved = resolve_server_config(config_path)?;
     let tls_config = Arc::new(build_server_config(&resolved)?);
     let upstream_tls_config = Arc::new(build_upstream_tls_config()?);
     let allowed_server_names = Arc::new(resolved.server_names.clone());
@@ -752,6 +770,41 @@ fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello> {
         raw_client_hello,
         key_share,
     })
+}
+
+fn generate_reality_keypair() -> Result<()> {
+    // Generate an X25519 private key and derive public, then print Xray-style fields.
+    let priv_key = agreement::PrivateKey::generate(&agreement::X25519)
+        .context("generate X25519 private key")?;
+    let pub_key = priv_key
+        .compute_public_key()
+        .context("compute public key")?;
+
+    // Extract raw private seed bytes (32 bytes)
+    let raw_priv: Curve25519SeedBin<'_> = priv_key
+        .as_be_bytes()
+        .context("extract private key bytes")?;
+    let priv_bytes = raw_priv.as_ref();
+
+    // base64url no-padding privateKey (Xray style)
+    let private_b64url = URL_SAFE_NO_PAD.encode(priv_bytes);
+
+    // shortId = first 8 bytes of SHA256(public_key)
+    let digest = Sha256::digest(pub_key.as_ref());
+    let short_id = &digest[..8];
+    let mut shorthex = String::with_capacity(16);
+    for b in short_id {
+        use core::fmt::Write;
+        write!(&mut shorthex, "{:02x}", b).ok();
+    }
+
+    // publicKey: base64url no padding (Xray-style) for client config
+    let public_b64url = URL_SAFE_NO_PAD.encode(pub_key.as_ref());
+
+    println!("privateKey: {}", private_b64url);
+    println!("publicKey: {}", public_b64url);
+    println!("shortId: {}", shorthex);
+    Ok(())
 }
 
 async fn handle_plain_tls_connection(

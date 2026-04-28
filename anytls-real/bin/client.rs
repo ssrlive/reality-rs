@@ -529,8 +529,15 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
         .server_addr
         .clone()
         .ok_or_else(|| anyhow!("client.serverAddr must be set in config"))?;
-    let ca_file = client.ca_file.clone();
+    let mut ca_file = client.ca_file.clone();
     let insecure = client.insecure.unwrap_or(false);
+    if insecure && ca_file.is_some() {
+        // If insecure mode is requested we must not attempt to load the CA file
+        // (verification is disabled). Clear the ca_file so load_root_store
+        // won't try to open a missing file and will use system roots instead.
+        log::debug!("'insecure = true' set in client config; ignoring provided ca_file");
+        ca_file = None;
+    }
 
     let password = anytls
         .password

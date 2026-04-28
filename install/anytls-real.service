@@ -1,0 +1,15 @@
+[Unit]
+Description=anytls-real (REALITY + anytls) server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/anytls-real
+ExecStart=/usr/local/bin/anytls-real-server --config /etc/anytls-real/config.toml
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
