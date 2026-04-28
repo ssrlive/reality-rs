@@ -14,15 +14,15 @@ UDP-over-TCP mode).
 
 ### Quick start
 
-Use the sample config in [client/reality-client.toml](client/reality-client.toml)
+Use the sample config in [config/reality-client.toml](config/reality-client.toml)
 together with the local test server (run from the repo root):
 
 ```powershell
-cargo run -p anytls-real --bin anytls-real-client -- --config ./anytls-real/client/reality-client.toml
+cargo run -p anytls-real --bin anytls-real-client -- --config ./anytls-real/config/reality-client.toml
 ```
 
 Both JSON and TOML config files are supported. An equivalent TOML sample is
-available in [client/reality-client.toml](client/reality-client.toml).
+available in [config/reality-client.toml](config/reality-client.toml).
 
 The sample config includes the local-only `insecure = true` setting so the
 bundled `bogo/keys/cert.pem` certificate can be used without extra setup.
@@ -67,15 +67,15 @@ Default listen address: `[::]:443`.
 
 ### Quick start
 
-Use the sample config in [server/reality-server.toml](server/reality-server.toml)
+Use the sample config in [config/reality-server.toml](config/reality-server.toml)
 with the local test certificate (run from the repo root):
 
 ```powershell
-cargo run -p anytls-real --bin anytls-real-server -- --config ./anytls-real/server/reality-server.toml
+cargo run -p anytls-real --bin anytls-real-server -- --config ./anytls-real/config/reality-server.toml
 ```
 
 Both TOML and JSON config files are supported. An equivalent JSON sample is
-available in [server/reality-server.json](server/reality-server.json).
+available in [config/reality-server.json](config/reality-server.json).
 
 ### Config layout
 
