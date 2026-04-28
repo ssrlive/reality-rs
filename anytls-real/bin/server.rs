@@ -20,6 +20,8 @@
 
 use anytls_real::async_bridge;
 
+use aes_gcm::aead::AeadInPlace;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use anyhow::{Context, Result, bail};
 use anytls::core::PaddingFactory;
 use anytls::proxy::session::{Session, Stream as AnytlsStream, new_server_session};
@@ -28,21 +30,30 @@ use anytls::uot::{
     UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream,
     uot_get_request_from_stream, uot_is_sentinel_destination,
 };
+use aws_lc_rs::agreement;
+use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use clap::Parser;
 use core::hash::Hasher;
+use core::time::Duration;
+use hkdf::Hkdf;
+use rustls::ClientConfig;
+use rustls::ClientConnection;
 use rustls::Connection;
 use rustls::ServerConfig;
 use rustls::ServerConnection;
 use rustls::crypto::Identity;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::{ClientHelloVerifier, RealityClientHello};
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
 use socks5_impl::protocol::{Address, AsyncStreamOperation};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream as TokioTcpStream, UdpSocket};
 
@@ -161,8 +172,14 @@ async fn main() -> Result<()> {
 
     let resolved = resolve_server_config(&args.config)?;
     let tls_config = Arc::new(build_server_config(&resolved)?);
+    let upstream_tls_config = Arc::new(build_upstream_tls_config()?);
+    let allowed_server_names = Arc::new(resolved.server_names.clone());
+    let plain_tls_config = Arc::new(build_plain_server_config(&resolved)?);
     let password_sha256: [u8; 32] = Sha256::digest(resolved.password.as_bytes()).into();
     let padding = DefaultPaddingFactory::load();
+    let reality_private_key = Arc::new(parse_reality_private_key(&resolved.private_key)?);
+    let reality_short_id = Arc::new(parse_reality_short_id_fixed(&resolved.short_id)?);
+    let reality_version = parse_reality_version(&resolved.version);
 
     let listener = TcpListener::bind(&resolved.listen).await?;
     log::info!("REALITY+anytls server listening on {}", resolved.listen);
@@ -170,10 +187,26 @@ async fn main() -> Result<()> {
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let tls_config = tls_config.clone();
+        let upstream_tls_config = upstream_tls_config.clone();
+        let allowed_server_names = allowed_server_names.clone();
+        let plain_tls_config = plain_tls_config.clone();
         let padding = padding.clone();
+        let reality_private_key = reality_private_key.clone();
+        let reality_short_id = reality_short_id.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                handle_connection(stream, tls_config, password_sha256, padding).await
+            if let Err(error) = handle_connection(
+                stream,
+                tls_config,
+                upstream_tls_config,
+                allowed_server_names,
+                plain_tls_config,
+                password_sha256,
+                padding,
+                reality_private_key,
+                reality_short_id,
+                reality_version,
+            )
+            .await
             {
                 log::warn!("REALITY client {peer_addr} failed: {error:#}");
             }
@@ -183,19 +216,42 @@ async fn main() -> Result<()> {
 
 async fn handle_connection(
     stream: TokioTcpStream,
-    config: Arc<ServerConfig>,
+    reality_config: Arc<ServerConfig>,
+    upstream_tls_config: Arc<ClientConfig>,
+    allowed_server_names: Arc<Vec<String>>,
+    plain_tls_config: Arc<ServerConfig>,
     password_sha256: [u8; 32],
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
+    reality_private_key: Arc<Vec<u8>>,
+    reality_short_id: Arc<[u8; 8]>,
+    reality_version: [u8; 3],
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
     let std_stream = stream.into_std()?;
+    std_stream.set_nonblocking(false)?;
+
+    let is_reality = is_reality_client_hello(
+        &std_stream,
+        reality_private_key.as_slice(),
+        reality_short_id.as_slice(),
+        &reality_version,
+    )?;
+    if !is_reality {
+        return handle_plain_tls_connection(
+            std_stream,
+            plain_tls_config,
+            upstream_tls_config,
+            allowed_server_names,
+        )
+        .await;
+    }
 
     // 1) REALITY blocking handshake on a worker thread.
     let tls = tokio::task::spawn_blocking(
         move || -> Result<StreamOwned<ServerConnection, std::net::TcpStream>> {
             let mut sock = std_stream;
             sock.set_nonblocking(false)?;
-            let mut conn = ServerConnection::new(config)?;
+            let mut conn = ServerConnection::new(reality_config)?;
             while conn.is_handshaking() {
                 complete_io(&mut sock, &mut conn).context("complete REALITY handshake")?;
             }
@@ -497,6 +553,398 @@ fn build_server_config(reality: &ServerConfigResolved) -> Result<ServerConfig> {
     Ok(config)
 }
 
+fn build_plain_server_config(reality: &ServerConfigResolved) -> Result<ServerConfig> {
+    let certs = CertificateDer::pem_file_iter(&reality.cert)
+        .context("open certificate file")?
+        .collect::<core::result::Result<Vec<_>, _>>()
+        .context("read certificate chain")?;
+    let private_key = PrivateKeyDer::from_pem_file(&reality.key).context("read private key")?;
+
+    let config = ServerConfig::builder(Arc::new(provider::DEFAULT_PROVIDER))
+        .with_no_client_auth()
+        .with_single_cert(Arc::new(Identity::from_cert_chain(certs)?), private_key)?;
+
+    Ok(config)
+}
+
+fn is_reality_client_hello(
+    stream: &std::net::TcpStream,
+    server_private_key: &[u8],
+    short_id: &[u8],
+    version: &[u8; 3],
+) -> Result<bool> {
+    stream
+        .set_nonblocking(false)
+        .context("set socket blocking for ClientHello peek")?;
+
+    let mut buf = vec![0u8; 2048];
+    let mut available = 0;
+
+    loop {
+        let n = stream
+            .peek(&mut buf[available..])
+            .context("peek ClientHello")?;
+        if n == 0 {
+            return Ok(false);
+        }
+        available += n;
+
+        if available < 5 {
+            continue;
+        }
+
+        let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+        let needed = 5 + record_len;
+        if available < needed {
+            if needed > buf.len() {
+                buf.resize(needed, 0);
+            }
+            continue;
+        }
+
+        let Ok(parsed) = parse_client_hello(&buf[..needed]) else {
+            return Ok(false);
+        };
+
+        let private_key =
+            agreement::PrivateKey::from_private_key(&agreement::X25519, server_private_key)
+                .context("parse REALITY private key bytes")?;
+        let peer_public = agreement::UnparsedPublicKey::new(&agreement::X25519, &parsed.key_share);
+        let reality_key = agreement::agree(
+            &private_key,
+            peer_public,
+            aws_lc_rs::error::Unspecified,
+            |secret| Ok::<Vec<u8>, aws_lc_rs::error::Unspecified>(Vec::from(secret)),
+        )
+        .map_err(|_| anyhow::anyhow!("failed to compute REALITY shared secret"))?;
+
+        let hk = Hkdf::<Sha256>::new(Some(&parsed.random[..20]), &reality_key);
+        let mut sealing_key = [0u8; 32];
+        hk.expand(b"REALITY", &mut sealing_key)
+            .context("derive REALITY sealing key")?;
+
+        let cipher = Aes256Gcm::new(&sealing_key.into());
+        let mut decrypted = parsed.session_id.to_vec();
+        let nonce = Nonce::from_slice(&parsed.random[20..32]);
+        if cipher
+            .decrypt_in_place(nonce, &parsed.raw_client_hello, &mut decrypted)
+            .is_err()
+        {
+            return Ok(false);
+        }
+
+        if decrypted.len() != 16 || decrypted[3] != 0 {
+            return Ok(false);
+        }
+        if &decrypted[..3] != version.as_slice() {
+            return Ok(false);
+        }
+        if &decrypted[8..16] != short_id {
+            return Ok(false);
+        }
+
+        return Ok(true);
+    }
+}
+
+struct ParsedClientHello {
+    random: [u8; 32],
+    session_id: [u8; 32],
+    raw_client_hello: Vec<u8>,
+    key_share: Vec<u8>,
+}
+
+fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello> {
+    if bytes.len() < 9 || bytes[0] != 22 {
+        bail!("not a TLS record")
+    }
+
+    let record_len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
+    if bytes.len() < 5 + record_len || record_len < 4 {
+        bail!("truncated TLS record")
+    }
+
+    let handshake = &bytes[5..5 + record_len];
+    if handshake[0] != 1 {
+        bail!("not a ClientHello")
+    }
+
+    let handshake_len =
+        ((handshake[1] as usize) << 16) | ((handshake[2] as usize) << 8) | (handshake[3] as usize);
+    if handshake_len + 4 > handshake.len() {
+        bail!("truncated ClientHello")
+    }
+
+    let body = &handshake[4..4 + handshake_len];
+    if body.len() < 35 {
+        bail!("ClientHello body too short")
+    }
+
+    let mut offset = 0;
+    let mut random = [0u8; 32];
+    random.copy_from_slice(&body[offset + 2..offset + 34]);
+    offset += 34;
+
+    let session_id_len = body[offset] as usize;
+    if session_id_len != 32 {
+        bail!("not a REALITY-style session_id")
+    }
+    offset += 1;
+
+    let session_id_offset = offset;
+    let mut session_id = [0u8; 32];
+    session_id.copy_from_slice(&body[offset..offset + 32]);
+    offset += 32;
+
+    let cipher_suites_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+    offset += 2 + cipher_suites_len;
+    if offset + 1 > body.len() {
+        bail!("truncated ClientHello after cipher suites")
+    }
+    let compression_len = body[offset] as usize;
+    offset += 1 + compression_len;
+    if offset + 2 > body.len() {
+        bail!("truncated ClientHello after compression")
+    }
+
+    let extensions_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+    offset += 2;
+    if offset + extensions_len > body.len() {
+        bail!("truncated ClientHello extensions")
+    }
+
+    let mut key_share = None;
+    let extensions_end = offset + extensions_len;
+    while offset + 4 <= extensions_end {
+        let ext_type = u16::from_be_bytes([body[offset], body[offset + 1]]);
+        let ext_len = u16::from_be_bytes([body[offset + 2], body[offset + 3]]) as usize;
+        offset += 4;
+        if offset + ext_len > extensions_end {
+            break;
+        }
+        if ext_type == 0x0033 {
+            if ext_len < 6 {
+                bail!("invalid key_share extension")
+            }
+            let client_shares_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+            if client_shares_len + 2 != ext_len {
+                bail!("invalid key_share length")
+            }
+            let group = u16::from_be_bytes([body[offset + 2], body[offset + 3]]);
+            let share_len = u16::from_be_bytes([body[offset + 4], body[offset + 5]]) as usize;
+            if group != 0x001d || share_len + 6 != ext_len {
+                bail!("unsupported key_share for REALITY")
+            }
+            key_share = Some(body[offset + 6..offset + 6 + share_len].to_vec());
+            break;
+        }
+        offset += ext_len;
+    }
+
+    let key_share = key_share.ok_or_else(|| anyhow::anyhow!("missing X25519 key_share"))?;
+    let mut raw_client_hello = handshake.to_vec();
+    let raw_session_id_offset = 4 + 2 + 32 + 1 + session_id_offset - 35;
+    raw_client_hello[raw_session_id_offset..raw_session_id_offset + 32].fill(0);
+
+    Ok(ParsedClientHello {
+        random,
+        session_id,
+        raw_client_hello,
+        key_share,
+    })
+}
+
+async fn handle_plain_tls_connection(
+    mut stream: std::net::TcpStream,
+    config: Arc<ServerConfig>,
+    upstream_tls_config: Arc<ClientConfig>,
+    allowed_server_names: Arc<Vec<String>>,
+) -> Result<()> {
+    stream.set_nonblocking(false)?;
+    let mut conn = ServerConnection::new(config)?;
+    while conn.is_handshaking() {
+        complete_io(&mut stream, &mut conn).context("complete plain TLS handshake")?;
+    }
+
+    let mut tls = StreamOwned::new(conn, stream);
+
+    let server_name = match tls.conn.server_name() {
+        Some(name) => name.as_ref().to_string(),
+        None => {
+            tls.conn.send_close_notify();
+            while tls.conn.wants_write() {
+                complete_io(&mut tls.sock, &mut tls.conn)
+                    .context("flush plain TLS rejection close_notify")?;
+            }
+            return Ok(());
+        }
+    };
+
+    if !allowed_server_names.is_empty()
+        && !allowed_server_names
+            .iter()
+            .any(|allowed| allowed == &server_name)
+    {
+        log::debug!("rejecting plain TLS probe for unexpected SNI: {server_name}");
+        tls.conn.send_close_notify();
+        while tls.conn.wants_write() {
+            complete_io(&mut tls.sock, &mut tls.conn)
+                .context("flush plain TLS rejection close_notify")?;
+        }
+        return Ok(());
+    }
+
+    proxy_plain_tls_connection(tls, upstream_tls_config, server_name).await
+}
+
+async fn proxy_plain_tls_connection(
+    client_tls: StreamOwned<ServerConnection, std::net::TcpStream>,
+    upstream_tls_config: Arc<ClientConfig>,
+    server_name: String,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let upstream_host = server_name;
+        let server_name =
+            ServerName::try_from(upstream_host.clone()).context("parse SNI server_name")?;
+        let upstream_sock = std::net::TcpStream::connect((upstream_host.as_str(), 443))
+            .with_context(|| format!("connect upstream {}:443", upstream_host))?;
+        upstream_sock.set_nodelay(true).ok();
+        upstream_sock.set_nonblocking(false)?;
+
+        let mut upstream_conn = upstream_tls_config
+            .connect(server_name)
+            .build()
+            .context("create upstream TLS client")?;
+        let mut upstream_sock = upstream_sock;
+        while upstream_conn.is_handshaking() {
+            complete_io(&mut upstream_sock, &mut upstream_conn)
+                .context("complete upstream TLS handshake")?;
+        }
+
+        let upstream_tls = StreamOwned::new(upstream_conn, upstream_sock);
+        relay_tls_streams(client_tls, upstream_tls)
+    })
+    .await??;
+
+    Ok(())
+}
+
+fn relay_tls_streams(
+    mut client_tls: StreamOwned<ServerConnection, std::net::TcpStream>,
+    mut upstream_tls: StreamOwned<ClientConnection, std::net::TcpStream>,
+) -> Result<()> {
+    client_tls.sock.set_nonblocking(true)?;
+    upstream_tls
+        .sock
+        .set_nonblocking(true)?;
+
+    let mut client_to_upstream = Vec::with_capacity(16 * 1024);
+    let mut upstream_to_client = Vec::with_capacity(16 * 1024);
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut client_closed = false;
+    let mut upstream_closed = false;
+
+    loop {
+        let mut progressed = false;
+
+        if !client_closed && client_to_upstream.len() < 256 * 1024 {
+            match client_tls.read(&mut buf) {
+                Ok(0) => {
+                    client_closed = true;
+                    upstream_tls.conn.send_close_notify();
+                    progressed = true;
+                }
+                Ok(n) => {
+                    client_to_upstream.extend_from_slice(&buf[..n]);
+                    progressed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        if !client_to_upstream.is_empty() {
+            match upstream_tls.write(&client_to_upstream) {
+                Ok(0) => upstream_closed = true,
+                Ok(n) => {
+                    client_to_upstream.drain(..n);
+                    progressed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+            let _ = upstream_tls.flush();
+        }
+
+        if !upstream_closed && upstream_to_client.len() < 256 * 1024 {
+            match upstream_tls.read(&mut buf) {
+                Ok(0) => {
+                    upstream_closed = true;
+                    client_tls.conn.send_close_notify();
+                    progressed = true;
+                }
+                Ok(n) => {
+                    upstream_to_client.extend_from_slice(&buf[..n]);
+                    progressed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        if !upstream_to_client.is_empty() {
+            match client_tls.write(&upstream_to_client) {
+                Ok(0) => client_closed = true,
+                Ok(n) => {
+                    upstream_to_client.drain(..n);
+                    progressed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+            let _ = client_tls.flush();
+        }
+
+        if client_tls.conn.wants_write() {
+            let _ = complete_io(&mut client_tls.sock, &mut client_tls.conn);
+            progressed = true;
+        }
+        if upstream_tls.conn.wants_write() {
+            let _ = complete_io(&mut upstream_tls.sock, &mut upstream_tls.conn);
+            progressed = true;
+        }
+
+        if (client_closed || upstream_closed)
+            && client_to_upstream.is_empty()
+            && upstream_to_client.is_empty()
+        {
+            break;
+        }
+
+        if !progressed {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    client_tls.conn.send_close_notify();
+    upstream_tls.conn.send_close_notify();
+    let _ = client_tls.flush();
+    let _ = upstream_tls.flush();
+    Ok(())
+}
+
+fn build_upstream_tls_config() -> Result<ClientConfig> {
+    let root_store = rustls::RootCertStore::from_iter(
+        webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .cloned(),
+    );
+
+    Ok(ClientConfig::builder(Arc::new(provider::DEFAULT_PROVIDER))
+        .with_root_certificates(root_store)
+        .with_no_client_auth()?)
+}
+
 fn load_server_config_file(path: &Path) -> Result<ServerConfigFile> {
     let contents = std::fs::read_to_string(path)?;
     match path
@@ -522,6 +970,48 @@ fn parse_reality_version(version: &str) -> [u8; 3] {
         parsed[index] = parse_hex_byte(chunk[0], chunk[1]);
     }
     parsed
+}
+
+fn parse_reality_private_key(private_key: &str) -> Result<Vec<u8>> {
+    let key = private_key.trim();
+    let decoded = URL_SAFE_NO_PAD
+        .decode(key.as_bytes())
+        .or_else(|_| STANDARD_NO_PAD.decode(key.as_bytes()))
+        .or_else(|_| URL_SAFE.decode(key.as_bytes()))
+        .or_else(|_| STANDARD.decode(key.as_bytes()))
+        .context("parse REALITY private key")?;
+
+    if decoded.len() != 32 {
+        bail!("REALITY private_key must decode to 32 bytes")
+    }
+    Ok(decoded)
+}
+
+fn parse_reality_short_id_fixed(short_id: &str) -> Result<[u8; 8]> {
+    let raw = decode_hex(short_id.trim())?;
+    if raw.len() > 8 {
+        bail!("REALITY short_id must be at most 8 bytes")
+    }
+
+    let mut fixed = [0u8; 8];
+    fixed[..raw.len()].copy_from_slice(&raw);
+    Ok(fixed)
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>> {
+    let input = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if !input.len().is_multiple_of(2) {
+        bail!("REALITY short_id hex string must contain an even number of digits")
+    }
+
+    let mut bytes = Vec::with_capacity(input.len() / 2);
+    for chunk in input.as_bytes().chunks_exact(2) {
+        bytes.push(parse_hex_byte(chunk[0], chunk[1]));
+    }
+    Ok(bytes)
 }
 
 fn parse_hex_byte(high: u8, low: u8) -> u8 {

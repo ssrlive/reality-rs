@@ -320,7 +320,7 @@ $null = New-Item -ItemType Directory -Path (Join-Path $repoRoot 'target/tmp') -F
 shortId = "aabbcc"
 privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
 version = "010203"
-serverNames = ["test"]
+serverNames = ["baidu.com", "www.baidu.com"]
 
 [anytls]
 password = "$smokePassword"
@@ -335,7 +335,7 @@ key = "./bogo/keys/key.pem"
 [reality]
 shortId = "aabbcc"
 publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"
-serverName = "test"
+serverName = "baidu.com"
 version = "010203"
 
 [anytls]
@@ -390,6 +390,15 @@ try {
     }
 
     Write-Host "Smoke response: $response"
+
+    $serverEndpoint = Split-Endpoint -Endpoint $ServerListen
+    $resolveArg = "baidu.com:$($serverEndpoint.Port):$($serverEndpoint.HostName)"
+    Write-Host "Running direct SNI fallback probe to baidu.com on $ServerListen"
+    $fallbackResponse = & curl.exe --silent --show-error -k --resolve $resolveArg "https://baidu.com:$($serverEndpoint.Port)/"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Fallback curl probe exited with code $LASTEXITCODE"
+    }
+    Write-Host "Fallback probe response: $fallbackResponse"
 
     if ($response -ne 'reality tunnel ok') {
         throw "Unexpected response body: $response"

@@ -387,7 +387,7 @@ cat > "$server_config_path" <<EOF
 shortId = "aabbcc"
 privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
 version = "010203"
-serverNames = ["test"]
+serverNames = ["baidu.com", "www.baidu.com"]
 
 [anytls]
 password = "$smoke_password"
@@ -402,7 +402,7 @@ cat > "$client_config_path" <<EOF
 [reality]
 shortId = "aabbcc"
 publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"
-serverName = "test"
+serverName = "baidu.com"
 version = "010203"
 
 [anytls]
@@ -457,6 +457,16 @@ if ! response="$(curl --silent --show-error --socks5-hostname "$client_listen" "
 fi
 
 echo "Smoke response: $response"
+
+server_host="${server_listen%:*}"
+server_port="${server_listen##*:}"
+echo "Running direct SNI fallback probe to baidu.com on $server_listen"
+if ! fallback_response="$(curl --silent --show-error -k --resolve "baidu.com:${server_port}:${server_host}" "https://baidu.com:${server_port}/")"; then
+    show_logs
+    die "Fallback curl probe exited with a non-zero status"
+fi
+
+echo "Fallback probe response: $fallback_response"
 
 if [[ "$response" != 'reality tunnel ok' ]]; then
     show_logs

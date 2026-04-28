@@ -1,8 +1,8 @@
 [reality]
 shortId = "aabbcc"
 publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"
-serverName = "test"
 version = "010203"
+serverName = "test"
 
 [anytls]
 password = "reality-smoke-password"
