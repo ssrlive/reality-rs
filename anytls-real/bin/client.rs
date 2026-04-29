@@ -331,7 +331,6 @@ async fn handle_tcp_connect(
     let stream = match client.create_stream().await {
         Ok(s) => s,
         Err(err) => {
-            let _ = client.close().await;
             if let Ok(mut failed) = connect_req
                 .reply(Reply::GeneralFailure, Address::unspecified())
                 .await
@@ -347,7 +346,6 @@ async fn handle_tcp_connect(
     let addr_bytes: Vec<u8> = target.clone().into();
     if let Err(err) = stream.write(&addr_bytes).await {
         let _ = stream.close().await;
-        let _ = client.close().await;
         if let Ok(mut failed) = connect_req
             .reply(Reply::GeneralFailure, Address::unspecified())
             .await
@@ -429,7 +427,6 @@ async fn handle_udp_associate(
     let stream = match client.create_stream().await {
         Ok(s) => s,
         Err(err) => {
-            let _ = client.close().await;
             let mut reply = associate_req
                 .reply(Reply::GeneralFailure, Address::unspecified())
                 .await?;
@@ -442,7 +439,6 @@ async fn handle_udp_associate(
     //   sentinel address (SocksAddr) + UotRequest{Datagram, unspecified}
     if let Err(err) = setup_uot_request(&stream).await {
         let _ = stream.close().await;
-        let _ = client.close().await;
         let mut reply = associate_req
             .reply(Reply::GeneralFailure, Address::unspecified())
             .await?;
