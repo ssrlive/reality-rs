@@ -549,7 +549,10 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
 
     let idle_check_secs = anytls.idle_check_secs.unwrap_or(30);
     let idle_timeout_secs = anytls.idle_timeout_secs.unwrap_or(30);
-    let min_idle_sessions = anytls.min_idle_sessions.unwrap_or(5);
+    // Keep the idle floor at zero by default so timed-out sessions are not
+    // preserved indefinitely. Users can opt back in via config if they want
+    // a warm pool.
+    let min_idle_sessions = anytls.min_idle_sessions.unwrap_or(0);
 
     let short_id = reality
         .short_id

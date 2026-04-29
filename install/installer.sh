@@ -251,7 +251,7 @@ serverName = "$the_site"
 password = "$anytls_password"
 idleCheckSecs = 30
 idleTimeoutSecs = 30
-minIdleSessions = 5
+minIdleSessions = 0
 
 [client]
 listen = "127.0.0.1:2080"

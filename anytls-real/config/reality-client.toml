@@ -8,7 +8,7 @@ serverName = "test"
 password = "reality-smoke-password"
 idleCheckSecs = 30
 idleTimeoutSecs = 30
-minIdleSessions = 5
+minIdleSessions = 0
 
 [client]
 listen = "127.0.0.1:1081"
