@@ -51,7 +51,7 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1.0.73"
-anytls = { version = "0.2.3", default-features = false, git = "https://github.com/ssrlive/anytls-rs.git", rev = "9591976", features = [
+anytls = { version = "0.2.3", default-features = false, git = "https://github.com/ssrlive/anytls-rs.git", rev = "6d600f1", features = [
   "core",
   "uot",
   "runtime",
