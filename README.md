@@ -1,3 +1,48 @@
+## About AnyTLS-Real
+
+This repository contains a fork of `rustls` for a REALITY-wrapped AnyTLS proxy implementation.
+Key user-facing binaries live in `anytls-real/`:
+
+- `anytls-real-client`: a SOCKS5 client that tunnels traffic over REALITY+TLS
+  and the AnyTLS session protocol.
+- `anytls-real-server`: the corresponding server that accepts REALITY+TLS
+  connections and forwards streams to upstream targets.
+
+If you only want to run the proxy pair quickly on a Linux system, the
+convenience installer is provided at `install/installer.sh` (it generates a
+local CA, server cert, REALITY keys, writes configs and attempts to enable a
+systemd service).
+
+### Quick install
+
+Options:
+
+- Install with the automated script (Linux, run as root):
+
+```sh
+sudo bash install/installer.sh install [domain] [port]
+```
+
+If you omit `[domain]` the script will prompt and may pick a random common
+hostname for certificate generation. `[port]` defaults to `443`.
+
+- Build and run from source (developer flow):
+
+```sh
+# build and install the anytls-real binaries into your cargo bin
+cargo install --path ./anytls-real
+
+# run the server with a config file
+cargo run -p anytls-real --bin anytls-real-server -- --config anytls-real/config/reality-server.toml
+
+# run the client
+cargo run -p anytls-real --bin anytls-real-client -- --config anytls-real/config/reality-client.toml
+```
+
+See `anytls-real/README.md` for additional runtime and smoke-test instructions.
+
+---
+
 <p align="center">
   <img width="512" src="https://raw.githubusercontent.com/rustls/rustls/main/admin/logo/rustls.svg">
 </p>
