@@ -14,7 +14,13 @@ path = "bin/server.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-anytls = { workspace = true }
+anytls = { version = "0.3.0", default-features = false, features = [
+    "core",
+    "uot",
+    "runtime",
+    "client",
+    "server",
+] }
 clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }

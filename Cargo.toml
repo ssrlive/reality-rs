@@ -51,13 +51,6 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1.0.73"
-anytls = { version = "0.3.0", default-features = false, features = [
-  "core",
-  "uot",
-  "runtime",
-  "client",
-  "server",
-] }
 asn1 = "0.24"
 async-trait = "0.1.74"
 aws-lc-rs = { version = "1.14", default-features = false }
