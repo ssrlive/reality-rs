@@ -3,8 +3,8 @@
 //! Architecture:
 //!
 //! - All session-level concerns (cmdSettings/cmdServerSettings, cmdSYN/
-//!   cmdSYNACK, cmdPSH/cmdFIN, cmdWaste padding scheme, idle session pool,
-//!   stream multiplexing) are owned by `anytls::proxy::session::Client`.
+//!   cmdSYNACK, cmdPSH/cmdFIN, cmdWaste padding scheme, idle session pool)
+//!   are owned by `anytls::proxy::session::Client`.
 //!   We only provide a `dial_out` callback that returns a fresh
 //!   `Box<dyn AsyncReadWrite>` carrier on demand.
 //! - Each carrier = one REALITY-protected TCP connection. The blocking
@@ -21,8 +21,8 @@ use anytls_real::async_bridge;
 
 use anyhow::{Context, Result, anyhow, bail};
 use anytls::AsyncReadWrite;
-use anytls::core::PaddingFactory;
-use anytls::proxy::session::{Client, Stream as AnytlsStream};
+use anytls::core::{Command, Frame, PaddingFactory};
+use anytls::proxy::session::{Client, DEFAULT_SID, Session as AnytlsSession};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{
     UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination,
@@ -33,6 +33,7 @@ use core::time::Duration;
 use rustls::ClientConfig;
 use rustls::Connection;
 use rustls::RootCertStore;
+use rustls::client::Resumption;
 use rustls::client::danger::{
     HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
     SignatureVerificationInput,
@@ -209,9 +210,8 @@ async fn main() -> Result<()> {
         padding: padding.clone(),
     });
 
-    // anytls Client owns the session pool and stream multiplexer. On every
-    // `create_stream()` it picks an idle session (under
-    // `MAX_STREAMS_PER_SESSION`) or invokes `dial_out` to build a new one.
+    // anytls Client owns the session pool. On every `create_stream()` it
+    // picks an idle session or invokes `dial_out` to build a new one.
     let dial_ctx_for_dial = dial_ctx.clone();
     let anytls_client = Arc::new(Client::new(
         Box::new(move || {
@@ -328,7 +328,7 @@ async fn handle_tcp_connect(
     let bind_addr = Address::from(connect_req.local_addr()?);
 
     // Open the anytls stream *before* confirming success to the SOCKS client.
-    let stream = match client.create_stream().await {
+    let session = match client.create_stream().await {
         Ok(s) => s,
         Err(err) => {
             if let Ok(mut failed) = connect_req
@@ -344,8 +344,22 @@ async fn handle_tcp_connect(
     // First user payload on this stream: target address in SOCKS5 SocksAddr
     // format. Becomes the data of the first cmdPSH frame.
     let addr_bytes: Vec<u8> = target.clone().into();
-    if let Err(err) = stream.write(&addr_bytes).await {
-        let _ = stream.close().await;
+    if let Err(err) = session.write(&addr_bytes).await {
+        let _ = session.terminate().await;
+        if let Ok(mut failed) = connect_req
+            .reply(Reply::GeneralFailure, Address::unspecified())
+            .await
+        {
+            let _ = failed.shutdown().await;
+        }
+        return Err(err.into());
+    }
+
+    if let Err(err) = session
+        .wait_for_stream_handshake()
+        .await
+    {
+        let _ = session.terminate().await;
         if let Ok(mut failed) = connect_req
             .reply(Reply::GeneralFailure, Address::unspecified())
             .await
@@ -362,29 +376,48 @@ async fn handle_tcp_connect(
         .await?;
 
     let (mut local_read, mut local_write) = ready.into_split();
-    let stream_w = stream.clone();
-    let stream_r = stream.clone();
+    let session_w = session.clone();
+    let session_r = session.clone();
 
     let l2r = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
+        let mut err = None;
+        let mut local_eof = false;
         loop {
             match local_read.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    local_eof = true;
+                    break;
+                }
                 Ok(n) => {
-                    if stream_w.write(&buf[..n]).await.is_err() {
+                    if let Err(e) = session_w.write(&buf[..n]).await {
+                        err = Some(e);
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    if is_nonfatal_local_disconnect(&e) {
+                        log::trace!("tcp tunnel local->proxy closed: {e}");
+                        local_eof = true;
+                    } else {
+                        err = Some(e);
+                    }
+                    break;
+                }
             }
         }
-        let _ = stream_w.close().await;
+        if let Some(e) = err {
+            let _ = session_w.terminate().await;
+            log::debug!("tcp tunnel local->proxy error: {e}");
+        } else if local_eof {
+            let _ = finish_logical_stream(&session_w).await;
+        }
     });
 
     let r2l = tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
-            match stream_r.read(&mut buf).await {
+            match session_r.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
                     if local_write
@@ -392,6 +425,7 @@ async fn handle_tcp_connect(
                         .await
                         .is_err()
                     {
+                        let _ = finish_logical_stream(&session_r).await;
                         break;
                     }
                 }
@@ -402,9 +436,28 @@ async fn handle_tcp_connect(
     });
 
     let _ = tokio::join!(l2r, r2l);
-    let _ = stream.close().await;
-    log::debug!("tcp tunnel to {target} closed");
+    log::trace!("tcp tunnel to {target} closed");
     Ok(())
+}
+
+async fn finish_logical_stream(session: &Arc<AnytlsSession>) -> std::io::Result<()> {
+    let _ = session
+        .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
+        .await;
+    session
+        .mark_local_stream_closed(DEFAULT_SID)
+        .await
+}
+
+fn is_nonfatal_local_disconnect(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }
 
 async fn handle_udp_associate(
@@ -424,7 +477,7 @@ async fn handle_udp_associate(
     };
     let listen_addr = udp.local_addr()?;
 
-    let stream = match client.create_stream().await {
+    let session = match client.create_stream().await {
         Ok(s) => s,
         Err(err) => {
             let mut reply = associate_req
@@ -437,13 +490,25 @@ async fn handle_udp_associate(
 
     // Mark this stream as a UoT stream:
     //   sentinel address (SocksAddr) + UotRequest{Datagram, unspecified}
-    if let Err(err) = setup_uot_request(&stream).await {
-        let _ = stream.close().await;
+    if let Err(err) = setup_uot_request(&session).await {
+        let _ = session.terminate().await;
         let mut reply = associate_req
             .reply(Reply::GeneralFailure, Address::unspecified())
             .await?;
         reply.shutdown().await?;
         return Err(err);
+    }
+
+    if let Err(err) = session
+        .wait_for_stream_handshake()
+        .await
+    {
+        let _ = session.terminate().await;
+        let mut reply = associate_req
+            .reply(Reply::GeneralFailure, Address::unspecified())
+            .await?;
+        reply.shutdown().await?;
+        return Err(err.into());
     }
 
     let mut reply = associate_req
@@ -452,8 +517,8 @@ async fn handle_udp_associate(
     let listen_udp = Arc::new(AssociatedUdpSocket::from((udp, MAX_UDP_RELAY_PACKET_SIZE)));
     // Pin the UDP association to the first sender; ignore packets from other sources.
     let incoming_addr = Arc::new(tokio::sync::Mutex::new(Option::<SocketAddr>::None));
-    let stream_writer = stream.clone();
-    let mut stream_reader = AnytlsStreamReader::new(stream.clone());
+    let session_writer = session.clone();
+    let mut session_reader = AnytlsStreamReader::new(session.clone());
 
     let result: Result<()> = loop {
         tokio::select! {
@@ -474,9 +539,9 @@ async fn handle_udp_associate(
                 }
                 drop(guard);
                 let frame = uot_encode_packet(UotMode::Datagram, Some(&destination), &pkt)?;
-                stream_writer.write(&frame).await?;
+                session_writer.write(&frame).await?;
             }
-            res = uot_get_packet_from_stream(UotMode::Datagram, &mut stream_reader) => {
+            res = uot_get_packet_from_stream(UotMode::Datagram, &mut session_reader) => {
                 let (source, payload) = res?;
                 let Some(incoming) = *incoming_addr.lock().await else {
                     continue;
@@ -491,16 +556,25 @@ async fn handle_udp_associate(
         }
     };
 
-    let _ = stream.close().await;
+    if result.is_ok() {
+        let _ = session
+            .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
+            .await;
+        let _ = session
+            .mark_local_stream_closed(DEFAULT_SID)
+            .await;
+    } else {
+        let _ = session.terminate().await;
+    }
     let _ = reply.shutdown().await;
     result
 }
 
-async fn setup_uot_request(stream: &Arc<AnytlsStream>) -> Result<()> {
+async fn setup_uot_request(session: &Arc<AnytlsSession>) -> Result<()> {
     let sentinel: Vec<u8> = uot_sentinel_destination().into();
-    stream.write(&sentinel).await?;
+    session.write(&sentinel).await?;
     let request_bytes: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified()).into();
-    stream.write(&request_bytes).await?;
+    session.write(&request_bytes).await?;
     Ok(())
 }
 
@@ -549,7 +623,10 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
 
     let idle_check_secs = anytls.idle_check_secs.unwrap_or(30);
     let idle_timeout_secs = anytls.idle_timeout_secs.unwrap_or(30);
-    let min_idle_sessions = anytls.min_idle_sessions.unwrap_or(5);
+    // Keep the idle floor at zero by default so timed-out sessions are not
+    // preserved indefinitely. Users can opt back in via config if they want
+    // a warm pool.
+    let min_idle_sessions = anytls.min_idle_sessions.unwrap_or(0);
 
     let short_id = reality
         .short_id
@@ -604,6 +681,11 @@ fn build_client_config(args: &RealityClientConfigResolved) -> Result<ClientConfi
         &args.short_id,
         &args.public_key,
     )?;
+
+    // REALITY carriers are short-lived and heavily concurrent here; disabling
+    // TLS resumption avoids resumed handshakes tearing down some fresh
+    // carriers under burst load.
+    config.resumption = Resumption::disabled();
 
     Ok(config)
 }
@@ -670,10 +752,10 @@ fn parse_hex_nibble(value: u8) -> u8 {
     }
 }
 
-// === AsyncRead adapter for AnytlsStream (so UoT helpers can drive it) ===
+// === AsyncRead adapter for AnytlsSession (so UoT helpers can drive it) ===
 
 struct AnytlsStreamReader {
-    inner: Arc<AnytlsStream>,
+    inner: Arc<AnytlsSession>,
     #[allow(clippy::type_complexity)]
     read_fut: Option<
         core::pin::Pin<
@@ -683,7 +765,7 @@ struct AnytlsStreamReader {
 }
 
 impl AnytlsStreamReader {
-    fn new(inner: Arc<AnytlsStream>) -> Self {
+    fn new(inner: Arc<AnytlsSession>) -> Self {
         Self {
             inner,
             read_fut: None,

@@ -7,24 +7,23 @@
 //! 4. Hand the carrier to `anytls::proxy::session::new_server_session` and
 //!    drive its `run()` loop. The library handles cmdSettings,
 //!    cmdServerSettings, cmdSYN/cmdSYNACK, cmdPSH/cmdFIN, cmdWaste etc.
-//! 5. For each opened anytls stream: read a SOCKS5-style `Address` (the
+//! 5. For each opened anytls session: read a SOCKS5-style `Address` (the
 //!    proxy target). If it is the AnyTLS UoT sentinel, follow with a
 //!    `UotRequest` and run a UDP-over-TCP relay. Otherwise dial the
 //!    address and bidirectionally relay between the upstream socket and
-//!    the anytls stream.
+//!    the anytls session.
 //!
-//! Note: anytls's protocol mandates that clients implement session reuse
-//! and that the server be tolerant of any number of streams per session.
-//! We do nothing special on the server side for that — if a client opens
-//! many streams over one session, this server still serves them all.
+//! Note: this fork treats one anytls session as a loop of logical flows.
+//! Each flow reads one destination address, relays until completion, then
+//! returns to the loop to accept the next address on the same session.
 
 use anytls_real::async_bridge;
 
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use anyhow::{Context, Result, bail};
-use anytls::core::PaddingFactory;
-use anytls::proxy::session::{Session, Stream as AnytlsStream, new_server_session};
+use anytls::core::{Command, Frame, PaddingFactory};
+use anytls::proxy::session::{DEFAULT_SID, Session as AnytlsSession, new_server_session};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{
     UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream,
@@ -303,10 +302,10 @@ async fn handle_connection(
     // 4) Hand the carrier to anytls and run the session loop.
     let session = new_server_session(
         Box::new(bridge),
-        Box::new(|stream: Arc<AnytlsStream>| {
+        Box::new(|session: Arc<AnytlsSession>| {
             tokio::spawn(async move {
-                if let Err(error) = handle_stream(stream).await {
-                    log::debug!("stream error: {error:#}");
+                if let Err(error) = handle_session(session).await {
+                    log::debug!("session error: {error:#}");
                 }
             });
         }),
@@ -314,52 +313,66 @@ async fn handle_connection(
     )
     .await;
 
-    let session: Session = session;
     if let Err(error) = session.run().await {
         log::debug!("anytls session ended: {error}");
     }
     Ok(())
 }
 
-async fn handle_stream(stream: Arc<AnytlsStream>) -> Result<()> {
-    let mut reader = AnytlsStreamReader::new(stream.clone());
-    let destination = Address::retrieve_from_async_stream(&mut reader).await?;
+async fn handle_session(session: Arc<AnytlsSession>) -> Result<()> {
+    let mut reader = AnytlsStreamReader::new(session.clone());
+    loop {
+        if session.is_terminated().await {
+            return Ok(());
+        }
 
-    if uot_is_sentinel_destination(&destination) {
-        let request = uot_get_request_from_stream(&mut reader).await?;
-        return match request.mode {
-            UotMode::Connected => handle_uot_connected(stream, &mut reader, &request).await,
-            UotMode::Datagram => handle_uot_datagram(stream, &mut reader).await,
+        let destination = match Address::retrieve_from_async_stream(&mut reader).await {
+            Ok(destination) => destination,
+            Err(error) if session.is_terminated().await || is_error_of_session_broken(&error) => {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
         };
-    }
 
-    handle_tcp_stream(stream, destination).await
+        if uot_is_sentinel_destination(&destination) {
+            let request = uot_get_request_from_stream(&mut reader).await?;
+            match request.mode {
+                UotMode::Connected => {
+                    handle_uot_connected(session.clone(), &mut reader, &request).await?
+                }
+                UotMode::Datagram => handle_uot_datagram(session.clone(), &mut reader).await?,
+            }
+        } else {
+            handle_tcp_stream(session.clone(), destination).await?;
+        }
+    }
 }
 
-async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> Result<()> {
+async fn handle_tcp_stream(session: Arc<AnytlsSession>, destination: Address) -> Result<()> {
     let dst = destination.to_string();
     let mut outbound = match TokioTcpStream::connect(&dst).await {
         Ok(s) => s,
         Err(err) => {
             log::debug!("connect upstream {dst} failed: {err}");
-            stream
+            session
                 .handshake_failure(&err.to_string())
                 .await?;
-            stream.close().await?;
+            session.terminate().await?;
             return Err(err.into());
         }
     };
     outbound.set_nodelay(true).ok();
-    stream.handshake_success().await?;
+    session.handshake_success().await?;
 
-    let (stream_read, stream_write) = stream.split_ref();
+    let session_read = session.clone();
+    let session_write = session.clone();
     let (mut up_read, mut up_write) = outbound.split();
 
     let s2u = async {
         use tokio::io::AsyncWriteExt;
         let mut buf = vec![0u8; 16 * 1024];
         loop {
-            match stream_read.read(&mut buf).await {
+            match session_read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
                     if up_write
@@ -382,9 +395,17 @@ async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> R
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             match up_read.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    let _ = session_write
+                        .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
+                        .await;
+                    let _ = session_write
+                        .mark_local_stream_closed(DEFAULT_SID)
+                        .await;
+                    break;
+                }
                 Ok(n) => {
-                    if stream_write
+                    if session_write
                         .write(&buf[..n])
                         .await
                         .is_err()
@@ -395,7 +416,6 @@ async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> R
                 Err(_) => break,
             }
         }
-        let _ = stream_write.close().await;
         Ok::<(), std::io::Error>(())
     };
 
@@ -404,11 +424,11 @@ async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> R
 }
 
 async fn handle_uot_datagram(
-    stream: Arc<AnytlsStream>,
+    session: Arc<AnytlsSession>,
     reader: &mut AnytlsStreamReader,
 ) -> Result<()> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
-    stream.handshake_success().await?;
+    session.handshake_success().await?;
     let mut buf = vec![0u8; 65_535];
 
     let result: Result<()> = async {
@@ -427,32 +447,34 @@ async fn handle_uot_datagram(
                         Some(&Address::from(source)),
                         &buf[..n],
                     )?;
-                    stream.write(&frame).await?;
+                    session.write(&frame).await?;
                 }
             }
         }
     }
     .await;
 
-    let _ = stream.close().await;
+    if result.is_err() {
+        let _ = session.terminate().await;
+    }
     result
 }
 
 async fn handle_uot_connected(
-    stream: Arc<AnytlsStream>,
+    session: Arc<AnytlsSession>,
     reader: &mut AnytlsStreamReader,
     request: &UotRequest,
 ) -> Result<()> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     let dst = request.destination.to_string();
     if let Err(err) = udp.connect(&dst).await {
-        stream
+        session
             .handshake_failure(&err.to_string())
             .await?;
-        stream.close().await?;
+        session.terminate().await?;
         return Err(err.into());
     }
-    stream.handshake_success().await?;
+    session.handshake_success().await?;
     let mut buf = vec![0u8; 65_535];
 
     let result: Result<()> = async {
@@ -465,14 +487,16 @@ async fn handle_uot_connected(
                 res = udp.recv(&mut buf) => {
                     let n = res?;
                     let frame = uot_encode_packet(UotMode::Connected, None, &buf[..n])?;
-                    stream.write(&frame).await?;
+                    session.write(&frame).await?;
                 }
             }
         }
     }
     .await;
 
-    let _ = stream.close().await;
+    if result.is_err() {
+        let _ = session.terminate().await;
+    }
     result
 }
 
@@ -596,27 +620,27 @@ fn is_reality_client_hello(
         .context("set socket blocking for ClientHello peek")?;
 
     let mut buf = vec![0u8; 2048];
-    let mut available = 0;
 
     loop {
-        let n = stream
-            .peek(&mut buf[available..])
+        let available = stream
+            .peek(&mut buf)
             .context("peek ClientHello")?;
-        if n == 0 {
+        if available == 0 {
             return Ok(false);
         }
-        available += n;
 
         if available < 5 {
+            thread::sleep(Duration::from_millis(1));
             continue;
         }
 
         let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
         let needed = 5 + record_len;
+        if needed > buf.len() {
+            buf.resize(needed, 0);
+        }
         if available < needed {
-            if needed > buf.len() {
-                buf.resize(needed, 0);
-            }
+            thread::sleep(Duration::from_millis(1));
             continue;
         }
 
@@ -1080,10 +1104,15 @@ fn parse_hex_nibble(value: u8) -> u8 {
     }
 }
 
-// === AsyncRead adapter for AnytlsStream ===
+fn is_error_of_session_broken(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, UnexpectedEof};
+    matches!(error.kind(), UnexpectedEof | BrokenPipe)
+}
+
+// === AsyncRead adapter for AnytlsSession ===
 
 struct AnytlsStreamReader {
-    inner: Arc<AnytlsStream>,
+    inner: Arc<AnytlsSession>,
     #[allow(clippy::type_complexity)]
     read_fut: Option<
         core::pin::Pin<
@@ -1093,7 +1122,7 @@ struct AnytlsStreamReader {
 }
 
 impl AnytlsStreamReader {
-    fn new(inner: Arc<AnytlsStream>) -> Self {
+    fn new(inner: Arc<AnytlsSession>) -> Self {
         Self {
             inner,
             read_fut: None,

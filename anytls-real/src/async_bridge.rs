@@ -34,7 +34,7 @@ where
     let handle = Handle::current();
     std::thread::spawn(move || {
         if let Err(error) = pump(handle, tls, remote) {
-            log::debug!("REALITY async bridge pump exited: {error:#}");
+            log::trace!("REALITY async bridge pump exited: {error:#}");
         }
     });
     Ok(local)
@@ -73,7 +73,7 @@ where
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => {
-                    log::debug!("bridge: tls read error: {error}");
+                    log::trace!("bridge: tls read error: {error}");
                     tls_eof = true;
                 }
             }
@@ -88,7 +88,7 @@ where
                     progressed = true;
                 }
                 Err(error) => {
-                    log::debug!("bridge: duplex write error: {error}");
+                    log::trace!("bridge: duplex write error: {error}");
                     app_eof = true;
                 }
             }
@@ -103,7 +103,6 @@ where
             match res {
                 Ok(Ok(0)) => {
                     app_eof = true;
-                    tls.conn.send_close_notify();
                     progressed = true;
                 }
                 Ok(Ok(n)) => {
@@ -111,7 +110,7 @@ where
                     progressed = true;
                 }
                 Ok(Err(error)) => {
-                    log::debug!("bridge: duplex read error: {error}");
+                    log::trace!("bridge: duplex read error: {error}");
                     app_eof = true;
                 }
                 Err(_) => {
@@ -129,14 +128,14 @@ where
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => {
-                    log::debug!("bridge: tls write error: {error}");
+                    log::trace!("bridge: tls write error: {error}");
                     tls_eof = true;
                 }
             }
             let _ = tls.flush();
         }
 
-        if (tls_eof || app_eof) && tls_to_app.is_empty() && app_to_tls.is_empty() {
+        if tls_eof && tls_to_app.is_empty() && app_to_tls.is_empty() {
             break;
         }
 
@@ -145,7 +144,9 @@ where
         }
     }
 
-    tls.conn.send_close_notify();
-    let _ = tls.flush();
+    if !tls_eof {
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+    }
     Ok(())
 }
