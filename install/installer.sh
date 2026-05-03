@@ -350,7 +350,7 @@ install_anyreality_all() {
   echo -e "${Green}\n==== Client config ($CLIENT_OUT) ====\n${Font}"
   cat "$CLIENT_OUT" || true
 
-  echo -e "${Green}Install complete. Server config: $SERVER_CONFIG; client config and CA printed above.${Font}"
+  echo -e "${Green}\nInstall complete. Server config: $SERVER_CONFIG; client config and CA printed above.\n${Font}"
 }
 
 uninstall_all() {

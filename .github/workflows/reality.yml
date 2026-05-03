@@ -5,7 +5,12 @@ permissions:
 
 on:
   push:
+    branches:
+      - '**'
+    tags-ignore: ['*']
   pull_request:
+    branches:
+      - '**'
   workflow_dispatch:
 
 concurrency:
