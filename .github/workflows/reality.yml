@@ -45,25 +45,13 @@ jobs:
         if: runner.os == 'Windows'
         uses: seanmiddleditch/gha-setup-ninja@v6
 
-      - name: Run REALITY smoke test (Linux/macOS)
-        if: runner.os == 'Linux' || runner.os == 'macOS'
+      - name: Run REALITY smoke test
         shell: bash
-        run: bash ./admin/reality-smoke.sh --build-with-cargo
+        run: python3 ./admin/reality_smoke.py --build-with-cargo
 
-      - name: Run REALITY smoke test (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./admin/reality-smoke.ps1 -BuildWithCargo
-
-      - name: Run REALITY UDP smoke test (Linux/macOS)
-        if: runner.os == 'Linux' || runner.os == 'macOS'
+      - name: Run REALITY UDP smoke test
         shell: bash
-        run: bash ./admin/reality-smoke-udp.sh
-
-      - name: Run REALITY UDP smoke test (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./admin/reality-smoke-udp.ps1
+        run: python3 ./admin/reality_smoke_udp.py
 
       - name: Upload REALITY smoke logs on failure
         if: failure()
