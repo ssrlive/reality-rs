@@ -293,7 +293,7 @@ function Assert-FileExists {
     )
 
     if (-not (Test-Path $FilePath -PathType Leaf)) {
-        throw "$Label binary not found at '$FilePath'. Build it first with './admin/reality-smoke.ps1 -BuildWithCargo' or 'cargo build -p anytls-real'."
+        throw "$Label binary not found at '$FilePath'. Build it first with './admin/reality-smoke.ps1 -BuildWithCargo' or 'cargo build -p anyreality'."
     }
 }
 
@@ -304,8 +304,8 @@ $server_config_path = Join-Path $repoRoot 'target/tmp/reality-server.smoke.toml'
 $client_config_path = Join-Path $repoRoot 'target/tmp/reality-client.smoke.toml'
 
 $exeSuffix = if ($IsWindows) { '.exe' } else { '' }
-$serverBinary = Join-Path $repoRoot ("target/debug/anytls-real-server$exeSuffix")
-$clientBinary = Join-Path $repoRoot ("target/debug/anytls-real-client$exeSuffix")
+$serverBinary = Join-Path $repoRoot ("target/debug/anyreality-server$exeSuffix")
+$clientBinary = Join-Path $repoRoot ("target/debug/anyreality-client$exeSuffix")
 
 $ServerListen = Resolve-Endpoint -PreferredEndpoint $ServerListen -Label 'Server'
 $ClientListen = Resolve-Endpoint -PreferredEndpoint $ClientListen -Label 'Client'
@@ -354,7 +354,7 @@ insecure = true
 try {
     if ($BuildWithCargo) {
         Write-Host 'Building formal server and client binaries with Cargo'
-        $build = Start-CargoProcess -Arguments @('build', '-p', 'anytls-real') -LogName 'reality-build'
+        $build = Start-CargoProcess -Arguments @('build', '-p', 'anyreality') -LogName 'reality-build'
         $build.Process.WaitForExit()
         if ($build.Process.ExitCode -ne 0) {
             Show-Logs -Entries @($build)

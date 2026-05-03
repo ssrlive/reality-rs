@@ -1,14 +1,14 @@
-# anytls-real
+# anyreality
 
 This crate provides two binaries that together form a REALITY-wrapped
 [AnyTLS](https://github.com/ssrlive/anytls-rs) proxy pair.
 
 ---
 
-## `anytls-real-client`
+## `anyreality-client`
 
 Exposes a local SOCKS5 listener and forwards traffic over a REALITY/TLS
-tunnel to `anytls-real-server` using the full AnyTLS session-multiplexing
+tunnel to `anyreality-server` using the full AnyTLS session-multiplexing
 protocol. Supports both `CONNECT` (TCP) and `UDP ASSOCIATE` (AnyTLS
 UDP-over-TCP mode).
 
@@ -18,7 +18,7 @@ Use the sample config in [config/reality-client.toml](config/reality-client.toml
 together with the local test server (run from the repo root):
 
 ```powershell
-cargo run -p anytls-real --bin anytls-real-client -- --config ./anytls-real/config/reality-client.toml
+cargo run -p anyreality --bin anyreality-client -- --config ./anyreality/config/reality-client.toml
 ```
 
 Both JSON and TOML config files are supported. An equivalent TOML sample is
@@ -55,9 +55,9 @@ knobs:
 
 ---
 
-## `anytls-real-server`
+## `anyreality-server`
 
-Accepts REALITY/TLS connections from `anytls-real-client`, verifies the
+Accepts REALITY/TLS connections from `anyreality-client`, verifies the
 shared-password AnyTLS auth header, then multiplexes streams using the
 AnyTLS session protocol. Each stream carries a target `Address` in SOCKS5
 wire format; the server opens a TCP (or UDP-over-TCP) connection to that
@@ -71,7 +71,7 @@ Use the sample config in [config/reality-server.toml](config/reality-server.toml
 with the local test certificate (run from the repo root):
 
 ```powershell
-cargo run -p anytls-real --bin anytls-real-server -- --config ./anytls-real/config/reality-server.toml
+cargo run -p anyreality --bin anyreality-server -- --config ./anyreality/config/reality-server.toml
 ```
 
 Both TOML and JSON config files are supported. An equivalent JSON sample is

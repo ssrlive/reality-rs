@@ -17,7 +17,7 @@
 //! - SOCKS5 supports `CONNECT` (TCP) and `UDP ASSOCIATE` (anytls UoT
 //!   Datagram mode, see `anytls::uot`).
 
-use anytls_real::async_bridge;
+use anyreality::async_bridge;
 
 use anyhow::{Context, Result, anyhow, bail};
 use anytls::AsyncReadWrite;

@@ -1,11 +1,11 @@
-## About AnyTLS-Real
+## About anyreality
 
 This repository contains a fork of `rustls` for a REALITY-wrapped AnyTLS proxy implementation.
-Key user-facing binaries live in `anytls-real/`:
+Key user-facing binaries live in `anyreality/`:
 
-- `anytls-real-client`: a SOCKS5 client that tunnels traffic over REALITY+TLS
+- `anyreality-client`: a SOCKS5 client that tunnels traffic over REALITY+TLS
   and the AnyTLS session protocol.
-- `anytls-real-server`: the corresponding server that accepts REALITY+TLS
+- `anyreality-server`: the corresponding server that accepts REALITY+TLS
   connections and forwards streams to upstream targets.
 
 If you only want to run the proxy pair quickly on a Linux system, the
@@ -29,17 +29,17 @@ hostname for certificate generation. `[port]` defaults to `443`.
 - Build and run from source (developer flow):
 
 ```sh
-# build and install the anytls-real binaries into your cargo bin
-cargo install --path ./anytls-real
+# build and install the anyreality binaries into your cargo bin
+cargo install --path ./anyreality
 
 # run the server with a config file
-cargo run -p anytls-real --bin anytls-real-server -- --config anytls-real/config/reality-server.toml
+cargo run -p anyreality --bin anyreality-server -- --config anyreality/config/reality-server.toml
 
 # run the client
-cargo run -p anytls-real --bin anytls-real-client -- --config anytls-real/config/reality-client.toml
+cargo run -p anyreality --bin anyreality-client -- --config anyreality/config/reality-client.toml
 ```
 
-See `anytls-real/README.md` for additional runtime and smoke-test instructions.
+See `anyreality/README.md` for additional runtime and smoke-test instructions.
 
 ---
 

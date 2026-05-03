@@ -17,7 +17,7 @@
 //! Each flow reads one destination address, relays until completion, then
 //! returns to the loop to accept the next address on the same session.
 
-use anytls_real::async_bridge;
+use anyreality::async_bridge;
 
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};

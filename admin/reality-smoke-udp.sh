@@ -2,13 +2,13 @@
 
 set -uo pipefail
 
-# UDP ASSOCIATE end-to-end smoke test for anytls-real.
+# UDP ASSOCIATE end-to-end smoke test for anyreality.
 #
 # Topology:
 #   Python UDP client
-#     -> SOCKS5 UDP relay (anytls-real-client on $client_listen)
+#     -> SOCKS5 UDP relay (anyreality-client on $client_listen)
 #     -> REALITY tunnel
-#     -> anytls-real-server (on $server_listen)
+#     -> anyreality-server (on $server_listen)
 #     -> UDP echo server (on $udp_echo_listen)
 #     -> back the same way
 #
@@ -49,7 +49,7 @@ Options:
   --client-listen HOST:PORT   Client listen endpoint (default: 127.0.0.1:1081)
   --udp-echo-listen HOST:PORT UDP echo server endpoint (default: 127.0.0.1:19090)
   --keep-running              Keep background processes alive after a successful smoke test
-  --build-with-cargo          Build anytls-real with Cargo before running
+  --build-with-cargo          Build anyreality with Cargo before running
   -h, --help                  Show this help text
 EOF
 }
@@ -201,7 +201,7 @@ run_cargo_build() {
     prepare_log_paths 'reality-build'
     if ! (
         cd -- "$repo_root"
-        cargo build -p anytls-real
+        cargo build -p anyreality
     ) >"$LOG_PATH" 2>"$ERROR_PATH"; then
         show_log_pair "$LOG_PATH" "$ERROR_PATH"
         die "Cargo build failed. See logs above."
@@ -248,8 +248,8 @@ done
 
 assert_command python3
 
-server_binary="$repo_root/target/debug/anytls-real-server"
-client_binary="$repo_root/target/debug/anytls-real-client"
+server_binary="$repo_root/target/debug/anyreality-server"
+client_binary="$repo_root/target/debug/anyreality-client"
 smoke_password='reality-smoke-password'
 server_config_path="$repo_root/target/tmp/reality-server.smoke.toml"
 client_config_path="$repo_root/target/tmp/reality-client.smoke.toml"
@@ -267,12 +267,12 @@ echo_port="$SPLIT_PORT"
 
 if (( build_with_cargo == 1 )); then
     assert_command cargo
-    echo 'Building anytls-real binaries with Cargo'
+    echo 'Building anyreality binaries with Cargo'
     run_cargo_build
 fi
 
-[[ -f "$server_binary" ]] || die "Server binary not found at '$server_binary'. Build first with '--build-with-cargo' or 'cargo build -p anytls-real'."
-[[ -f "$client_binary" ]] || die "Client binary not found at '$client_binary'. Build first with '--build-with-cargo' or 'cargo build -p anytls-real'."
+[[ -f "$server_binary" ]] || die "Server binary not found at '$server_binary'. Build first with '--build-with-cargo' or 'cargo build -p anyreality'."
+[[ -f "$client_binary" ]] || die "Client binary not found at '$client_binary'. Build first with '--build-with-cargo' or 'cargo build -p anyreality'."
 
 cat > "$server_config_path" <<EOF
 [reality]
@@ -341,20 +341,20 @@ entry_logs+=("$LOG_PATH")
 entry_errors+=("$ERROR_PATH")
 sleep 0.25
 
-echo "Starting anytls-real-server on $server_listen"
+echo "Starting anyreality-server on $server_listen"
 start_binary_process "$server_binary" 'reality-server' \
     --config "$server_config_path"
 server_pid="$START_PID"
 sleep 0.5
-assert_process_running "$server_pid" 'anytls-real-server' "$START_LOG_PATH" "$START_ERROR_PATH"
+assert_process_running "$server_pid" 'anyreality-server' "$START_LOG_PATH" "$START_ERROR_PATH"
 wait_tcp_endpoint "$server_listen"
 
-echo "Starting anytls-real-client on $client_listen"
+echo "Starting anyreality-client on $client_listen"
 start_binary_process "$client_binary" 'reality-client' \
     --config "$client_config_path"
 client_pid="$START_PID"
 sleep 0.5
-assert_process_running "$client_pid" 'anytls-real-client' "$START_LOG_PATH" "$START_ERROR_PATH"
+assert_process_running "$client_pid" 'anyreality-client' "$START_LOG_PATH" "$START_ERROR_PATH"
 wait_tcp_endpoint "$client_listen"
 
 # Run the SOCKS5 UDP ASSOCIATE handshake and echo round-trip via Python

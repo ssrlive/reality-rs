@@ -6,13 +6,13 @@ param(
     [switch]$BuildWithCargo
 )
 
-# UDP ASSOCIATE end-to-end smoke test for anytls-real.
+# UDP ASSOCIATE end-to-end smoke test for anyreality.
 #
 # Topology:
 #   PowerShell UDP client
-#     -> SOCKS5 UDP relay (anytls-real-client on $ClientListen)
+#     -> SOCKS5 UDP relay (anyreality-client on $ClientListen)
 #     -> REALITY tunnel
-#     -> anytls-real-server (on $ServerListen)
+#     -> anyreality-server (on $ServerListen)
 #     -> UDP echo server (on $UdpEchoListen)
 #     -> back the same way
 #
@@ -214,8 +214,8 @@ function Parse-Socks5UdpPacket {
 # ---------------------------------------------------------------------------
 
 $exeSuffix = if ($IsWindows) { '.exe' } else { '' }
-$serverBinary = Join-Path $repoRoot "target\debug\anytls-real-server$exeSuffix"
-$clientBinary = Join-Path $repoRoot "target\debug\anytls-real-client$exeSuffix"
+$serverBinary = Join-Path $repoRoot "target\debug\anyreality-server$exeSuffix"
+$clientBinary = Join-Path $repoRoot "target\debug\anyreality-client$exeSuffix"
 $smokePassword = 'reality-smoke-password'
 
 $ServerListen = Resolve-Endpoint $ServerListen  'Server'
@@ -276,10 +276,10 @@ $udpClient = $null
 
 try {
     if ($BuildWithCargo) {
-        Write-Host 'Building anytls-real binaries with Cargo'
+        Write-Host 'Building anyreality binaries with Cargo'
         $paths = New-LogPaths 'reality-build'
         $build = Start-Process cargo `
-            -ArgumentList @('build', '-p', 'anytls-real') `
+            -ArgumentList @('build', '-p', 'anyreality') `
             -WorkingDirectory $repoRoot `
             -RedirectStandardOutput $paths.LogPath `
             -RedirectStandardError  $paths.ErrorPath `
@@ -292,10 +292,10 @@ try {
     }
 
     if (-not (Test-Path $serverBinary -PathType Leaf)) {
-        throw "Server binary not found at '$serverBinary'. Build first with '-BuildWithCargo' or 'cargo build -p anytls-real'."
+        throw "Server binary not found at '$serverBinary'. Build first with '-BuildWithCargo' or 'cargo build -p anyreality'."
     }
     if (-not (Test-Path $clientBinary -PathType Leaf)) {
-        throw "Client binary not found at '$clientBinary'. Build first with '-BuildWithCargo' or 'cargo build -p anytls-real'."
+        throw "Client binary not found at '$clientBinary'. Build first with '-BuildWithCargo' or 'cargo build -p anyreality'."
     }
 
     # Start UDP echo server
@@ -324,18 +324,18 @@ try {
     $echoEntry = [pscustomobject]@{ Process = $echoProc; LogPath = $echoPaths.LogPath; ErrorPath = $echoPaths.ErrorPath }
     Start-Sleep -Milliseconds 250
 
-    # Start anytls-real-server
-    Write-Host "Starting anytls-real-server on $ServerListen"
+    # Start anyreality-server
+    Write-Host "Starting anyreality-server on $ServerListen"
     $serverEntry = Start-BinaryProcess $serverBinary @('--config', $server_config_path) 'reality-server'
     Start-Sleep -Milliseconds 500
-    Assert-ProcessRunning $serverEntry 'anytls-real-server'
+    Assert-ProcessRunning $serverEntry 'anyreality-server'
     Wait-TcpEndpoint $ServerListen
 
-    # Start anytls-real-client
-    Write-Host "Starting anytls-real-client on $ClientListen"
+    # Start anyreality-client
+    Write-Host "Starting anyreality-client on $ClientListen"
     $clientEntry = Start-BinaryProcess $clientBinary @('--config', $client_config_path) 'reality-client'
     Start-Sleep -Milliseconds 500
-    Assert-ProcessRunning $clientEntry 'anytls-real-client'
+    Assert-ProcessRunning $clientEntry 'anyreality-client'
     Wait-TcpEndpoint $ClientListen
 
     # SOCKS5 handshake: open control TCP connection for UDP ASSOCIATE

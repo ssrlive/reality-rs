@@ -16,18 +16,18 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-anytls_real_bin_url="https://github.com/ssrlive/reality-rs/releases/latest/download/anytls-real-x86_64-unknown-linux-musl.zip"
+anyreality_bin_url="https://github.com/ssrlive/reality-rs/releases/latest/download/anyreality-x86_64-unknown-linux-musl.zip"
 
 # some foreign sites likely accessible from China (common CDNs, developer sites)
 STOCK_SITES=(cdn.jsdelivr.net jsdelivr.com stackoverflow.com developer.mozilla.org python.org pypi.org crates.io golang.org nodejs.org npmjs.com cloudflare.com nginx.org rust-lang.org debian.org ubuntu.com)
 
 BIN_DIR=${BIN_DIR:-/usr/local/bin}
-BIN_FILE="anytls-real-server"
-INSTALL_DIR=${INSTALL_DIR:-/etc/anytls-real}
+BIN_FILE="anyreality-server"
+INSTALL_DIR=${INSTALL_DIR:-/etc/anyreality}
 SERVER_CONFIG="${INSTALL_DIR}/config.toml"
 TARGET_SITE=""
 LISTEN_PORT=""
-SERVICE_UNIT_NAME="anytls-real.service"
+SERVICE_UNIT_NAME="anyreality.service"
 
 select_random_site() {
   # choose a random site and generate certificate
@@ -59,8 +59,8 @@ install_server_binary() {
   cleanup() { rm -rf "$TMPDIR"; }
   trap cleanup EXIT
 
-  echo -e "${Green}Downloading anytls-real from: $anytls_real_bin_url${Font}"
-  curl -L "$anytls_real_bin_url" -o "$TMPDIR/anytls.zip"
+  echo -e "${Green}Downloading anyreality from: $anyreality_bin_url${Font}"
+  curl -L "$anyreality_bin_url" -o "$TMPDIR/anytls.zip"
 
   echo -e "${Green}Extracting...${Font}"
   unzip -o "$TMPDIR/anytls.zip" -d "$TMPDIR" >/dev/null
@@ -266,7 +266,7 @@ install_systemd_service() {
   local service_path="/etc/systemd/system/$SERVICE_UNIT_NAME"
   cat > "$service_path" <<EOF
 [Unit]
-Description=anytls-real server
+Description=anyreality server
 After=network.target
 
 [Service]
@@ -294,7 +294,7 @@ EOF
   fi
 }
 
-install_anytls_real_all() {
+install_anyreality_all() {
   # Begin main flow
   install_prereqs
   install_server_binary || { echo -e "${Red}Binary installation failed${Font}" >&2; exit 1; }
@@ -372,7 +372,7 @@ uninstall_all() {
 }
 
 do_uninstall_service_action() {
-  echo -e "${Yellow}Uninstalling anytls-real...${Font}"
+  echo -e "${Yellow}Uninstalling anyreality...${Font}"
 
   # Stop and disable service if systemd is present
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
@@ -411,7 +411,7 @@ case "${1:-}" in
   install)
     TARGET_SITE="${2:-}"
     LISTEN_PORT="${3:-}"
-    install_anytls_real_all
+    install_anyreality_all
     exit 0
     ;;
   uninstall)

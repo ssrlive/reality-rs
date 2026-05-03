@@ -213,7 +213,7 @@ run_cargo_build() {
 
     if ! (
         cd -- "$repo_root"
-        cargo build -p anytls-real
+        cargo build -p anyreality
     ) >"$LOG_PATH" 2>"$ERROR_PATH"
     then
         show_log_pair "$LOG_PATH" "$ERROR_PATH"
@@ -288,7 +288,7 @@ assert_file_exists() {
     local label="$2"
 
     if [[ ! -f "$file_path" ]]; then
-        die "$label binary not found at '$file_path'. Build it first with './admin/reality-smoke.sh --build-with-cargo' or 'cargo build -p anytls-real'."
+        die "$label binary not found at '$file_path'. Build it first with './admin/reality-smoke.sh --build-with-cargo' or 'cargo build -p anyreality'."
     fi
 }
 
@@ -368,8 +368,8 @@ done
 assert_command python3
 assert_command curl
 
-server_binary="$repo_root/target/debug/anytls-real-server"
-client_binary="$repo_root/target/debug/anytls-real-client"
+server_binary="$repo_root/target/debug/anyreality-server"
+client_binary="$repo_root/target/debug/anyreality-client"
 
 server_listen="$(resolve_endpoint "$server_listen" 'Server')"
 client_listen="$(resolve_endpoint "$client_listen" 'Client')"

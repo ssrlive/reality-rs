@@ -1,11 +1,11 @@
 [Unit]
-Description=anytls-real (REALITY + anytls) server
+Description=anyreality (REALITY + anytls) server
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/etc/anytls-real
-ExecStart=/usr/local/bin/anytls-real-server --config /etc/anytls-real/config.toml
+WorkingDirectory=/etc/anyreality
+ExecStart=/usr/local/bin/anyreality-server --config /etc/anyreality/config.toml
 Restart=on-failure
 RestartSec=5
 AmbientCapabilities=CAP_NET_BIND_SERVICE

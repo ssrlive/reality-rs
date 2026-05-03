@@ -1,7 +1,7 @@
 [workspace]
 members = [
   # AnyTLS client & server implementations using REALITY protocol
-  "anytls-real",
+  "anyreality",
   # Bogo test shim
   "bogo",
   # CI benchmarks
@@ -45,7 +45,7 @@ default-members = [
   "rustls-aws-lc-rs",
   "rustls-ring",
   "rustls-test",
-  "anytls-real",
+  "anyreality",
 ]
 resolver = "2"
 
@@ -60,7 +60,7 @@ brotli = { version = "8", default-features = false, features = ["std"] }
 brotli-decompressor = "5.0.0"
 byteorder = "1.4.3"
 clap = { version = "4.3.21", features = ["derive", "env"] }
-crabgrind = "0.2"
+crabgrind = "0.2.5"
 criterion = "0.8"
 env_logger = "0.11"
 graviola = "0.3"

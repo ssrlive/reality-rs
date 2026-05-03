@@ -83,13 +83,13 @@ jobs:
       run: |
         mkdir -p dist
         if [ "${{ matrix.os }}" = "windows-latest" ]; then
-          cp target/${{ matrix.target }}/release/anytls-real-client.exe dist/anytls-real-client.exe
-          cp target/${{ matrix.target }}/release/anytls-real-server.exe dist/anytls-real-server.exe
-          cd dist && 7z a -tzip ../anytls-real-${{ matrix.target }}.zip *
+          cp target/${{ matrix.target }}/release/anyreality-client.exe dist/anyreality-client.exe
+          cp target/${{ matrix.target }}/release/anyreality-server.exe dist/anyreality-server.exe
+          cd dist && 7z a -tzip ../anyreality-${{ matrix.target }}.zip *
         else
-          cp target/${{ matrix.target }}/release/anytls-real-client dist/
-          cp target/${{ matrix.target }}/release/anytls-real-server dist/
-          cd dist && zip -r ../anytls-real-${{ matrix.target }}.zip *
+          cp target/${{ matrix.target }}/release/anyreality-client dist/
+          cp target/${{ matrix.target }}/release/anyreality-server dist/
+          cd dist && zip -r ../anyreality-${{ matrix.target }}.zip *
         fi
       shell: bash
 
@@ -97,7 +97,7 @@ jobs:
       if: ${{ !cancelled() }}
       uses: actions/upload-artifact@v4
       with:
-        name: anytls-real-${{ matrix.target }}
+        name: anyreality-${{ matrix.target }}
         path: |
           *.zip
           *.tar.gz
