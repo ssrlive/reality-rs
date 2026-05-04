@@ -238,7 +238,7 @@ Examples:
             'shortId = "aabbcc"\n'
             'privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"\n'
             'version = "010203"\n'
-            'serverNames = ["baidu.com", "www.baidu.com"]\n\n'
+            'serverNames = ["test", "example.com", "baidu.com", "www.baidu.com"]\n\n'
             '[anytls]\n'
             'password = "reality-smoke-password"\n\n'
             '[server]\n'
@@ -252,7 +252,7 @@ Examples:
             '[reality]\n'
             'shortId = "aabbcc"\n'
             'publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"\n'
-            'serverName = "baidu.com"\n'
+            'serverName = "test"\n'
             'version = "010203"\n\n'
             '[anytls]\n'
             'password = "reality-smoke-password"\n'
@@ -263,7 +263,7 @@ Examples:
             f'listen = "{client_listen}"\n'
             f'serverAddr = "{server_listen}"\n'
             "caFile = './bogo/keys/cert.pem'\n"
-            'insecure = true\n'
+            'insecure = false\n'
         )
 
     entries = []

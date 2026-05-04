@@ -14,7 +14,7 @@ path = "bin/server.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-anytls = { version = "0.3.1", default-features = false, features = [
+anytls = { version = "0.3.2", default-features = false, features = [
     "core",
     "uot",
     "runtime",

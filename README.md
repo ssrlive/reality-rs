@@ -13,6 +13,8 @@ convenience installer is provided at `install/installer.sh` (it generates a
 local CA, server cert, REALITY keys, writes configs and attempts to enable a
 systemd service).
 
+[中文版安装指南](install.md)
+
 ### Quick install
 
 Options:
