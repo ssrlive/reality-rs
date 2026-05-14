@@ -52,7 +52,9 @@ use socks5_impl::server::connection::{
 use socks5_impl::server::{AssociatedUdpSocket, Server, UdpAssociate};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader,
+};
 use tokio::net::{TcpStream, UdpSocket};
 
 const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
@@ -114,6 +116,8 @@ struct ClientRuntimeConfigFile {
     #[serde(default)]
     server_addr: Option<String>,
     #[serde(default)]
+    probe_proxy: Option<SocketAddr>,
+    #[serde(default)]
     ca_file: Option<PathBuf>,
     #[serde(default)]
     insecure: Option<bool>,
@@ -123,6 +127,7 @@ struct ClientRuntimeConfigFile {
 struct RealityClientConfigResolved {
     listen: String,
     server_addr: String,
+    probe_proxy: Option<SocketAddr>,
     ca_file: Option<PathBuf>,
     insecure: bool,
     password: String,
@@ -184,6 +189,7 @@ impl ServerVerifier for NoCertificateVerification {
 #[derive(Clone)]
 struct DialCtx {
     server_addr: String,
+    probe_proxy: Option<SocketAddr>,
     tls_config: Arc<ClientConfig>,
     server_name: String,
     password_sha256: [u8; 32],
@@ -204,6 +210,7 @@ async fn main() -> Result<()> {
 
     let dial_ctx = Arc::new(DialCtx {
         server_addr: server_addr.clone(),
+        probe_proxy: resolved.probe_proxy,
         tls_config,
         server_name: server_name.clone(),
         password_sha256: Sha256::digest(resolved.password.as_bytes()).into(),
@@ -252,8 +259,13 @@ async fn main() -> Result<()> {
 /// `Box<dyn AsyncReadWrite>` ready to be wrapped in a brand-new anytls
 /// session. Called by `Client` whenever the idle-session pool is empty.
 async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWrite>> {
-    // 1) Plain TCP connect.
-    let tokio_tcp = TcpStream::connect(&ctx.server_addr).await?;
+    // 1) Plain TCP connect, optionally via an HTTP CONNECT probe proxy.
+    let tokio_tcp = if let Some(proxy_addr) = ctx.probe_proxy {
+        log::info!("Connecting to REALITY server via probe proxy at {proxy_addr}");
+        connect_via_probe_proxy(proxy_addr, &ctx.server_addr).await?
+    } else {
+        TcpStream::connect(&ctx.server_addr).await?
+    };
     tokio_tcp.set_nodelay(true).ok();
     let std_tcp = tokio_tcp.into_std()?;
 
@@ -303,6 +315,45 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
     bridge.write_all(&auth).await?;
 
     Ok(Box::new(bridge) as Box<dyn AsyncReadWrite>)
+}
+
+async fn connect_via_probe_proxy(
+    proxy_addr: SocketAddr,
+    target: &str,
+) -> std::io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    stream.set_nodelay(true)?;
+
+    let connect_request = format!(
+        "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+    );
+    stream
+        .write_all(connect_request.as_bytes())
+        .await?;
+
+    let mut reader = TokioBufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .await?;
+    if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+        return Err(std::io::Error::other(format!(
+            "HTTP proxy CONNECT failed: {}",
+            status_line.trim_end()
+        )));
+    }
+
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
+
+    let stream = reader.into_inner();
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
 async fn handle_socks(incoming: IncomingConnection<()>, client: Arc<Client>) -> Result<()> {
@@ -648,6 +699,7 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
     Ok(RealityClientConfigResolved {
         listen,
         server_addr,
+        probe_proxy: client.probe_proxy,
         ca_file,
         insecure,
         password,

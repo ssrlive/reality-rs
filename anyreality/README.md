@@ -36,7 +36,7 @@ The sample client config uses three top-level sections:
 - `anytls`: shared AnyTLS settings (`password`, plus the client-side
   session-pool knobs)
 - `client`: client-only runtime defaults such as `listen`, `serverAddr`,
-  `caFile`, and `insecure`
+  `probeProxy`, `caFile`, and `insecure`
 
 The binary now reads runtime values from the config file. The CLI only takes
 `--config` and `--log`.
@@ -52,6 +52,54 @@ knobs:
 | `idleCheckSecs` | 30 | How often to reap idle AnyTLS sessions |
 | `idleTimeoutSecs` | 30 | Idle session lifetime before close |
 | `minIdleSessions` | 5 | Minimum warm idle sessions to keep |
+
+### Probe proxy
+
+If your environment needs the client to reach the AnyTLS server through an
+HTTP CONNECT probe proxy, set `client.probeProxy` to the proxy address.
+The client will open the TLS carrier through that proxy before starting the
+REALITY handshake.
+
+Example:
+
+```toml
+[client]
+probeProxy = "127.0.0.1:8080"
+```
+
+The repository also includes a standalone probe proxy example at
+[examples/reality-cracker.rs](examples/reality-cracker.rs). Run it from the repo
+root like this:
+
+```powershell
+cargo run -p anyreality --example reality-cracker -- 127.0.0.1:8080
+```
+
+By default, the example uses the built-in characteristic probe set. You can
+override or extend that set from the CLI:
+
+```powershell
+# replace the built-in probe set with inline probes
+cargo run -p anyreality --example reality-cracker -- 127.0.0.1:8080 --probe "14 03 03 00 01 01"
+
+# append extra probes on top of the built-in set
+cargo run -p anyreality --example reality-cracker -- 127.0.0.1:8080 --probe-mode append --probe "14 03 03 00 01 01"
+
+# replace the built-in set from a file such as VLESS-cracker/characteristic.txt
+cargo run -p anyreality --example reality-cracker -- 127.0.0.1:8080 --probe-file C:/VLESS-cracker/characteristic.txt
+```
+
+`--probe` and `--probe-file` can both be repeated. `--probe-mode replace`
+is the default, and `--probe-mode append` keeps the built-in characteristic
+probes and then adds the CLI/file probes after them. Blank lines plus `#` /
+`//` comment lines in probe files are ignored.
+
+Then point the anyreality client at that address with `client.probeProxy` in
+`config/reality-client.toml` or `config/reality-client.json`. The client will
+send its outbound carrier CONNECT request through the probe proxy, so the
+proxy can parse the TLS ClientHello/ServerHello records, log the negotiated
+SNI/ALPN/version fields, and launch a background replay probe using the same
+record-level logic as the vless-cracker sample.
 
 ---
 
