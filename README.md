@@ -41,7 +41,7 @@ cargo run -p anyreality --bin anyreality-server -- --config anyreality/config/re
 cargo run -p anyreality --bin anyreality-client -- --config anyreality/config/reality-client.toml
 ```
 
-See `anyreality/README.md` for additional runtime and smoke-test instructions.
+See [anyreality/README.md](anyreality/README.md) for additional runtime and smoke-test instructions.
 
 ---
 
