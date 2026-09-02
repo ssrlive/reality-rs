@@ -19,11 +19,11 @@
 
 use anyreality::async_bridge;
 
-use aes_gcm::aead::AeadInPlace;
+use aes_gcm::aead::AeadInOut;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use anyhow::{Context, Result, bail};
-use anytls::core::{Command, Frame, PaddingFactory};
-use anytls::proxy::session::{DEFAULT_SID, Session as AnytlsSession, new_server_session};
+use anytls::core::PaddingFactory;
+use anytls::proxy::session::{Stream as AnytlsStream, new_server_session};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{
     UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream,
@@ -302,7 +302,7 @@ async fn handle_connection(
     // 4) Hand the carrier to anytls and run the session loop.
     let session = new_server_session(
         Box::new(bridge),
-        Box::new(|session: Arc<AnytlsSession>| {
+        Box::new(|session: Arc<AnytlsStream>| {
             tokio::spawn(async move {
                 if let Err(error) = handle_session(session).await {
                     log::debug!("session error: {error:#}");
@@ -319,7 +319,7 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn handle_session(session: Arc<AnytlsSession>) -> Result<()> {
+async fn handle_session(session: Arc<AnytlsStream>) -> Result<()> {
     let mut reader = AnytlsStreamReader::new(session.clone());
     loop {
         if session.is_terminated().await {
@@ -348,7 +348,7 @@ async fn handle_session(session: Arc<AnytlsSession>) -> Result<()> {
     }
 }
 
-async fn handle_tcp_stream(session: Arc<AnytlsSession>, destination: Address) -> Result<()> {
+async fn handle_tcp_stream(session: Arc<AnytlsStream>, destination: Address) -> Result<()> {
     let dst = destination.to_string();
     let mut outbound = match TokioTcpStream::connect(&dst).await {
         Ok(s) => s,
@@ -396,12 +396,7 @@ async fn handle_tcp_stream(session: Arc<AnytlsSession>, destination: Address) ->
         loop {
             match up_read.read(&mut buf).await {
                 Ok(0) => {
-                    let _ = session_write
-                        .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
-                        .await;
-                    let _ = session_write
-                        .mark_local_stream_closed(DEFAULT_SID)
-                        .await;
+                    let _ = session_write.close().await;
                     break;
                 }
                 Ok(n) => {
@@ -424,7 +419,7 @@ async fn handle_tcp_stream(session: Arc<AnytlsSession>, destination: Address) ->
 }
 
 async fn handle_uot_datagram(
-    session: Arc<AnytlsSession>,
+    session: Arc<AnytlsStream>,
     reader: &mut AnytlsStreamReader,
 ) -> Result<()> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
@@ -461,7 +456,7 @@ async fn handle_uot_datagram(
 }
 
 async fn handle_uot_connected(
-    session: Arc<AnytlsSession>,
+    session: Arc<AnytlsStream>,
     reader: &mut AnytlsStreamReader,
     request: &UotRequest,
 ) -> Result<()> {
@@ -667,9 +662,9 @@ fn is_reality_client_hello(
 
         let cipher = Aes256Gcm::new(&sealing_key.into());
         let mut decrypted = parsed.session_id.to_vec();
-        let nonce = Nonce::from_slice(&parsed.random[20..32]);
+        let nonce = Nonce::try_from(&parsed.random[20..32])?;
         if cipher
-            .decrypt_in_place(nonce, &parsed.raw_client_hello, &mut decrypted)
+            .decrypt_in_place(&nonce, &parsed.raw_client_hello, &mut decrypted)
             .is_err()
         {
             return Ok(false);
@@ -1112,7 +1107,7 @@ fn is_error_of_session_broken(error: &std::io::Error) -> bool {
 // === AsyncRead adapter for AnytlsSession ===
 
 struct AnytlsStreamReader {
-    inner: Arc<AnytlsSession>,
+    inner: Arc<AnytlsStream>,
     #[allow(clippy::type_complexity)]
     read_fut: Option<
         core::pin::Pin<
@@ -1122,7 +1117,7 @@ struct AnytlsStreamReader {
 }
 
 impl AnytlsStreamReader {
-    fn new(inner: Arc<AnytlsSession>) -> Self {
+    fn new(inner: Arc<AnytlsStream>) -> Self {
         Self {
             inner,
             read_fut: None,
@@ -1161,6 +1156,7 @@ impl AsyncRead for AnytlsStreamReader {
             self.read_fut = Some(Box::pin(async move {
                 let mut v = vec![0u8; remaining];
                 let n = inner.read(&mut v).await?;
+                v.truncate(n);
                 Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
             }));
         }

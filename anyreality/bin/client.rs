@@ -21,8 +21,8 @@ use anyreality::async_bridge;
 
 use anyhow::{Context, Result, anyhow, bail};
 use anytls::AsyncReadWrite;
-use anytls::core::{Command, Frame, PaddingFactory};
-use anytls::proxy::session::{Client, DEFAULT_SID, Session as AnytlsSession};
+use anytls::core::PaddingFactory;
+use anytls::proxy::session::{Client, Stream as AnytlsStream};
 use anytls::runtime::DefaultPaddingFactory;
 use anytls::uot::{
     UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination,
@@ -58,6 +58,7 @@ use tokio::io::{
 use tokio::net::{TcpStream, UdpSocket};
 
 const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
+const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 8;
 
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -229,6 +230,7 @@ async fn main() -> Result<()> {
         Duration::from_secs(resolved.idle_check_secs),
         Duration::from_secs(resolved.idle_timeout_secs),
         resolved.min_idle_sessions,
+        DEFAULT_MAX_STREAMS_PER_SESSION,
     ));
 
     log::info!(
@@ -356,8 +358,8 @@ async fn connect_via_probe_proxy(
     Ok(stream)
 }
 
-async fn handle_socks(incoming: IncomingConnection<()>, client: Arc<Client>) -> Result<()> {
-    let (authenticated, _) = incoming.authenticate().await?;
+async fn handle_socks(incoming: IncomingConnection, client: Arc<Client>) -> Result<()> {
+    let authenticated = incoming.authenticate().await?;
     let request = authenticated.wait_request().await?;
 
     match request {
@@ -396,20 +398,6 @@ async fn handle_tcp_connect(
     // format. Becomes the data of the first cmdPSH frame.
     let addr_bytes: Vec<u8> = target.clone().into();
     if let Err(err) = session.write(&addr_bytes).await {
-        let _ = session.terminate().await;
-        if let Ok(mut failed) = connect_req
-            .reply(Reply::GeneralFailure, Address::unspecified())
-            .await
-        {
-            let _ = failed.shutdown().await;
-        }
-        return Err(err.into());
-    }
-
-    if let Err(err) = session
-        .wait_for_stream_handshake()
-        .await
-    {
         let _ = session.terminate().await;
         if let Ok(mut failed) = connect_req
             .reply(Reply::GeneralFailure, Address::unspecified())
@@ -491,13 +479,8 @@ async fn handle_tcp_connect(
     Ok(())
 }
 
-async fn finish_logical_stream(session: &Arc<AnytlsSession>) -> std::io::Result<()> {
-    let _ = session
-        .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
-        .await;
-    session
-        .mark_local_stream_closed(DEFAULT_SID)
-        .await
+async fn finish_logical_stream(session: &Arc<AnytlsStream>) -> std::io::Result<()> {
+    session.close().await
 }
 
 fn is_nonfatal_local_disconnect(error: &std::io::Error) -> bool {
@@ -550,18 +533,6 @@ async fn handle_udp_associate(
         return Err(err);
     }
 
-    if let Err(err) = session
-        .wait_for_stream_handshake()
-        .await
-    {
-        let _ = session.terminate().await;
-        let mut reply = associate_req
-            .reply(Reply::GeneralFailure, Address::unspecified())
-            .await?;
-        reply.shutdown().await?;
-        return Err(err.into());
-    }
-
     let mut reply = associate_req
         .reply(Reply::Succeeded, Address::from(listen_addr))
         .await?;
@@ -608,12 +579,7 @@ async fn handle_udp_associate(
     };
 
     if result.is_ok() {
-        let _ = session
-            .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
-            .await;
-        let _ = session
-            .mark_local_stream_closed(DEFAULT_SID)
-            .await;
+        let _ = session.close().await;
     } else {
         let _ = session.terminate().await;
     }
@@ -621,7 +587,7 @@ async fn handle_udp_associate(
     result
 }
 
-async fn setup_uot_request(session: &Arc<AnytlsSession>) -> Result<()> {
+async fn setup_uot_request(session: &Arc<AnytlsStream>) -> Result<()> {
     let sentinel: Vec<u8> = uot_sentinel_destination().into();
     session.write(&sentinel).await?;
     let request_bytes: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified()).into();
@@ -807,7 +773,7 @@ fn parse_hex_nibble(value: u8) -> u8 {
 // === AsyncRead adapter for AnytlsSession (so UoT helpers can drive it) ===
 
 struct AnytlsStreamReader {
-    inner: Arc<AnytlsSession>,
+    inner: Arc<AnytlsStream>,
     #[allow(clippy::type_complexity)]
     read_fut: Option<
         core::pin::Pin<
@@ -817,7 +783,7 @@ struct AnytlsStreamReader {
 }
 
 impl AnytlsStreamReader {
-    fn new(inner: Arc<AnytlsSession>) -> Self {
+    fn new(inner: Arc<AnytlsStream>) -> Self {
         Self {
             inner,
             read_fut: None,
@@ -856,6 +822,7 @@ impl AsyncRead for AnytlsStreamReader {
             self.read_fut = Some(Box::pin(async move {
                 let mut v = vec![0u8; remaining];
                 let n = inner.read(&mut v).await?;
+                v.truncate(n);
                 Ok::<(Vec<u8>, usize), std::io::Error>((v, n))
             }));
         }
