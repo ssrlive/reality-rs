@@ -453,6 +453,7 @@ impl Accepted {
                 .certificate_authority_names
                 .as_deref(),
             named_groups: client_hello.named_groups.as_deref(),
+            reality_auth_key: None,
         };
 
         trace!("Accepted::client_hello(): {ch:#?}");

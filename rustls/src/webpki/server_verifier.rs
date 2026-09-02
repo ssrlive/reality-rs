@@ -155,7 +155,7 @@ impl WebPkiServerVerifier {
 
     /// Short-cut for creating a `WebPkiServerVerifier` that does not perform certificate revocation
     /// checking, avoiding the need to use a builder.
-    pub(crate) fn new_without_revocation(
+    pub fn new_without_revocation(
         roots: impl Into<Arc<RootCertStore>>,
         supported_algs: WebPkiSupportedAlgorithms,
     ) -> Self {

@@ -203,6 +203,17 @@ pub struct SelectedCredential {
     pub ocsp: Option<Arc<[u8]>>,
 }
 
+impl SelectedCredential {
+    /// Construct a selected credential from an owned identity and one-time signer.
+    pub fn new(identity: Arc<Identity<'static>>, signer: Box<dyn Signer>) -> Self {
+        Self {
+            identity,
+            signer,
+            ocsp: None,
+        }
+    }
+}
+
 /// A peer's identity, depending on the negotiated certificate type.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

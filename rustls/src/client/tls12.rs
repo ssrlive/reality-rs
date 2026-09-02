@@ -386,7 +386,7 @@ impl ExpectCertificateStatus {
 
         trace!(
             "Server stapled OCSP response is {:?}",
-            &server_cert_ocsp_response
+            server_cert_ocsp_response
         );
 
         let server_cert = ServerCertDetails::new(self.server_cert_chain, server_cert_ocsp_response);
@@ -759,6 +759,7 @@ impl ExpectServerDone {
                 server_name: &self.hs.session_key.server_name,
                 ocsp_response: &self.server_cert.ocsp_response,
                 now: self.hs.config.current_time()?,
+                reality_auth_key: None,
             })?;
 
         // 2.

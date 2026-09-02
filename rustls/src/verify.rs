@@ -117,6 +117,8 @@ pub struct ServerIdentity<'a> {
     pub ocsp_response: &'a [u8],
     /// Current time against which time-sensitive inputs should be validated.
     pub now: UnixTime,
+    /// AuthKey for the current REALITY handshake, if one was generated.
+    pub reality_auth_key: Option<&'a [u8; 32]>,
 }
 
 impl<'a> ServerIdentity<'a> {
@@ -127,7 +129,14 @@ impl<'a> ServerIdentity<'a> {
             server_name,
             ocsp_response: &[],
             now,
+            reality_auth_key: None,
         }
+    }
+
+    /// Attach the connection-scoped REALITY AuthKey to this identity.
+    pub fn with_reality_auth_key(mut self, auth_key: &'a [u8; 32]) -> Self {
+        self.reality_auth_key = Some(auth_key);
+        self
     }
 }
 

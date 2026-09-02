@@ -316,6 +316,17 @@ pub trait ClientHelloVerifier: Debug + Send + Sync + Any {
     /// Reject the handshake by returning an error.
     fn verify_client_hello(&self, client_hello: &RealityClientHello<'_>) -> Result<(), Error>;
 
+    /// Return the AuthKey for a successfully verified REALITY ClientHello.
+    ///
+    /// The value is passed only to the credential resolver for this handshake.
+    /// Implementations that do not use REALITY authentication return `None`.
+    fn reality_auth_key(
+        &self,
+        _client_hello: &RealityClientHello<'_>,
+    ) -> Result<Option<[u8; 32]>, Error> {
+        Ok(None)
+    }
+
     /// Include verifier configuration in the server config hash.
     fn hash_config(&self, _h: &mut dyn core::hash::Hasher) {}
 }
@@ -418,6 +429,7 @@ pub struct ClientHello<'a> {
     /// [certificate_authorities]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
     pub(super) certificate_authorities: Option<&'a [DistinguishedName]>,
     pub(super) named_groups: Option<&'a [NamedGroup]>,
+    pub(super) reality_auth_key: Option<[u8; 32]>,
 }
 
 impl<'a> ClientHello<'a> {
@@ -426,6 +438,7 @@ impl<'a> ClientHello<'a> {
         signature_schemes: &'a [SignatureScheme],
         sni: Option<&'a DnsName<'static>>,
         version: ProtocolVersion,
+        reality_auth_key: Option<[u8; 32]>,
     ) -> Self {
         Self {
             server_name: sni.map(Cow::Borrowed),
@@ -452,6 +465,7 @@ impl<'a> ClientHello<'a> {
                 .client_hello
                 .named_groups
                 .as_deref(),
+            reality_auth_key,
         }
     }
 
@@ -460,6 +474,11 @@ impl<'a> ClientHello<'a> {
     /// Returns `None` if the client did not supply a SNI.
     pub fn server_name(&self) -> Option<&DnsName<'_>> {
         self.server_name.as_deref()
+    }
+
+    /// Return the verified AuthKey for this connection, if supplied by a REALITY verifier.
+    pub fn reality_auth_key(&self) -> Option<&[u8; 32]> {
+        self.reality_auth_key.as_ref()
     }
 
     /// Get the compatible signature schemes.

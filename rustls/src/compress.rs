@@ -188,6 +188,7 @@ mod feat_zlib_rs {
 pub use feat_zlib_rs::{ZLIB_COMPRESSOR, ZLIB_DECOMPRESSOR};
 
 #[cfg(feature = "brotli")]
+#[allow(clippy::std_instead_of_core)]
 mod feat_brotli {
     use std::io::{Cursor, Write};
 

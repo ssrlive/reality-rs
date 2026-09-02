@@ -18,7 +18,7 @@ use crate::sync::Arc;
 use crate::verify::DistinguishedName;
 #[cfg(feature = "webpki")]
 pub use crate::webpki::{
-    ServerVerifierBuilder, VerifierBuilderError, WebPkiServerVerifier,
+    ParsedCertificate, ServerVerifierBuilder, VerifierBuilderError, WebPkiServerVerifier,
     verify_identity_signed_by_trust_anchor, verify_server_name,
 };
 use crate::{Tls12CipherSuite, Tls13CipherSuite, compress};

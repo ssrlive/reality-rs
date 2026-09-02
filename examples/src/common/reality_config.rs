@@ -41,7 +41,7 @@ pub(crate) struct RealityFallbackRuleConfig {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RealityServerConfig {
     pub private_key: String,
-    pub short_id: String,
+    pub short_ids: Vec<String>,
     pub version: String,
     #[serde(default)]
     pub server_names: Vec<String>,

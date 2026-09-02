@@ -437,6 +437,7 @@ pub struct ClientHelloCallbackContext<'a> {
     active_key_exchange: Option<&'a dyn ActiveKeyExchange>,
     raw_client_hello: Option<&'a [u8]>,
     is_retry: bool,
+    reality_auth_key: Option<[u8; 32]>,
 }
 
 impl<'a> ClientHelloCallbackContext<'a> {
@@ -455,6 +456,7 @@ impl<'a> ClientHelloCallbackContext<'a> {
             active_key_exchange,
             raw_client_hello,
             is_retry,
+            reality_auth_key: None,
         }
     }
 
@@ -509,6 +511,15 @@ impl<'a> ClientHelloCallbackContext<'a> {
     /// Returns whether this hello is being emitted after a `HelloRetryRequest`.
     pub fn is_retry(&self) -> bool {
         self.is_retry
+    }
+
+    /// Stores the AuthKey derived for this connection's REALITY handshake.
+    pub fn set_reality_auth_key(&mut self, auth_key: [u8; 32]) {
+        self.reality_auth_key = Some(auth_key);
+    }
+
+    pub(crate) fn reality_auth_key(&self) -> Option<[u8; 32]> {
+        self.reality_auth_key
     }
 }
 

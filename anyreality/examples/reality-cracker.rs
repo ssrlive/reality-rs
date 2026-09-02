@@ -8,11 +8,12 @@
 //! of application-data probes after the first response arrives, and classifies
 //! each probe as ALERT / FIN / RST / TIMEOUT / NONE.
 
+use core::time::Duration;
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use clap::{Parser, ValueEnum};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
@@ -913,7 +914,7 @@ fn parse_hex_line(line: &str) -> Result<Vec<u8>, ()> {
         .chars()
         .filter(|c| !c.is_ascii_whitespace() && *c != ':' && *c != '-')
         .collect();
-    if filtered.is_empty() || filtered.len() % 2 != 0 {
+    if filtered.is_empty() || !filtered.len().is_multiple_of(2) {
         return Err(());
     }
 
@@ -1266,7 +1267,7 @@ fn parse_extensions(exts: &[u8]) -> (String, String, String, usize) {
             }
             43 if ext_len >= 1 => {
                 let list_len = ext[0] as usize;
-                if list_len + 1 <= ext_len {
+                if list_len < ext_len {
                     let mut pos = 1;
                     while pos + 1 < 1 + list_len && pos + 1 < ext_len {
                         if !versions.is_empty() {

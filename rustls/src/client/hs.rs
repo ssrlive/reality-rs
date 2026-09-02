@@ -421,6 +421,7 @@ pub(crate) struct ClientHelloInput {
     pub(super) session_id: SessionId,
     pub(super) session_key: ClientSessionKey<'static>,
     pub(super) prev_ech_ext: Option<EncryptedClientHello>,
+    pub(super) reality_auth_key: Option<[u8; 32]>,
 }
 
 impl ClientHelloInput {
@@ -486,6 +487,7 @@ impl ClientHelloInput {
             session_id,
             session_key,
             prev_ech_ext: None,
+            reality_auth_key: None,
         })
     }
 
@@ -838,6 +840,7 @@ fn emit_client_hello_for_retry(
             retryreq.is_some(),
         );
         callback.modify_client_hello(&mut callback_context)?;
+        input.reality_auth_key = callback_context.reality_auth_key();
     }
 
     let tls13_early_data_key_schedule = match (ech_state.as_mut(), tls13_session) {

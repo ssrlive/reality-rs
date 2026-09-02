@@ -77,7 +77,6 @@ struct TlsServer {
     reality_server_names: Vec<String>, // Added field for reality server names
     reality_fallback_target: Option<FallbackTarget>,
     reality_fallback_rules: Vec<FallbackRule>,
-    reality_probe_matcher: Option<RealityProbeMatcher>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,6 +157,7 @@ struct ClientHelloFallbackInput<'a> {
     named_groups: Option<&'a [NamedGroup]>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RealityProbeMatcher {
     version_prefix: [u8; 4],
@@ -172,7 +172,6 @@ impl TlsServer {
         reality_server_names: Vec<String>, // Added parameter for reality server names
         reality_fallback_target: Option<FallbackTarget>,
         reality_fallback_rules: Vec<FallbackRule>,
-        reality_probe_matcher: Option<RealityProbeMatcher>,
     ) -> Self {
         Self {
             server,
@@ -183,7 +182,6 @@ impl TlsServer {
             reality_server_names, // Initialize reality server names
             reality_fallback_target,
             reality_fallback_rules,
-            reality_probe_matcher,
         }
     }
 
@@ -206,7 +204,6 @@ impl TlsServer {
                         self.reality_server_names.clone(), // Pass reality server names to connection
                         self.reality_fallback_target.clone(),
                         self.reality_fallback_rules.clone(),
-                        self.reality_probe_matcher.clone(),
                     );
                     connection.register(registry);
                     self.connections
@@ -261,7 +258,6 @@ struct OpenConnection {
     tls_config: Arc<ServerConfig>,
     reality_fallback_target: Option<FallbackTarget>,
     reality_fallback_rules: Vec<FallbackRule>,
-    reality_probe_matcher: Option<RealityProbeMatcher>,
     back: Option<TcpStream>,
     front_send_buf: Vec<u8>,
     back_send_buf: Vec<u8>,
@@ -334,7 +330,6 @@ impl OpenConnection {
         reality_server_names: Vec<String>, // Added parameter for reality server names
         reality_fallback_target: Option<FallbackTarget>,
         reality_fallback_rules: Vec<FallbackRule>,
-        reality_probe_matcher: Option<RealityProbeMatcher>,
     ) -> Self {
         let state = if reality_fallback_target.is_some() {
             ConnectionState::Accepting {
@@ -359,7 +354,6 @@ impl OpenConnection {
             tls_config,
             reality_fallback_target,
             reality_fallback_rules,
-            reality_probe_matcher,
             back,
             front_send_buf: Vec::new(),
             back_send_buf: Vec::new(),
@@ -481,16 +475,34 @@ impl OpenConnection {
             Ok(Some(accepted)) => {
                 if let Some(target) = self.fallback_target_for_client_hello(accepted.client_hello())
                 {
-                    debug!("routing client hello to REALITY fallback backend");
-                    if let Some(buffered) = self.take_accept_buffer() {
-                        match self.start_fallback(registry, buffered, target) {
-                            Ok(()) => {
-                                debug!("forwarding non-REALITY probe to fallback backend");
-                                return AcceptProgress::Fallback;
+                    let buffered = self
+                        .take_accept_buffer()
+                        .unwrap_or_default();
+
+                    // Allowlisted SNI is authenticated by the real verifier first. A
+                    // failed verification falls back without sending a TLS alert.
+                    match self.start_tls_from_buffer(&buffered) {
+                        Ok(()) => {
+                            if self
+                                .tls_conn()
+                                .is_some_and(ServerConnection::wants_write)
+                            {
+                                self.do_tls_write_and_handle_error();
                             }
-                            Err(err) => {
-                                error!("failed to connect/write REALITY fallback backend: {err:?}");
-                            }
+                            return AcceptProgress::Ready;
+                        }
+                        Err(err) => {
+                            debug!("REALITY verification failed; forwarding probe: {err:?}");
+                        }
+                    }
+
+                    match self.start_fallback(registry, buffered, target) {
+                        Ok(()) => {
+                            debug!("forwarding non-REALITY probe to fallback backend");
+                            return AcceptProgress::Fallback;
+                        }
+                        Err(err) => {
+                            error!("failed to connect/write REALITY fallback backend: {err:?}");
                         }
                     }
 
@@ -527,13 +539,6 @@ impl OpenConnection {
     fn take_accept_buffer(&mut self) -> Option<Vec<u8>> {
         match &mut self.state {
             ConnectionState::Accepting { buffered, .. } => Some(core::mem::take(buffered)),
-            _ => None,
-        }
-    }
-
-    fn accept_buffer(&self) -> Option<&[u8]> {
-        match &self.state {
-            ConnectionState::Accepting { buffered, .. } => Some(buffered.as_slice()),
             _ => None,
         }
     }
@@ -597,23 +602,22 @@ impl OpenConnection {
             return Some(selected_target);
         }
 
-        let matcher = self.reality_probe_matcher.as_ref()?;
-        let Some(session_id) = self
-            .accept_buffer()
-            .and_then(client_hello_session_id)
-        else {
-            return Some(selected_target);
-        };
-
-        (!session_id_matches_reality(session_id, matcher)).then_some(selected_target)
+        // Do not trust a session ID prefix here. The TLS verifier performs the
+        // complete X25519 + HKDF + AES-GCM check before accepting the handshake;
+        // an authentication failure is routed using the original bytes above.
+        Some(selected_target)
     }
 
     fn start_tls_from_accept_buffer(&mut self) -> Result<(), rustls::Error> {
         let buffered = self
             .take_accept_buffer()
             .unwrap_or_default();
+        self.start_tls_from_buffer(&buffered)
+    }
+
+    fn start_tls_from_buffer(&mut self, buffered: &[u8]) -> Result<(), rustls::Error> {
         let mut conn = ServerConnection::new(self.tls_config.clone())?;
-        let mut incoming = buffered.as_slice();
+        let mut incoming = buffered;
         conn.read_tls(&mut incoming)
             .map_err(|err| rustls::Error::General(err.to_string()))?;
         conn.process_new_packets()?;
@@ -1290,13 +1294,19 @@ fn resolve_reality_config(
         None
     };
 
-    let short_id = args
+    let short_ids = args
         .reality_short_id
         .clone()
         .or_else(|| {
             file_config
                 .as_ref()
-                .map(|config| config.short_id.clone())
+                .and_then(|config| config.short_ids.first().cloned())
+        })
+        .map(|short_id| vec![short_id])
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .map(|config| config.short_ids.clone())
         });
     let private_key = args
         .reality_private_key
@@ -1336,10 +1346,10 @@ fn resolve_reality_config(
             .and_then(|config| config.fallback_port)
     });
 
-    match (short_id, private_key, version) {
+    match (short_ids, private_key, version) {
         (None, None, None) => Ok(None),
-        (Some(short_id), Some(private_key), Some(version)) => Ok(Some(RealityServerConfig {
-            short_id,
+        (Some(short_ids), Some(private_key), Some(version)) => Ok(Some(RealityServerConfig {
+            short_ids,
             private_key,
             version,
             server_names,
@@ -1352,7 +1362,7 @@ fn resolve_reality_config(
         })),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "REALITY requires short_id, private_key, and version via CLI flags or --reality-config",
+            "REALITY requires short_ids, private_key, and version via CLI flags or --reality-config",
         )
         .into()),
     }
@@ -1460,21 +1470,6 @@ fn select_fallback_target(
     default_target
 }
 
-fn effective_reality_probe_matcher(
-    reality: Option<&RealityServerConfig>,
-) -> Option<RealityProbeMatcher> {
-    let reality = reality?;
-    Some(RealityProbeMatcher {
-        version_prefix: reality_version_prefix(&reality.version)?,
-        short_id_prefix: parse_reality_short_id_prefix(&reality.short_id)?,
-    })
-}
-
-fn reality_version_prefix(version: &str) -> Option<[u8; 4]> {
-    let parsed = parse_reality_version_checked(version)?;
-    Some([parsed[0], parsed[1], parsed[2], 0])
-}
-
 fn parse_reality_short_id_prefix(short_id: &str) -> Option<[u8; 8]> {
     let short_id = short_id.trim();
     if short_id.len() > 16 || !short_id.len().is_multiple_of(2) {
@@ -1493,6 +1488,7 @@ fn parse_reality_short_id_prefix(short_id: &str) -> Option<[u8; 8]> {
     Some(parsed)
 }
 
+#[cfg(test)]
 fn client_hello_session_id(buf: &[u8]) -> Option<&[u8]> {
     if buf.len() < 5 || buf[0] != 22 {
         return None;
@@ -1510,6 +1506,7 @@ fn client_hello_session_id(buf: &[u8]) -> Option<&[u8]> {
     hello.get(35..35 + session_id_len)
 }
 
+#[cfg(test)]
 fn session_id_matches_reality(session_id: &[u8], matcher: &RealityProbeMatcher) -> bool {
     session_id.len() == 32
         && session_id[..4] == matcher.version_prefix
@@ -1593,11 +1590,24 @@ fn make_config(args: &Args, reality: Option<&RealityServerConfig>) -> Arc<Server
         .collect();
 
     if let Some(reality) = reality {
+        let short_ids = reality
+            .short_ids
+            .iter()
+            .map(|short_id| {
+                let parsed = parse_reality_short_id_prefix(short_id).expect("bad REALITY short_id");
+                parsed[..short_id.len() / 2].to_vec()
+            })
+            .collect::<Vec<_>>();
+        let primary_short_id = reality
+            .short_ids
+            .first()
+            .expect("REALITY requires at least one short_id");
         let inner = provider::reality::RealityServerVerifierConfig::from_xray_fields(
             parse_reality_version(&reality.version),
-            &reality.short_id,
+            primary_short_id,
             &reality.private_key,
         )
+        .map(|config| config.with_short_ids(short_ids))
         .and_then(|config| config.build_verifier())
         .expect("bad REALITY verifier parameters");
         config
@@ -1674,7 +1684,6 @@ fn main() {
         .unwrap();
     let fallback_target = effective_reality_fallback_target(&args, reality.as_ref());
     let fallback_rules = effective_reality_fallback_rules(reality.as_ref());
-    let reality_probe_matcher = effective_reality_probe_matcher(reality.as_ref());
 
     let mut tlsserv = TlsServer::new(
         listener,
@@ -1686,7 +1695,6 @@ fn main() {
             .unwrap_or_default(),
         fallback_target,
         fallback_rules,
-        reality_probe_matcher,
     );
 
     let mut events = mio::Events::with_capacity(256);
@@ -2132,7 +2140,7 @@ mod tests {
             ..base_args(ServerMode::Http)
         };
         let reality = RealityServerConfig {
-            short_id: "aabbcc".to_string(),
+            short_ids: vec!["aabbcc".to_string()],
             private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
             version: "010203".to_string(),
             server_names: vec!["test".to_string()],
@@ -2165,7 +2173,7 @@ mod tests {
             ..base_args(ServerMode::Http)
         };
         let reality = RealityServerConfig {
-            short_id: "aabbcc".to_string(),
+            short_ids: vec!["aabbcc".to_string()],
             private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
             version: "010203".to_string(),
             server_names: vec!["test".to_string()],

@@ -244,7 +244,7 @@ impl ClientHelloVerifier for RecordingRealityVerifier {
         );
         assert!(
             client_hello
-                .key_share(NamedGroup::X25519)
+                .key_share(NamedGroup::from(0xfe00))
                 .is_some()
         );
         Ok(())
@@ -570,7 +570,7 @@ fn minimal_client_hello() -> ClientHelloPayload {
     ClientHelloPayload {
         client_version: ProtocolVersion::TLSv1_3,
         random: Random::from([0u8; 32]),
-        session_id: SessionId::empty(),
+        session_id: SessionId::from([0u8; 32]),
         cipher_suites: vec![CipherSuite(0xff13), CipherSuite(0xff12)],
         compression_methods: vec![Compression::Null],
         extensions: Box::new(ClientExtensions {
@@ -582,7 +582,7 @@ fn minimal_client_hello() -> ClientHelloPayload {
             }),
             key_shares: Some(vec![KeyShareEntry {
                 group: NamedGroup::from(0xfe00),
-                payload: SizedPayload::from(vec![0xab; 32]),
+                payload: SizedPayload::from(b"KxPeerShareKxPeerShareKxPeerShare".to_vec()),
             }]),
             extended_master_secret_request: Some(()),
             ..ClientExtensions::default()

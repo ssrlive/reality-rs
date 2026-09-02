@@ -243,6 +243,7 @@ mod sni_resolver {
                         cipher_suites: &[],
                         certificate_authorities: None,
                         named_groups: None,
+                        reality_auth_key: None,
                     })
                     .is_err()
             );
@@ -265,6 +266,7 @@ mod sni_resolver {
                         cipher_suites: &[],
                         certificate_authorities: None,
                         named_groups: None,
+                        reality_auth_key: None,
                     })
                     .is_err()
             );

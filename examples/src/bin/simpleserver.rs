@@ -119,13 +119,19 @@ fn resolve_reality_config(args: &Args) -> Result<Option<RealityServerConfig>, Bo
         None
     };
 
-    let short_id = args
+    let short_ids = args
         .reality_short_id
         .clone()
         .or_else(|| {
             file_config
                 .as_ref()
-                .map(|config| config.short_id.clone())
+                .and_then(|config| config.short_ids.first().cloned())
+        })
+        .map(|short_id| vec![short_id])
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .map(|config| config.short_ids.clone())
         });
     let private_key = args
         .reality_private_key
@@ -152,10 +158,10 @@ fn resolve_reality_config(args: &Args) -> Result<Option<RealityServerConfig>, Bo
         args.reality_server_name.clone()
     };
 
-    match (short_id, private_key, version) {
+    match (short_ids, private_key, version) {
         (None, None, None) => Ok(None),
-        (Some(short_id), Some(private_key), Some(version)) => Ok(Some(RealityServerConfig {
-            short_id,
+        (Some(short_ids), Some(private_key), Some(version)) => Ok(Some(RealityServerConfig {
+            short_ids,
             private_key,
             version,
             server_names,
@@ -172,7 +178,7 @@ fn resolve_reality_config(args: &Args) -> Result<Option<RealityServerConfig>, Bo
         })),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "REALITY requires short_id, private_key, and version via CLI flags or --reality-config",
+            "REALITY requires short_ids, private_key, and version via CLI flags or --reality-config",
         )
         .into()),
     }
@@ -201,7 +207,10 @@ fn build_config(
     if let Some(reality) = reality {
         let inner = provider::reality::RealityServerVerifierConfig::from_xray_fields(
             parse_reality_version(&reality.version),
-            &reality.short_id,
+            reality
+                .short_ids
+                .first()
+                .ok_or("REALITY requires at least one short_id")?,
             &reality.private_key,
         )?
         .build_verifier()?;
@@ -355,7 +364,7 @@ mod tests {
         let reality = resolve_reality_config(&args)
             .unwrap()
             .unwrap();
-        assert_eq!(reality.short_id, "aabbcc");
+        assert_eq!(reality.short_ids, vec!["aabbcc"]);
         assert_eq!(reality.version, "010203");
         assert_eq!(reality.server_names, vec!["test"]);
         assert_eq!(reality.fallback_address.as_deref(), Some("::1"));

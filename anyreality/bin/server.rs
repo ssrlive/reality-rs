@@ -1,3 +1,5 @@
+#![allow(clippy::std_instead_of_core)]
+
 //! REALITY-wrapped server speaking the **full AnyTLS protocol**.
 //!
 //! For each inbound TCP:

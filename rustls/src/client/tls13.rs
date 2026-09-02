@@ -124,6 +124,7 @@ impl ClientHandler<Tls13CipherSuite> for Handler {
             mut sent_tls13_fake_ccs,
             mut hello,
             session_key,
+            reality_auth_key,
             protocol,
             ..
         } = st.input;
@@ -267,6 +268,7 @@ impl ClientHandler<Tls13CipherSuite> for Handler {
             hs: HandshakeState {
                 config,
                 session_key,
+                reality_auth_key,
                 randoms,
                 transcript,
                 key_schedule,
@@ -1148,6 +1150,7 @@ impl ExpectCertificateVerify {
                 server_name: &self.hs.session_key.server_name,
                 ocsp_response: &self.server_cert.ocsp_response,
                 now: self.hs.config.current_time()?,
+                reality_auth_key: self.hs.reality_auth_key.as_ref(),
             })?;
 
         // 2. Verify their signature on the handshake.
@@ -1441,6 +1444,7 @@ impl From<Box<ExpectFinished>> for ClientState {
 struct HandshakeState {
     config: Arc<ClientConfig>,
     session_key: ClientSessionKey<'static>,
+    reality_auth_key: Option<[u8; 32]>,
     randoms: ConnectionRandoms,
     transcript: HandshakeHash,
     key_schedule: KeyScheduleHandshake,

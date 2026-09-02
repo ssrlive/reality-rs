@@ -22,6 +22,11 @@ pub trait RealitySessionIdGenerator: fmt::Debug + Send + Sync + Any {
     /// Derive the session ID for the outgoing `ClientHello`.
     fn generate_session_id(&self, hello: &RealityClientHello<'_>) -> Result<[u8; 32], Error>;
 
+    /// Derive the connection-scoped AuthKey used to authenticate a REALITY certificate.
+    fn derive_auth_key(&self, _hello: &RealityClientHello<'_>) -> Result<Option<[u8; 32]>, Error> {
+        Ok(None)
+    }
+
     /// Include generator configuration in the client config hash.
     fn hash_config(&self, _h: &mut dyn Hasher) {}
 }
@@ -258,6 +263,19 @@ impl RealitySessionIdGenerator for SealingRealitySessionIdGenerator {
             .seal(&sealing_key, &nonce, raw_client_hello, &header)
     }
 
+    fn derive_auth_key(&self, hello: &RealityClientHello<'_>) -> Result<Option<[u8; 32]>, Error> {
+        let reality_key = hello
+            .extract_reality_key(&self.server_public_key)
+            .ok_or(ApiMisuse::RealitySealingGeneratorRequiresRealityKey)?;
+        let expander = HkdfUsingHmac(self.hmac)
+            .extract_from_secret(Some(&hello.client_random()[..20]), &reality_key);
+        let mut auth_key = [0u8; 32];
+        expander
+            .expand_slice(&[b"REALITY"], &mut auth_key)
+            .map_err(|_| Error::Unreachable("REALITY AuthKey output length rejected"))?;
+        Ok(Some(auth_key))
+    }
+
     fn hash_config(&self, h: &mut dyn Hasher) {
         h.write(&self.version);
         h.write(&[self.short_id_len as u8]);
@@ -296,6 +314,12 @@ impl ClientHelloCallback for RealityClientHelloCallback {
         let session_id = self
             .generator
             .generate_session_id(&reality_hello)?;
+        if let Some(auth_key) = self
+            .generator
+            .derive_auth_key(&reality_hello)?
+        {
+            hello.set_reality_auth_key(auth_key);
+        }
         hello.set_session_id(&session_id)
     }
 

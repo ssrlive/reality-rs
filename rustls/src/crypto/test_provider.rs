@@ -319,7 +319,7 @@ impl SupportedKxGroup for FakeKeyExchangeGroup {
 const KX_PEER_SHARE: &[u8] = b"KxPeerShareKxPeerShareKxPeerShare";
 const KX_SHARED_SECRET: &[u8] = b"KxSharedSecretKxSharedSecret";
 pub(crate) const REALITY_SERVER_PUB_KEY: &[u8] = b"RealityServerStaticPublicKeyValue";
-pub(crate) const REALITY_AUTH_KEY: &[u8] = b"RealityAuthKeyMaterialForTests!!!!";
+pub(crate) const REALITY_AUTH_KEY: &[u8] = b"RealityAuthKeyMaterialForTests!!";
 
 struct Aead;
 

@@ -75,6 +75,12 @@ pub(crate) struct SessionId {
     len: usize,
 }
 
+impl From<[u8; 32]> for SessionId {
+    fn from(data: [u8; 32]) -> Self {
+        Self { data, len: 32 }
+    }
+}
+
 impl SessionId {
     pub(crate) fn random(secure_random: &dyn SecureRandom) -> Result<Self, GetRandomFailed> {
         let mut data = [0u8; 32];

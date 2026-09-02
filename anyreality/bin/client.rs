@@ -1,3 +1,5 @@
+#![allow(clippy::std_instead_of_core)]
+
 //! REALITY-wrapped SOCKS5 client speaking the **full AnyTLS protocol**.
 //!
 //! Architecture:

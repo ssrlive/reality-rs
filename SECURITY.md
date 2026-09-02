@@ -7,11 +7,11 @@ original semver-compatible release was published less than 2 years ago.
 
 For example, as of 2025-05-09 the latest release is 0.23.27.
 
-* 0.23.0 was released in February of 2024
-* 0.22.0 was released in December of 2023
-* 0.21.0 was released in March of 2023
-* 0.20.0 was released in September of 2021
-* 0.19.0 was released in November of 2020
+- 0.23.0 was released in February of 2024
+- 0.22.0 was released in December of 2023
+- 0.21.0 was released in March of 2023
+- 0.20.0 was released in September of 2021
+- 0.19.0 was released in November of 2020
 
 Therefore 0.23.x and 0.22.x will be updated, while 0.21.x, 0.20.x and 0.19.x
 will not be.
@@ -29,7 +29,7 @@ in the course of normal development, subject to these constraints:
 - Our MSRV will be no more recent than 9 versions old, or approximately 12 months.
 
 > [!TIP]
-> At the time of writing, the most recent Rust release is 1.94.  That means
+> At the time of writing, the most recent Rust release is 1.94. That means
 > our MSRV could be as recent as 1.85. As it happens, it is 1.85.
 
 - Our MSRV policy only covers the core library crate: it does not cover tests
@@ -76,14 +76,14 @@ We'll then:
 - Submit an advisory to [rustsec/advisory-db](https://github.com/RustSec/advisory-db).
 - Refer to the advisory on the main README.md and release notes.
 
-If you're *looking* for security bugs, this crate is set up for
+If you're _looking_ for security bugs, this crate is set up for
 `cargo fuzz` but would benefit from more runtime, targets and corpora.
 
 ## Threat model
 
 ### Scope and assumptions
 
-This library typically sits between raw network I/O and application code.  The network side
+This library typically sits between raw network I/O and application code. The network side
 is fully attacker-controlled; the application-side is relatively trusted but still aims to be
 misuse-resistant.
 
@@ -94,7 +94,7 @@ By "fully attacker-controlled", we specifically include:
 - honest but broken peers (again, pre- or post-authentication)
 
 The core `rustls` library is a TLS protocol implementation, and requires additional items to
-become useful.  These items are therefore in scope:
+become useful. These items are therefore in scope:
 
 - the default certificate verifiers based on `rustls-webpki`.
 - the cryptography providers published from the rustls repository (currently `rustls-ring` and `rustls-aws-lc-rs`;
@@ -123,14 +123,14 @@ Specific threats (non-exhaustive):
 
 Mitigations:
 
-- The entire crate which processes items on this trust boundary is `forbid(unsafe_code)`.  This means all
-  code within is the memory safe-subset of Rust.  This ameliorates impact of items like integer overflows (generally
+- The entire crate which processes items on this trust boundary is `forbid(unsafe_code)`. This means all
+  code within is the memory safe-subset of Rust. This ameliorates impact of items like integer overflows (generally
   reducing their impact to denial-of-service), but has little impact on other threats.
-- We fuzz this interface, looking for reachable panics.  The project is registered with OSS-Fuzz which provides
-  compute for this effort.  Fuzzing is performed with a mock provider of cryptography, which is intended to make
+- We fuzz this interface, looking for reachable panics. The project is registered with OSS-Fuzz which provides
+  compute for this effort. Fuzzing is performed with a mock provider of cryptography, which is intended to make
   both pre-auth and post-auth code paths reachable to the fuzzer (at the cost of fuzzing not covering the actual
   cryptography implementations).
-- We have [studied and explained](https://rustls.dev/docs/manual/_01_impl_vulnerabilities/index.html#a-review-of-tls-implementation-vulnerabilities)
+- We have [studied and explained](https://rustls.dev/docs/rustls/manual/_01_impl_vulnerabilities/index.html#a-review-of-tls-implementation-vulnerabilities)
   issues encountered in other TLS implementations and discuss further mitigations there.
 - We implement the TLS 1.3 downgrade sentinel (a [standard and required protocol feature](https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3)
   which limits downgrade from TLS 1.3).
@@ -165,9 +165,9 @@ The public API is the interface between the core `rustls` library and applicatio
 This is a semi-trusted boundary: callers are not treated as adversaries, but the API
 aims to be misuse-resistant so that common mistakes do not lead to security failures.
 
-However, application code is not treated as adversarial.  Callers who deliberately work
+However, application code is not treated as adversarial. Callers who deliberately work
 to undermine their own security (for example, by implementing a custom certificate verifier
-that accepts all certificates) are outside the threat model.  Security reports that
+that accepts all certificates) are outside the threat model. Security reports that
 require the caller to actively opt in to insecure behavior — through custom configuration
 that is unlikely to arise by accident — will be treated as normal bug reports.
 
@@ -186,4 +186,4 @@ Mitigations:
   requires explicit action on the part of the application.
 - Avoiding `Debug` impls on any type that contains secret key material.
 - In the public API error type, we have items for unreachable conditions, and
-  conditions that indicate misuse of the public API.  These are returned instead of panics.
+  conditions that indicate misuse of the public API. These are returned instead of panics.

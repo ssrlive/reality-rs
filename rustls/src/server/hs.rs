@@ -506,7 +506,7 @@ impl ExpectClientHello {
     }
 
     fn with_version<T: Suite + 'static>(
-        mut self,
+        self,
         input: ClientHelloInput<'_>,
         output: &mut dyn Output<'_>,
     ) -> Result<ServerState, Error>
@@ -523,13 +523,13 @@ impl ExpectClientHello {
             .accept(input.client_hello.server_name.as_ref())?;
         output.emit(Event::ReceivedServerName(sni.clone()));
 
-        if let Some(verifier) = &self.config.client_hello_verifier {
-            verifier.verify_client_hello(&RealityClientHello::new(
-                &input,
-                sni.as_ref(),
-                T::VERSION,
-            )?)?;
-        }
+        let reality_auth_key = if let Some(verifier) = &self.config.client_hello_verifier {
+            let reality_client_hello = RealityClientHello::new(&input, sni.as_ref(), T::VERSION)?;
+            verifier.verify_client_hello(&reality_client_hello)?;
+            verifier.reality_auth_key(&reality_client_hello)?
+        } else {
+            None
+        };
 
         if self.done_retry {
             let ch_sni = input
@@ -578,8 +578,25 @@ impl ExpectClientHello {
                 &sig_schemes,
                 sni.as_ref(),
                 T::VERSION,
+                reality_auth_key,
             ))?;
+        self.finish_client_hello(input, output, sni, credentials)
+    }
+
+    fn finish_client_hello<T: Suite + 'static>(
+        mut self,
+        input: ClientHelloInput<'_>,
+        output: &mut dyn Output<'_>,
+        sni: Option<DnsName<'static>>,
+        credentials: SelectedCredential,
+    ) -> Result<ServerState, Error>
+    where
+        CryptoProvider: Borrow<[&'static T]>,
+        SupportedCipherSuite: From<&'static T>,
+        dyn CipherSuiteSelector: VersionSuiteSelector<T>,
+    {
         self.sni = sni;
+        let suites = <CryptoProvider as Borrow<[&'static T]>>::borrow(&self.config.provider);
 
         let (suite, skxg) = self.choose_suite_and_kx_group(
             suites,

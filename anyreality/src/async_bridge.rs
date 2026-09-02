@@ -40,6 +40,7 @@ where
     Ok(local)
 }
 
+#[allow(clippy::std_instead_of_core)]
 fn pump<C>(
     handle: Handle,
     mut tls: StreamOwned<C, std::net::TcpStream>,
