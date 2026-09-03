@@ -53,8 +53,12 @@ use socks5_impl::protocol::{Address, AsyncStreamOperation};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream as TokioTcpStream, UdpSocket};
+
+const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const CLIENT_HELLO_MAX_WIRE_SIZE: usize = 128 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -587,33 +591,36 @@ fn is_reality_client_hello(
     stream
         .set_nonblocking(false)
         .context("set socket blocking for ClientHello peek")?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .context("set ClientHello peek timeout")?;
 
     let mut buf = vec![0u8; 2048];
+    let deadline = Instant::now() + CLIENT_HELLO_TIMEOUT;
 
     loop {
-        let available = stream
-            .peek(&mut buf)
-            .context("peek ClientHello")?;
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for ClientHello")
+        }
+        let available = match stream.peek(&mut buf) {
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(error) => return Err(error).context("peek ClientHello"),
+        };
         if available == 0 {
             return Ok(false);
         }
 
-        if available < 5 {
+        let Some(handshake) = collect_client_hello(&buf[..available])? else {
+            if buf.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
+                bail!("ClientHello exceeds maximum size")
+            }
+            buf.resize((buf.len() * 2).min(CLIENT_HELLO_MAX_WIRE_SIZE), 0);
             thread::sleep(Duration::from_millis(1));
             continue;
-        }
+        };
 
-        let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-        let needed = 5 + record_len;
-        if needed > buf.len() {
-            buf.resize(needed, 0);
-        }
-        if available < needed {
-            thread::sleep(Duration::from_millis(1));
-            continue;
-        }
-
-        let Ok(parsed) = parse_client_hello(&buf[..needed]) else {
+        let Ok(parsed) = parse_client_hello(&handshake) else {
             return Ok(false);
         };
         if parsed.session_id.len() != 32 {
@@ -672,28 +679,67 @@ struct ParsedClientHello {
     server_name: Option<String>,
 }
 
+fn collect_client_hello(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    let mut offset = 0;
+    let mut handshake = Vec::new();
+    let mut expected_len = None;
+
+    while offset < bytes.len() {
+        if bytes.len() - offset < 5 {
+            return Ok(None);
+        }
+        let header = &bytes[offset..offset + 5];
+        offset += 5;
+        if header[0] != 22 {
+            bail!("not a handshake record")
+        }
+        let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        if bytes.len() - offset < record_len {
+            return Ok(None);
+        }
+        let payload = &bytes[offset..offset + record_len];
+        offset += record_len;
+        handshake.extend_from_slice(payload);
+
+        if expected_len.is_none() && handshake.len() >= 4 {
+            if handshake[0] != 1 {
+                bail!("not a ClientHello")
+            }
+            let client_hello_len = ((handshake[1] as usize) << 16)
+                | ((handshake[2] as usize) << 8)
+                | handshake[3] as usize;
+            let total_len = client_hello_len
+                .checked_add(4)
+                .ok_or_else(|| anyhow::anyhow!("ClientHello length overflow"))?;
+            if total_len > CLIENT_HELLO_MAX_WIRE_SIZE {
+                bail!("ClientHello exceeds maximum size")
+            }
+            expected_len = Some(total_len);
+        }
+
+        if let Some(expected_len) = expected_len {
+            if handshake.len() >= expected_len {
+                handshake.truncate(expected_len);
+                return Ok(Some(handshake));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello> {
-    if bytes.len() < 5 || bytes[0] != 22 {
-        bail!("not a TLS record")
-    }
-
-    let record_len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
-    if bytes.len() < 5 + record_len || record_len < 4 {
-        bail!("truncated TLS record")
-    }
-
-    let handshake = &bytes[5..5 + record_len];
-    if handshake[0] != 1 {
+    if bytes.len() < 4 || bytes[0] != 1 {
         bail!("not a ClientHello")
     }
 
     let handshake_len =
-        ((handshake[1] as usize) << 16) | ((handshake[2] as usize) << 8) | (handshake[3] as usize);
-    if handshake_len < 34 || handshake_len + 4 > handshake.len() {
+        ((bytes[1] as usize) << 16) | ((bytes[2] as usize) << 8) | (bytes[3] as usize);
+    if handshake_len < 34 || handshake_len + 4 > bytes.len() {
         bail!("truncated ClientHello")
     }
 
-    let body = &handshake[4..4 + handshake_len];
+    let body = &bytes[4..4 + handshake_len];
     let mut offset = 2;
     let mut random = [0u8; 32];
     let random_end = offset + 32;
@@ -747,7 +793,7 @@ fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello> {
     }
 
     let key_share = key_share.unwrap_or_default();
-    let mut raw_client_hello = handshake.to_vec();
+    let mut raw_client_hello = bytes.to_vec();
     let raw_session_id_end = 4 + session_id_offset + session_id_len;
     raw_client_hello
         .get_mut(4 + session_id_offset..raw_session_id_end)
@@ -858,26 +904,29 @@ async fn handle_raw_tls_fallback(
     client: std::net::TcpStream,
     allowed_server_names: Arc<Vec<String>>,
 ) -> Result<()> {
+    client.set_read_timeout(Some(Duration::from_secs(1)))?;
     let mut buffer = vec![0u8; 2048];
-    let available = loop {
-        let available = client.peek(&mut buffer)?;
-        if available < 5 {
+    let deadline = Instant::now() + CLIENT_HELLO_TIMEOUT;
+    let handshake = loop {
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for fallback ClientHello");
+        }
+        let available = match client.peek(&mut buffer) {
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => 0,
+            Err(error) => return Err(error.into()),
+        };
+        let Some(handshake) = collect_client_hello(&buffer[..available])? else {
+            if buffer.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
+                bail!("ClientHello exceeds maximum size");
+            }
+            buffer.resize((buffer.len() * 2).min(CLIENT_HELLO_MAX_WIRE_SIZE), 0);
             thread::sleep(Duration::from_millis(1));
             continue;
-        }
-        let record_len = u16::from_be_bytes([buffer[3], buffer[4]]) as usize;
-        let needed = 5 + record_len;
-        if needed > buffer.len() {
-            buffer.resize(needed, 0);
-            continue;
-        }
-        if available < needed {
-            thread::sleep(Duration::from_millis(1));
-            continue;
-        }
-        break available;
+        };
+        break handshake;
     };
-    let parsed = parse_client_hello(&buffer[..available])?;
+    let parsed = parse_client_hello(&handshake)?;
     let server_name = parsed
         .server_name
         .ok_or_else(|| anyhow::anyhow!("fallback requires SNI"))?;
@@ -1044,7 +1093,7 @@ impl AsyncRead for AnytlsStreamReader {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_client_hello;
+    use super::{collect_client_hello, parse_client_hello};
 
     #[test]
     fn malformed_client_hello_returns_error_without_panicking() {
@@ -1059,5 +1108,26 @@ mod tests {
             assert!(result.is_ok(), "parser panicked for malformed input");
             assert!(result.unwrap().is_err());
         }
+    }
+
+    #[test]
+    fn fragmented_client_hello_is_collected_and_parsed() {
+        let mut handshake = vec![1, 0, 0, 75, 3, 3];
+        handshake.extend([0u8; 32]);
+        handshake.push(32);
+        handshake.extend([0u8; 32]);
+        handshake.extend([0, 2, 0x13, 0x01, 1, 0, 0, 0]);
+
+        let split = 2;
+        let mut records = vec![22, 3, 3, 0, split as u8];
+        records.extend_from_slice(&handshake[..split]);
+        records.extend([22, 3, 3, 0, (handshake.len() - split) as u8]);
+        records.extend_from_slice(&handshake[split..]);
+
+        let collected = collect_client_hello(&records)
+            .unwrap()
+            .expect("fragmented ClientHello should be complete");
+        assert_eq!(collected, handshake);
+        assert!(parse_client_hello(&collected).is_ok());
     }
 }
