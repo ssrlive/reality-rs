@@ -7,7 +7,7 @@ This crate provides two binaries that together form a REALITY-wrapped
 
 ## `anyreality-client`
 
-Exposes a local SOCKS5 listener and forwards traffic over a REALITY/TLS
+Exposes a local mixed SOCKS5 and HTTP CONNECT listener and forwards traffic over a REALITY/TLS
 tunnel to `anyreality-server` using the full AnyTLS session-multiplexing
 protocol. Supports both `CONNECT` (TCP) and `UDP ASSOCIATE` (AnyTLS
 UDP-over-TCP mode).
@@ -154,8 +154,9 @@ pwsh -File admin/reality-smoke.ps1 -BuildWithCargo
 bash admin/reality-smoke.sh --build-with-cargo
 ```
 
-This starts a tiny HTTP server on port `18080`, verifies that a `curl`
-request routed through the SOCKS5 proxy returns `reality tunnel ok`.
+This starts a tiny HTTP server on port `18080`, verifies that `curl`
+requests routed through both the SOCKS5 and HTTP CONNECT proxies return
+`reality tunnel ok`.
 
 ### UDP ASSOCIATE smoke test
 

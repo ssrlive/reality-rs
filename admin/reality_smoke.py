@@ -306,6 +306,23 @@ Examples:
         smoke_response = response.stdout
         print(f'Smoke response: {smoke_response.rstrip()}')
 
+        print('Running HTTP CONNECT smoke request')
+        http_response = subprocess.run(
+            [
+                'curl', '--silent', '--show-error', '--fail', '--proxytunnel',
+                '--proxy', f'http://{client_listen}', '--noproxy', '', target_uri,
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        if http_response.returncode != 0:
+            show_logs(entries)
+            raise RuntimeError('HTTP CONNECT curl probe exited with a non-zero status')
+
+        http_smoke_response = http_response.stdout
+        print(f'HTTP CONNECT response: {http_smoke_response.rstrip()}')
+
         server_host, server_port = split_endpoint(server_listen)
         print(f'Running direct SNI fallback probe to baidu.com on {server_listen}')
         fallback = subprocess.run(
@@ -323,6 +340,9 @@ Examples:
         if smoke_response != 'reality tunnel ok':
             show_logs(entries)
             raise RuntimeError(f'Unexpected response body: {smoke_response}')
+        if http_smoke_response != 'reality tunnel ok':
+            show_logs(entries)
+            raise RuntimeError(f'Unexpected HTTP response body: {http_smoke_response}')
 
         cleanup_message = True
         print('Smoke test passed')

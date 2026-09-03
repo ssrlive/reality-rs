@@ -45,13 +45,13 @@ use socks5_impl::server::auth::NoAuth;
 use socks5_impl::server::connection::{
     ClientConnection as SocksClientConnection, IncomingConnection, associate, connect,
 };
-use socks5_impl::server::{AssociatedUdpSocket, Server, UdpAssociate};
+use socks5_impl::server::{AssociatedUdpSocket, UdpAssociate};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader,
 };
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
 const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 8;
@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
     ));
 
     log::info!(
-        "REALITY+anytls client: SOCKS5 {} -> {} (sni={})",
+        "REALITY+anytls client: mixed SOCKS5/HTTP {} -> {} (sni={})",
         resolved.listen,
         server_addr,
         server_name
@@ -188,14 +188,25 @@ async fn main() -> Result<()> {
         .listen
         .parse()
         .context("parse --listen")?;
-    let socks_server = Server::bind(listen, Arc::new(NoAuth)).await?;
+    let listener = TcpListener::bind(listen).await?;
+    let auth = Arc::new(NoAuth);
 
     loop {
-        let (incoming, peer_addr) = socks_server.accept().await?;
+        let (stream, peer_addr) = listener.accept().await?;
         let anytls_client = anytls_client.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_socks(incoming, anytls_client).await {
-                log::warn!("SOCKS peer {peer_addr} failed: {error:#}");
+            let mut first_byte = [0u8; 1];
+            let result = match stream.peek(&mut first_byte).await {
+                Ok(0) => Ok(()),
+                Ok(_) if first_byte[0] == 0x05 => {
+                    handle_socks(IncomingConnection::new(stream, auth), anytls_client).await
+                }
+                Ok(_) => handle_http_connect(stream, anytls_client).await,
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = result {
+                log::warn!("Proxy peer {peer_addr} failed: {error:#}");
             }
         });
     }
@@ -315,6 +326,104 @@ async fn handle_socks(incoming: IncomingConnection, client: Arc<Client>) -> Resu
         }
         SocksClientConnection::Bind(_, _) => bail!("SOCKS BIND is not supported"),
     }
+}
+
+async fn handle_http_connect(mut stream: TcpStream, client: Arc<Client>) -> Result<()> {
+    let mut request = Vec::new();
+    let read_headers = async {
+        loop {
+            let mut byte = [0u8; 1];
+            let count = stream.read(&mut byte).await?;
+            if count == 0 {
+                bail!("HTTP proxy client closed before sending headers");
+            }
+            request.push(byte[0]);
+            if request.len() > 16 * 1024 {
+                bail!("HTTP proxy request headers are too large");
+            }
+            if request.ends_with(b"\r\n\r\n") || request.ends_with(b"\n\n") {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::time::timeout(Duration::from_secs(10), read_headers)
+        .await
+        .context("HTTP proxy header timeout")??;
+
+    let text = std::str::from_utf8(&request).context("HTTP proxy request is not UTF-8")?;
+    let request_line = text
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("HTTP proxy request is empty"))?;
+    let mut fields = request_line.split_whitespace();
+    let method = fields.next().unwrap_or_default();
+    let target = fields.next().unwrap_or_default();
+    if !method.eq_ignore_ascii_case("CONNECT") {
+        stream
+            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+    let target = Address::try_from(target).context("invalid HTTP CONNECT target")?;
+
+    let session = client.create_stream().await?;
+    session
+        .write(&Vec::<u8>::from(target.clone()))
+        .await?;
+    stream
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+
+    let (mut local_read, mut local_write) = stream.into_split();
+    let session_w = session.clone();
+    let session_r = session.clone();
+    let l2r = tokio::spawn(async move {
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            match local_read.read(&mut buffer).await {
+                Ok(0) => {
+                    let _ = finish_logical_stream(&session_w).await;
+                    break;
+                }
+                Ok(count) => {
+                    if session_w
+                        .write(&buffer[..count])
+                        .await
+                        .is_err()
+                    {
+                        let _ = session_w.terminate().await;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = session_w.terminate().await;
+                    break;
+                }
+            }
+        }
+    });
+    let r2l = tokio::spawn(async move {
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            match session_r.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(count)
+                    if local_write
+                        .write_all(&buffer[..count])
+                        .await
+                        .is_err() =>
+                {
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let _ = local_write.shutdown().await;
+    });
+    let _ = tokio::join!(l2r, r2l);
+    Ok(())
 }
 
 async fn handle_tcp_connect(

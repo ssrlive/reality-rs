@@ -70,8 +70,8 @@ Install complete. Server config: /etc/anyreality/config.toml; client config prin
 anyreality-client --config /your/path/to/anyreality-client-config.toml
 ```
 
-客户端成功连接服务端后， 根据配置里的 `listen = "127.0.0.1:2080"` 参数， 它就是一个监听在 127.0.0.1:2080 的上的 SOCKS5 代理，
-你可以在本地的浏览器里设置 SOCKS5 代理的这个地址， 就可以通过 anyreality 连接到你的目标服务器， 从而访问被 GFW 封锁的网站了。
+客户端成功连接服务端后， 根据配置里的 `listen = "127.0.0.1:2080"` 参数，它会在 127.0.0.1:2080 同时监听 SOCKS5 和 HTTP CONNECT 代理。
+你可以在本地的浏览器里设置 SOCKS5 或 HTTP 代理为这个地址，通过 anyreality 连接到你的目标服务器。
 
 > [!TIP]
 > 如果你在 Windows 上使用 anyreality 客户端， 可以这样在 `powershell` 上运行， 它会安静地呆在后台， 不会弹出黑乎乎的命令行窗口
