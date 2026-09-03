@@ -25,21 +25,14 @@ Enter the listen port for the server (default 443):443
 ```
 
 如果 你不想停下来 输入 域名 和 端口， 也 可以在 命令行里 直接 加入
+
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/ssrlive/reality-rs/main/install/installer.sh) install cn.bing.com 443
 ```
 
-安装完毕后， 这时会在终端显示 客户端的 配置 文件 和 自签名 证书， 像这样
+安装完毕后， 这时会在终端显示 客户端的 配置 文件， 像这样
+
 ```plaintext
-==== CA CERT (/etc/anyreality/ca.crt) ====
-
------BEGIN CERTIFICATE-----
-MIIFHzCCAwegAwIBAgIUeOuljYqqNNxILV1nCdfmMY6rNIowDQYJKoZIhvcNAQEL
-...
-1XFA1grVfQL9tDNMd4RmcavkOKWIw/lp+WMUbB1gve6YIThA1qFyBtR/XLiwI6gd
-08Nqh9tbW8Hqd4WbFWNCdF9DJQ==
------END CERTIFICATE-----
-
 ==== Client config (/etc/anyreality/client-config.toml) ====
 
 [reality]
@@ -59,22 +52,14 @@ minIdleSessions = 5
 [client]
 listen = "127.0.0.1:2080"
 serverAddr = "123.45.67.89:443"
-caFile = "/etc/anyreality/ca.crt"
-insecure = true
 
-Install complete. Server config: /etc/anyreality/config.toml; client config and CA printed above.
+Install complete. Server config: /etc/anyreality/config.toml; client config printed above.
 ```
 
-请将 从 `[reality]` 到 `insecure = true` 的文字复制粘贴并保存到本地的 `anyreality-client-config.toml` 文件里
+请将 从 `[reality]` 到 `serverAddr = "123.45.67.89:443"` 的文字复制粘贴并保存到本地的 `anyreality-client-config.toml` 文件里
 作为 anyreality 客户端的 配置文件。
 
-值得说明的是， 配置里的 `insecure = true` 代表 客户端在连接服务器时 不验证 服务器证书，这为用户带来一定的 便利性。
-
-> [!TIP]
-> 另一方面，由于服务端使用的是未由任何权威机构认证的自签名证书，因此无法通过正常的证书验证流程。这会带来一定安全风险（比如中间人攻击）。
-> 如果你想要更安全的连接， 可以将 `insecure` 设置为 `false`， 并将服务器的自签名证书
-> （上面显示的 `ca.crt` 内容， 从 `-----BEGIN CERTIFICATE-----` 到 `-----END CERTIFICATE-----`）保存到本地，
-> 然后在配置里将 `caFile` 的路径指向这个保存的证书文件(请使用全路径)。 这样客户端在连接服务器时就会验证服务器的证书， 提高安全性。
+客户端使用 REALITY 校验流程验证服务端每连接生成的临时证书。
 
 到 [这里](https://github.com/ssrlive/reality-rs/releases) 下载 anyreality 客户端的二进制文件，
 选择与你的操作系统和 CPU 架构相匹配的版本下载并解压.
@@ -90,6 +75,7 @@ anyreality-client --config /your/path/to/anyreality-client-config.toml
 
 > [!TIP]
 > 如果你在 Windows 上使用 anyreality 客户端， 可以这样在 `powershell` 上运行， 它会安静地呆在后台， 不会弹出黑乎乎的命令行窗口
+>
 > ```powershell
 > Start-Process -FilePath "C:\path\to\anyreality-client.exe" -ArgumentList "--config C:\path\to\anyreality-client-config.toml" -WindowStyle Hidden
 > ```

@@ -42,10 +42,10 @@ use hkdf::Hkdf;
 use rustls::Connection;
 use rustls::ServerConfig;
 use rustls::ServerConnection;
-use rustls::crypto::Identity;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::{ClientHelloVerifier, RealityClientHello};
+use rustls::crypto::SelectedCredential;
+use rustls::server::{
+    ClientHello, ClientHelloVerifier, RealityClientHello, ServerCredentialResolver,
+};
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
@@ -113,17 +113,11 @@ struct ServerAnytlsConfigFile {
 struct ServerRuntimeConfigFile {
     #[serde(default)]
     listen: Option<String>,
-    #[serde(default)]
-    cert: Option<PathBuf>,
-    #[serde(default)]
-    key: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
 struct ServerConfigResolved {
     listen: String,
-    cert: PathBuf,
-    key: PathBuf,
     password: String,
     private_key: String,
     short_id: String,
@@ -135,6 +129,18 @@ struct ServerConfigResolved {
 struct ExampleRealityVerifier {
     inner: Arc<dyn ClientHelloVerifier>,
     server_names: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RejectCredentialResolver;
+
+impl ServerCredentialResolver for RejectCredentialResolver {
+    fn resolve(
+        &self,
+        _client_hello: &ClientHello<'_>,
+    ) -> Result<SelectedCredential, rustls::Error> {
+        Err(rustls::Error::NoSuitableCertificate)
+    }
 }
 
 impl ClientHelloVerifier for ExampleRealityVerifier {
@@ -161,6 +167,14 @@ impl ClientHelloVerifier for ExampleRealityVerifier {
 
         self.inner
             .verify_client_hello(client_hello)
+    }
+
+    fn reality_auth_key(
+        &self,
+        client_hello: &RealityClientHello<'_>,
+    ) -> core::result::Result<Option<[u8; 32]>, rustls::Error> {
+        self.inner
+            .reality_auth_key(client_hello)
     }
 
     fn hash_config(&self, h: &mut dyn Hasher) {
@@ -505,14 +519,6 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
         .listen
         .clone()
         .unwrap_or_else(|| "[::]:443".to_string());
-    let cert = server
-        .cert
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("server.cert must be set in config"))?;
-    let key = server
-        .key
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("server.key must be set in config"))?;
     let password = anytls
         .password
         .clone()
@@ -544,8 +550,6 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
 
     Ok(ServerConfigResolved {
         listen,
-        cert,
-        key,
         password,
         private_key,
         short_id,
@@ -555,27 +559,22 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
 }
 
 fn build_server_config(reality: &ServerConfigResolved) -> Result<ServerConfig> {
-    let certs = CertificateDer::pem_file_iter(&reality.cert)
-        .context("open certificate file")?
-        .collect::<core::result::Result<Vec<_>, _>>()
-        .context("read certificate chain")?;
-    let private_key = PrivateKeyDer::from_pem_file(&reality.key).context("read private key")?;
-
     let provider = provider::reality::default_x25519_tls13_reality_provider();
     let mut config = ServerConfig::builder(Arc::new(provider))
         .with_no_client_auth()
-        .with_single_cert(Arc::new(Identity::from_cert_chain(certs)?), private_key)?;
+        .with_server_credential_resolver(Arc::new(RejectCredentialResolver))?;
 
-    let inner = provider::reality::RealityServerVerifierConfig::from_xray_fields(
+    let reality_config = provider::reality::RealityServerVerifierConfig::from_xray_fields(
         parse_reality_version(&reality.version),
         &reality.short_id,
         &reality.private_key,
-    )?
-    .build_verifier()?;
+    )?;
+    reality_config.install_into(&mut config)?;
+    let verifier = reality_config.build_verifier()?;
     config
         .dangerous()
         .set_reality_client_hello_verifier(Some(Arc::new(ExampleRealityVerifier {
-            inner,
+            inner: verifier,
             server_names: reality.server_names.clone(),
         })));
 
@@ -1034,14 +1033,11 @@ fn is_error_of_session_broken(error: &std::io::Error) -> bool {
 
 // === AsyncRead adapter for AnytlsSession ===
 
+type ReadFut = Box<dyn core::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>;
+
 struct AnytlsStreamReader {
     inner: Arc<AnytlsStream>,
-    #[allow(clippy::type_complexity)]
-    read_fut: Option<
-        core::pin::Pin<
-            Box<dyn core::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>,
-        >,
-    >,
+    read_fut: Option<core::pin::Pin<ReadFut>>,
 }
 
 impl AnytlsStreamReader {

@@ -13,8 +13,6 @@
     },
     "client": {
         "listen": "127.0.0.1:1081",
-        "serverAddr": "127.0.0.1:9445",
-        "caFile": "./bogo/keys/cert.pem",
-        "insecure": true
+        "serverAddr": "127.0.0.1:9445"
     }
 }

@@ -24,8 +24,8 @@ cargo run -p anyreality --bin anyreality-client -- --config ./anyreality/config/
 Both JSON and TOML config files are supported. An equivalent TOML sample is
 available in [config/reality-client.toml](config/reality-client.toml).
 
-The sample config includes the local-only `insecure = true` setting so the
-bundled `bogo/keys/cert.pem` certificate can be used without extra setup.
+The sample config uses the built-in REALITY certificate verification flow;
+the server generates a temporary certificate and key for each connection.
 
 ### Config layout
 
@@ -36,7 +36,7 @@ The sample client config uses three top-level sections:
 - `anytls`: shared AnyTLS settings (`password`, plus the client-side
   session-pool knobs)
 - `client`: client-only runtime defaults such as `listen`, `serverAddr`,
-  `probeProxy`, `caFile`, and `insecure`
+  and `probeProxy`
 
 The binary now reads runtime values from the config file. The CLI only takes
 `--config` and `--log`.
@@ -116,7 +116,7 @@ Default listen address: `[::]:443`.
 ### Quick start
 
 Use the sample config in [config/reality-server.toml](config/reality-server.toml)
-with the local test certificate (run from the repo root):
+(run from the repo root):
 
 ```powershell
 cargo run -p anyreality --bin anyreality-server -- --config ./anyreality/config/reality-server.toml
@@ -132,8 +132,7 @@ The sample server config uses three top-level sections:
 - `reality`: REALITY handshake material (`shortId`, `privateKey`,
   `serverNames`, `version`)
 - `anytls`: shared AnyTLS settings (`password`)
-- `server`: server-only runtime defaults such as `listen`, `cert`, and
-  `key`
+- `server`: server-only runtime defaults such as `listen`
 
 The binary now reads runtime values from the config file. The CLI only takes
 `--config` and `--log`.

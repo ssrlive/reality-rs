@@ -243,8 +243,6 @@ Examples:
             'password = "reality-smoke-password"\n\n'
             '[server]\n'
             f'listen = "{server_listen}"\n'
-            "cert = './bogo/keys/cert.pem'\n"
-            "key = './bogo/keys/key.pem'\n"
         )
 
     with open(client_config_path, 'w', encoding='utf-8') as handle:
@@ -262,8 +260,6 @@ Examples:
             '[client]\n'
             f'listen = "{client_listen}"\n'
             f'serverAddr = "{server_listen}"\n'
-            "caFile = './bogo/keys/cert.pem'\n"
-            'insecure = false\n'
         )
 
     entries = []

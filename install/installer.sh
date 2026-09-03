@@ -151,122 +151,6 @@ generate_reality_keys() {
   fi
 }
 
-generate_cert_for_target_site() {
-  local the_site="$1"
-  local install_dir="$2"
-  if [ -z "$the_site" ]; then
-    echo -e "${Red}generate_cert_for_target_site requires a site argument${ColorOff}" >&2
-    return 1
-  fi
-  mkdir -p "$install_dir"
-  echo -e "${Green}Generating CA and server certificate for $the_site${ColorOff}"
-
-  # If a CA cert/key already exist, ensure they match. If they don't, remove them so
-  # we create a fresh CA (this prevents "CA certificate and CA private key do not match").
-  if [ -f "$install_dir/ca.crt" ] && [ -f "$install_dir/ca.key" ]; then
-    can_read_mods=true
-    cert_mod=$(openssl x509 -noout -modulus -in "$install_dir/ca.crt" 2>/dev/null | openssl md5 2>/dev/null) || can_read_mods=false
-    key_mod=$(openssl rsa -noout -modulus -in "$install_dir/ca.key" 2>/dev/null | openssl md5 2>/dev/null) || can_read_mods=false
-    if [ "$can_read_mods" = false ]; then
-      echo -e "${Yellow}Warning: existing CA files present but could not compute modulus; regenerating CA${ColorOff}" >&2
-      rm -f "$install_dir/ca.crt" "$install_dir/ca.key" "$install_dir/ca.srl" || true
-    elif [ "$cert_mod" != "$key_mod" ]; then
-      echo -e "${Yellow}Warning: existing CA cert and key do not match; regenerating CA${ColorOff}" >&2
-      rm -f "$install_dir/ca.crt" "$install_dir/ca.key" "$install_dir/ca.srl" || true
-    else
-      echo -e "${Green}Found matching existing CA cert/key; reusing${ColorOff}"
-    fi
-  fi
-  openssl genrsa -out "$install_dir/ca.key" 4096 || { echo -e "${Red}Failed to generate CA private key${ColorOff}" >&2; return 1; }
-
-  # Create CA extensions for a v3 CA cert
-  cat > "$install_dir/ca.ext" <<CAEXT
-[ v3_ca ]
-subjectKeyIdentifier=hash
-authorityKeyIdentifier=keyid:always,issuer
-basicConstraints=CA:TRUE
-keyUsage = cRLSign, keyCertSign
-CAEXT
-
-  # Build a minimal openssl config referencing the v3_ca extensions (more compatible)
-  cat > "$install_dir/ca.conf" <<CAREQ
-[ req ]
-default_bits = 4096
-distinguished_name = req_distinguished_name
-x509_extensions = v3_ca
-prompt = no
-
-[ req_distinguished_name ]
-CN = anytls-local-CA
-
-[ v3_ca ]
-subjectKeyIdentifier=hash
-authorityKeyIdentifier=keyid:always,issuer
-basicConstraints=CA:TRUE
-keyUsage = cRLSign, keyCertSign
-CAREQ
-
-  if ! openssl req -x509 -new -nodes -key "$install_dir/ca.key" -sha256 -days 3650 \
-    -config "$install_dir/ca.conf" -out "$install_dir/ca.crt" 2>"$install_dir/ca_gen.err"; then
-    echo -e "${Red}Failed to generate CA certificate; openssl stderr:${ColorOff}" >&2
-    sed -n '1,200p' "$install_dir/ca_gen.err" >&2 || true
-    rm -f "$install_dir/ca_gen.err"
-    return 1
-  fi
-
-  # Verify CA cert exists
-  if [ ! -s "$install_dir/ca.crt" ]; then
-    echo -e "${Red}CA certificate missing after creation: $install_dir/ca.crt${ColorOff}" >&2
-    return 1
-  fi
-
-  openssl genrsa -out "$install_dir/server.key" 2048 || { echo -e "${Red}Failed to generate server private key${ColorOff}" >&2; return 1; }
-  if ! openssl req -new -key "$install_dir/server.key" -subj "/CN=$the_site" -out "$install_dir/server.csr" 2>"$install_dir/server_csr.err"; then
-    echo -e "${Red}Failed to generate server CSR; openssl stderr:${ColorOff}" >&2
-    sed -n '1,200p' "$install_dir/server_csr.err" >&2 || true
-    rm -f "$install_dir/server_csr.err"
-    return 1
-  fi
-
-  # Create server certificate extensions (v3) including SAN
-  cat > "$install_dir/server.ext" <<SRVEXT
-[ v3_req ]
-authorityKeyIdentifier=keyid,issuer
-basicConstraints=CA:FALSE
-keyUsage = digitalSignature, keyEncipherment
-extendedKeyUsage = serverAuth
-subjectAltName = DNS:$the_site
-SRVEXT
-
-  if ! openssl x509 -req -in "$install_dir/server.csr" -CA "$install_dir/ca.crt" -CAkey "$install_dir/ca.key" -CAcreateserial -out "$install_dir/server.crt" -days 365 -sha256 -extfile "$install_dir/server.ext" -extensions v3_req 2>"$install_dir/server_sign.err"; then
-    echo -e "${Red}Failed to sign server certificate; openssl stderr:${ColorOff}" >&2
-    sed -n '1,200p' "$install_dir/server_sign.err" >&2 || true
-    rm -f "$install_dir/server_sign.err"
-    return 1
-  fi
-  rm -f "$install_dir/ca.srl" || true
-
-  # Ensure server cert was created and is non-empty
-  if [ ! -s "$install_dir/server.crt" ]; then
-    echo -e "${Red}Error: server certificate not created or empty: $install_dir/server.crt${ColorOff}" >&2
-    return 1
-  fi
-
-  # Many TLS stacks expect the cert file to contain the full chain (server cert followed by CA cert)
-  # Append CA cert to server.crt to produce a chain file.
-  if [ -s "$install_dir/ca.crt" ]; then
-    cat "$install_dir/ca.crt" >> "$install_dir/server.crt" || true
-  else
-    echo -e "${Yellow}Warning: CA cert missing: $install_dir/ca.crt${ColorOff}" >&2
-  fi
-
-  chmod 0644 "$install_dir/server.crt" || true
-  chmod 0600 "$install_dir/server.key" || true
-  chmod 0644 "$install_dir/ca.crt" || true
-
-  echo -e "${Green}Wrote CA and server cert/key to $install_dir${ColorOff}"
-}
-
 write_server_config() {
   local the_site="$1"
   local listen_port="$2"
@@ -285,8 +169,6 @@ password = "$anytls_password"
 
 [server]
 listen = "0.0.0.0:${listen_port}"
-cert = "$INSTALL_DIR/server.crt"
-key = "$INSTALL_DIR/server.key"
 EOF
   echo -e "${Green}Wrote server config: $SERVER_CONFIG${ColorOff}"
 }
@@ -314,8 +196,6 @@ minIdleSessions = 5
 [client]
 listen = "127.0.0.1:2080"
 serverAddr = "${hostaddr}:${the_port}"
-caFile = "$INSTALL_DIR/ca.crt"
-insecure = true
 EOF
   echo -e "${Green}Wrote client config: $CLIENT_OUT${ColorOff}"
 }
@@ -386,9 +266,6 @@ install_anyreality_all() {
   anytls_password=$(generate_anytls_password)
   mkdir -p "$INSTALL_DIR"
 
-  # generate certs
-  generate_cert_for_target_site "$TARGET_SITE" "$INSTALL_DIR" || { echo -e "${Red}Certificate generation failed${ColorOff}" >&2; exit 1; }
-
   # write configs
   write_server_config "$TARGET_SITE" "$LISTEN_PORT"
   write_client_config "$TARGET_SITE" "$LISTEN_PORT"
@@ -401,14 +278,12 @@ install_anyreality_all() {
     echo -e "  ${Yellow}$BIN_DIR/$BIN_FILE --config $SERVER_CONFIG${ColorOff}" >&2
   fi
 
-  # Print client config and CA to terminal for easy copy/paste
-  echo -e "${Green}\n==== CA CERT ($INSTALL_DIR/ca.crt) ====\n${ColorOff}"
-  cat "$INSTALL_DIR/ca.crt" || true
+  # Print client config to terminal for easy copy/paste
   CLIENT_OUT="$INSTALL_DIR/client-config.toml"
   echo -e "${Green}\n==== Client config ($CLIENT_OUT) ====\n${ColorOff}"
   cat "$CLIENT_OUT" || true
 
-  echo -e "${Green}\nInstall complete. Server config: $SERVER_CONFIG; client config and CA printed above.\n${ColorOff}"
+  echo -e "${Green}\nInstall complete. Server config: $SERVER_CONFIG; client config printed above.\n${ColorOff}"
 }
 
 uninstall_all() {

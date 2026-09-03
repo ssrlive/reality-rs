@@ -36,13 +36,7 @@ use rustls::ClientConfig;
 use rustls::Connection;
 use rustls::RootCertStore;
 use rustls::client::Resumption;
-use rustls::client::danger::{
-    HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
-    SignatureVerificationInput,
-};
-use rustls::crypto::SignatureScheme;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::ServerName;
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
@@ -120,10 +114,6 @@ struct ClientRuntimeConfigFile {
     server_addr: Option<String>,
     #[serde(default)]
     probe_proxy: Option<SocketAddr>,
-    #[serde(default)]
-    ca_file: Option<PathBuf>,
-    #[serde(default)]
-    insecure: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,8 +121,6 @@ struct RealityClientConfigResolved {
     listen: String,
     server_addr: String,
     probe_proxy: Option<SocketAddr>,
-    ca_file: Option<PathBuf>,
-    insecure: bool,
     password: String,
     idle_check_secs: u64,
     idle_timeout_secs: u64,
@@ -141,52 +129,6 @@ struct RealityClientConfigResolved {
     short_id: String,
     version: String,
     server_name: String,
-}
-
-#[derive(Debug)]
-struct NoCertificateVerification;
-
-impl ServerVerifier for NoCertificateVerification {
-    fn verify_identity(
-        &self,
-        _identity: &ServerIdentity<'_>,
-    ) -> core::result::Result<PeerVerified, rustls::Error> {
-        Ok(PeerVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _input: &SignatureVerificationInput<'_>,
-    ) -> core::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _input: &SignatureVerificationInput<'_>,
-    ) -> core::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-        ]
-    }
-
-    fn request_ocsp_response(&self) -> bool {
-        false
-    }
-
-    fn hash_config(&self, _: &mut dyn core::hash::Hasher) {}
 }
 
 #[derive(Clone)]
@@ -622,16 +564,6 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
         .server_addr
         .clone()
         .ok_or_else(|| anyhow!("client.serverAddr must be set in config"))?;
-    let mut ca_file = client.ca_file.clone();
-    let insecure = client.insecure.unwrap_or(false);
-    if insecure && ca_file.is_some() {
-        // If insecure mode is requested we must not attempt to load the CA file
-        // (verification is disabled). Clear the ca_file so load_root_store
-        // won't try to open a missing file and will use system roots instead.
-        log::debug!("'insecure = true' set in client config; ignoring provided ca_file");
-        ca_file = None;
-    }
-
     let password = anytls
         .password
         .clone()
@@ -668,8 +600,6 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
         listen,
         server_addr,
         probe_proxy: client.probe_proxy,
-        ca_file,
-        insecure,
         password,
         idle_check_secs,
         idle_timeout_secs,
@@ -682,24 +612,12 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
 }
 
 fn build_client_config(args: &RealityClientConfigResolved) -> Result<ClientConfig> {
-    let provider = provider::reality::default_x25519_tls13_reality_provider();
-    let root_store = load_root_store(args.ca_file.as_deref())?;
-
-    let mut config = ClientConfig::builder(Arc::new(provider))
-        .with_root_certificates(root_store)
-        .with_no_client_auth()?;
-
-    if args.insecure {
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(NoCertificateVerification));
-    }
-
-    provider::reality::install_reality_session_id_generator_from_xray_fields(
-        &mut config,
+    let root_store = load_root_store();
+    let mut config = provider::reality::build_reality_client_config_from_xray_fields(
         parse_reality_version(&args.version),
         &args.short_id,
         &args.public_key,
+        root_store,
     )?;
 
     // REALITY carriers are short-lived and heavily concurrent here; disabling
@@ -710,26 +628,14 @@ fn build_client_config(args: &RealityClientConfigResolved) -> Result<ClientConfi
     Ok(config)
 }
 
-fn load_root_store(ca_file: Option<&Path>) -> Result<RootCertStore> {
+fn load_root_store() -> RootCertStore {
     let mut root_store = RootCertStore::empty();
-
-    if let Some(ca_file) = ca_file {
-        let certs = CertificateDer::pem_file_iter(ca_file)
-            .context("open CA file")?
-            .collect::<core::result::Result<Vec<_>, _>>()
-            .context("read CA certificates")?;
-        for cert in certs {
-            root_store.add(cert)?;
-        }
-    } else {
-        root_store.extend(
-            webpki_roots::TLS_SERVER_ROOTS
-                .iter()
-                .cloned(),
-        );
-    }
-
-    Ok(root_store)
+    root_store.extend(
+        webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .cloned(),
+    );
+    root_store
 }
 
 fn load_client_config_file(path: &Path) -> Result<ClientConfigFile> {
