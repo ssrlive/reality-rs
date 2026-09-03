@@ -133,7 +133,18 @@ where
                     tls_eof = true;
                 }
             }
-            let _ = tls.flush();
+            match tls.flush() {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        if app_eof && app_to_tls.is_empty() {
+            let _ = tls
+                .sock
+                .shutdown(std::net::Shutdown::Both);
+            break;
         }
 
         if tls_eof && tls_to_app.is_empty() && app_to_tls.is_empty() {

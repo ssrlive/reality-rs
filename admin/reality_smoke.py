@@ -313,7 +313,7 @@ Examples:
         server_host, server_port = split_endpoint(server_listen)
         print(f'Running direct SNI fallback probe to baidu.com on {server_listen}')
         fallback = subprocess.run(
-            ['curl', '--silent', '--show-error', '-k', '--resolve', f'baidu.com:{server_port}:{server_host}', f'https://baidu.com:{server_port}/'],
+            ['curl', '--silent', '--show-error', '--fail', '--resolve', f'baidu.com:{server_port}:{server_host}', f'https://baidu.com:{server_port}/'],
             cwd=repo_root,
             capture_output=True,
             text=True,
