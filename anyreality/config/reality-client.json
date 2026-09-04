@@ -3,7 +3,8 @@
         "shortId": "aabbcc",
         "publicKey": "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg",
         "version": "010203",
-        "serverName": "test"
+        "serverName": "test",
+        "clientHelloProfile": "chrome"
     },
     "anytls": {
         "clientId": null,

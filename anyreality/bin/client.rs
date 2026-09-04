@@ -35,7 +35,7 @@ use core::time::Duration;
 use rustls::ClientConfig;
 use rustls::Connection;
 use rustls::RootCertStore;
-use rustls::client::Resumption;
+use rustls::client::{ClientHelloProfile, Resumption};
 use rustls::pki_types::ServerName;
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
@@ -90,6 +90,8 @@ struct ClientRealityConfigFile {
     version: Option<String>,
     #[serde(default)]
     server_name: Option<String>,
+    #[serde(default)]
+    client_hello_profile: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
@@ -135,6 +137,7 @@ struct RealityClientConfigResolved {
     short_id: String,
     version: String,
     server_name: String,
+    client_hello_profile: ClientHelloProfile,
 }
 
 #[derive(Clone)]
@@ -722,6 +725,13 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
         .server_name
         .clone()
         .ok_or_else(|| anyhow!("reality.serverName must be set in config"))?;
+    let client_hello_profile = match reality.client_hello_profile.as_deref() {
+        None | Some("default") => ClientHelloProfile::Default,
+        Some("chrome") => ClientHelloProfile::Chrome,
+        Some("firefox") => ClientHelloProfile::Firefox,
+        Some("safari") => ClientHelloProfile::Safari,
+        Some(value) => bail!("unsupported reality.clientHelloProfile: {value}"),
+    };
 
     Ok(RealityClientConfigResolved {
         listen,
@@ -737,6 +747,7 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
         public_key,
         version,
         server_name,
+        client_hello_profile,
     })
 }
 
@@ -753,6 +764,7 @@ fn build_client_config(args: &RealityClientConfigResolved) -> Result<ClientConfi
     // TLS resumption avoids resumed handshakes tearing down some fresh
     // carriers under burst load.
     config.resumption = Resumption::disabled();
+    config.client_hello_profile = args.client_hello_profile;
 
     Ok(config)
 }

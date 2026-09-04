@@ -60,6 +60,9 @@ use crate::{DistinguishedName, DynHasher, KeyLog, compress, verify};
 /// [`RootCertStore`]: crate::RootCertStore
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
+    /// Browser-shaped ordering and selection for the outgoing ClientHello.
+    pub client_hello_profile: ClientHelloProfile,
+
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.
     pub alpn_protocols: Vec<ApplicationProtocol<'static>>,
@@ -175,6 +178,123 @@ pub struct ClientConfig {
 
     /// How to offer Encrypted Client Hello (ECH). The default is to not offer ECH.
     pub(super) ech_mode: Option<EchMode>,
+}
+
+/// A conservative browser ClientHello profile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClientHelloProfile {
+    /// Use the provider and verifier defaults.
+    #[default]
+    Default,
+    /// Current Chrome-like ordering.
+    Chrome,
+    /// Current Firefox-like ordering.
+    Firefox,
+    /// Current Safari-like ordering.
+    Safari,
+}
+
+impl ClientHelloProfile {
+    pub(crate) fn cipher_suites(self) -> &'static [CipherSuite] {
+        match self {
+            Self::Default => &[],
+            Self::Chrome | Self::Safari => &[
+                CipherSuite::TLS13_AES_128_GCM_SHA256,
+                CipherSuite::TLS13_AES_256_GCM_SHA384,
+                CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            ],
+            Self::Firefox => &[
+                CipherSuite::TLS13_AES_128_GCM_SHA256,
+                CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+                CipherSuite::TLS13_AES_256_GCM_SHA384,
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            ],
+        }
+    }
+
+    pub(crate) fn named_groups(self) -> &'static [NamedGroup] {
+        match self {
+            Self::Default => &[],
+            Self::Chrome => &[NamedGroup::X25519, NamedGroup::secp256r1],
+            Self::Firefox => &[
+                NamedGroup::X25519,
+                NamedGroup::secp256r1,
+                NamedGroup::secp384r1,
+            ],
+            Self::Safari => &[NamedGroup::X25519, NamedGroup::secp256r1],
+        }
+    }
+
+    pub(crate) fn signature_schemes(self) -> &'static [SignatureScheme] {
+        match self {
+            Self::Default => &[],
+            Self::Chrome | Self::Safari => &[
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::ED25519,
+            ],
+            Self::Firefox => &[
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::ED25519,
+            ],
+        }
+    }
+
+    pub(crate) fn extension_order(self) -> &'static [crate::msgs::ExtensionType] {
+        use crate::msgs::ExtensionType;
+        match self {
+            Self::Default => &[],
+            Self::Chrome => &[
+                ExtensionType::ServerName,
+                ExtensionType::ExtendedMasterSecret,
+                ExtensionType::EllipticCurves,
+                ExtensionType::ECPointFormats,
+                ExtensionType::SignatureAlgorithms,
+                ExtensionType::ALProtocolNegotiation,
+                ExtensionType::StatusRequest,
+                ExtensionType::SupportedVersions,
+                ExtensionType::PSKKeyExchangeModes,
+                ExtensionType::KeyShare,
+            ],
+            Self::Firefox => &[
+                ExtensionType::ServerName,
+                ExtensionType::StatusRequest,
+                ExtensionType::EllipticCurves,
+                ExtensionType::ECPointFormats,
+                ExtensionType::SignatureAlgorithms,
+                ExtensionType::ALProtocolNegotiation,
+                ExtensionType::SupportedVersions,
+                ExtensionType::PSKKeyExchangeModes,
+                ExtensionType::KeyShare,
+            ],
+            Self::Safari => &[
+                ExtensionType::ServerName,
+                ExtensionType::EllipticCurves,
+                ExtensionType::ECPointFormats,
+                ExtensionType::SignatureAlgorithms,
+                ExtensionType::ALProtocolNegotiation,
+                ExtensionType::SupportedVersions,
+                ExtensionType::PSKKeyExchangeModes,
+                ExtensionType::KeyShare,
+            ],
+        }
+    }
 }
 
 impl ClientConfig {
@@ -884,6 +1004,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
 
         let require_ems = !matches!(self.provider.fips(), FipsStatus::Unvalidated);
         Ok(ClientConfig {
+            client_hello_profile: ClientHelloProfile::default(),
             alpn_protocols: Vec::new(),
             check_selected_alpn: true,
             resumption: Resumption::default(),

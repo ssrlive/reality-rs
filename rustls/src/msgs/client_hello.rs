@@ -243,6 +243,15 @@ extension_struct! {
 }
 
 impl ClientExtensions<'_> {
+    pub(crate) fn set_extension_order(&mut self, preferred: &[ExtensionType]) {
+        let used = self.collect_used();
+        self.contiguous_extensions = preferred
+            .iter()
+            .copied()
+            .filter(|extension| used.contains(extension))
+            .collect();
+    }
+
     pub(crate) fn into_owned(self) -> ClientExtensions<'static> {
         let Self {
             server_name,

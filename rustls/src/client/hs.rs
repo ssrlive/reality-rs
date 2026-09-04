@@ -577,22 +577,56 @@ fn emit_client_hello_for_retry(
         },
         // offer groups which are usable for any offered version
         named_groups: Some(
-            config
-                .provider()
-                .kx_groups
-                .iter()
-                .filter_map(|skxg| {
-                    let named_group = skxg.name();
-                    supported_versions
-                        .any(|v| named_group.usable_for_version(v))
-                        .then_some(named_group)
-                })
-                .collect(),
+            match config
+                .client_hello_profile
+                .named_groups()
+            {
+                [] => config
+                    .provider()
+                    .kx_groups
+                    .iter()
+                    .filter_map(|skxg| {
+                        let named_group = skxg.name();
+                        supported_versions
+                            .any(|v| named_group.usable_for_version(v))
+                            .then_some(named_group)
+                    })
+                    .collect(),
+                preferred => preferred
+                    .iter()
+                    .filter(|named_group| {
+                        config
+                            .provider()
+                            .kx_groups
+                            .iter()
+                            .any(|skxg| {
+                                skxg.name() == **named_group
+                                    && supported_versions.any(|v| named_group.usable_for_version(v))
+                            })
+                    })
+                    .copied()
+                    .collect(),
+            },
         ),
         signature_schemes: Some(
-            config
-                .verifier()
-                .supported_verify_schemes(),
+            match config
+                .client_hello_profile
+                .signature_schemes()
+            {
+                [] => config
+                    .verifier()
+                    .supported_verify_schemes(),
+                preferred => preferred
+                    .iter()
+                    .copied()
+                    .filter(|scheme| {
+                        config
+                            .verifier()
+                            .supported_verify_schemes()
+                            .contains(scheme)
+                    })
+                    .collect(),
+            },
         ),
         protocols: extra_exts.protocols.clone(),
         extended_master_secret_request: Some(()),
@@ -725,18 +759,39 @@ fn emit_client_hello_for_retry(
         _ => (None, false),
     };
 
+    exts.set_extension_order(
+        config
+            .client_hello_profile
+            .extension_order(),
+    );
+
     // Extensions MAY be randomized
     // but they also need to keep the same order as the previous ClientHello
     exts.order_seed = input.hello.extension_order_seed;
 
-    let mut cipher_suites: Vec<_> = config
-        .provider()
-        .iter_cipher_suites()
-        .filter_map(|cs| match cs.usable_for_protocol(input.protocol) {
-            true => Some(cs.suite()),
-            false => None,
-        })
-        .collect();
+    let mut cipher_suites: Vec<_> = match config
+        .client_hello_profile
+        .cipher_suites()
+    {
+        [] => config
+            .provider()
+            .iter_cipher_suites()
+            .filter_map(|cs| {
+                cs.usable_for_protocol(input.protocol)
+                    .then_some(cs.suite())
+            })
+            .collect(),
+        preferred => preferred
+            .iter()
+            .copied()
+            .filter(|suite| {
+                config
+                    .provider()
+                    .iter_cipher_suites()
+                    .any(|cs| cs.suite() == *suite && cs.usable_for_protocol(input.protocol))
+            })
+            .collect(),
+    };
 
     if supported_versions.tls12 {
         // We don't do renegotiation at all, in fact.
