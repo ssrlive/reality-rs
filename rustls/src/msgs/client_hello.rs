@@ -254,7 +254,13 @@ impl ClientExtensions<'_> {
         }
         self.contiguous_extensions = preferred
             .iter()
-            .copied()
+            .filter_map(|extension| {
+                if extension.is_grease() {
+                    self.grease_extension
+                } else {
+                    Some(*extension)
+                }
+            })
             .filter(|extension| used.contains(extension))
             .collect();
     }
@@ -323,10 +329,6 @@ impl ClientExtensions<'_> {
     pub(crate) fn used_extensions_in_encoding_order(&self) -> Vec<ExtensionType> {
         let mut exts = self.order_insensitive_extensions_in_random_order();
         exts.extend(&self.contiguous_extensions);
-
-        if let Some(grease) = self.grease_extension {
-            exts.push(grease);
-        }
 
         if self
             .encrypted_client_hello_outer

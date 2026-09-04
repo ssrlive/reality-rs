@@ -466,6 +466,30 @@ fn client_extensions_ordering() {
 }
 
 #[test]
+fn test_dynamic_grease_extension_order() {
+    let grease = ExtensionType(0x3a3a);
+    let mut extensions = ClientExtensions {
+        server_name: Some(ServerNamePayload::from(
+            &DnsName::try_from("hello").unwrap(),
+        )),
+        grease_extension: Some(grease),
+        ..Default::default()
+    };
+
+    extensions.set_extension_order(&[ExtensionType::ServerName, ExtensionType::GREASE]);
+    let order = extensions.used_extensions_in_encoding_order();
+
+    assert_eq!(order, vec![ExtensionType::ServerName, grease]);
+    assert_eq!(
+        order
+            .iter()
+            .filter(|extension| **extension == grease)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn test_truncated_psk_offer() {
     let ext = PresharedKeyOffer {
         identities: vec![PresharedKeyIdentity::new(vec![3, 4, 5], 123456)],
