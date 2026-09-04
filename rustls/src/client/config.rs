@@ -263,6 +263,7 @@ impl ClientHelloProfile {
             Self::Default => &[],
             Self::Chrome => &[
                 ExtensionType::ServerName,
+                ExtensionType::GREASE,
                 ExtensionType::ExtendedMasterSecret,
                 ExtensionType::EllipticCurves,
                 ExtensionType::ECPointFormats,
@@ -275,6 +276,7 @@ impl ClientHelloProfile {
             ],
             Self::Firefox => &[
                 ExtensionType::ServerName,
+                ExtensionType::GREASE,
                 ExtensionType::StatusRequest,
                 ExtensionType::EllipticCurves,
                 ExtensionType::ECPointFormats,
@@ -286,6 +288,7 @@ impl ClientHelloProfile {
             ],
             Self::Safari => &[
                 ExtensionType::ServerName,
+                ExtensionType::GREASE,
                 ExtensionType::EllipticCurves,
                 ExtensionType::ECPointFormats,
                 ExtensionType::SignatureAlgorithms,

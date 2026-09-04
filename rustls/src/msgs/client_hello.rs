@@ -234,21 +234,24 @@ extension_struct! {
         ExtensionType::EncryptedClientHelloOuterExtensions =>
             pub(crate) encrypted_client_hello_outer: Option<Vec<ExtensionType>>,
 
-        /// A GREASE extension (RFC 8701).
-        ExtensionType::GREASE =>
-            pub(crate) grease: Option<()>,
     } + {
         /// Order randomization seed.
         pub(crate) order_seed: u16,
 
         /// Extensions that must appear contiguously.
         pub(crate) contiguous_extensions: Vec<ExtensionType>,
+
+        /// The per-ClientHello GREASE extension type, when enabled.
+        pub(crate) grease_extension: Option<ExtensionType>,
     }
 }
 
 impl ClientExtensions<'_> {
     pub(crate) fn set_extension_order(&mut self, preferred: &[ExtensionType]) {
-        let used = self.collect_used();
+        let mut used = self.collect_used();
+        if let Some(grease) = self.grease_extension {
+            used.push(grease);
+        }
         self.contiguous_extensions = preferred
             .iter()
             .copied()
@@ -280,9 +283,9 @@ impl ClientExtensions<'_> {
             renegotiation_info,
             encrypted_client_hello,
             encrypted_client_hello_outer,
-            grease,
             order_seed,
             contiguous_extensions,
+            grease_extension,
         } = self;
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
@@ -311,15 +314,19 @@ impl ClientExtensions<'_> {
             renegotiation_info: renegotiation_info.map(|x| x.into_owned()),
             encrypted_client_hello,
             encrypted_client_hello_outer,
-            grease,
             order_seed,
             contiguous_extensions,
+            grease_extension,
         }
     }
 
     pub(crate) fn used_extensions_in_encoding_order(&self) -> Vec<ExtensionType> {
         let mut exts = self.order_insensitive_extensions_in_random_order();
         exts.extend(&self.contiguous_extensions);
+
+        if let Some(grease) = self.grease_extension {
+            exts.push(grease);
+        }
 
         if self
             .encrypted_client_hello_outer
@@ -351,6 +358,9 @@ impl ClientExtensions<'_> {
     ///   are required to be last by the standard.
     fn order_insensitive_extensions_in_random_order(&self) -> Vec<ExtensionType> {
         let mut order = self.collect_used();
+        if let Some(grease) = self.grease_extension {
+            order.push(grease);
+        }
 
         // Remove extensions which have specific order requirements.
         order.retain(|ext| {
@@ -381,7 +391,12 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
 
         let body = LengthPrefixedBuffer::new(ListLength::U16, bytes);
         for item in order {
-            self.encode_one(item, body.buf);
+            if self.grease_extension == Some(item) {
+                item.encode(body.buf);
+                ().encode(LengthPrefixedBuffer::new(ListLength::U16, body.buf).buf);
+            } else {
+                self.encode_one(item, body.buf);
+            }
         }
     }
 

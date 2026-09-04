@@ -543,6 +543,11 @@ impl ClientHelloInput {
 ///
 /// `retryreq` and `suite` are `None` if this is the initial
 /// ClientHello.
+fn grease_value(secure_random: &dyn crate::crypto::SecureRandom) -> Result<u16, Error> {
+    let nibble = rand::random_u16(secure_random)? & 0x000f;
+    Ok(nibble * 0x1010 + 0x0a0a)
+}
+
 fn emit_client_hello_for_retry(
     mut transcript_buffer: HandshakeHashBuffer,
     retryreq: Option<&HelloRetryRequest>,
@@ -555,6 +560,11 @@ fn emit_client_hello_for_retry(
     mut ech_status: EchStatus,
 ) -> Result<ClientState, Error> {
     let config = &input.config;
+    let grease = config
+        .client_hello_profile
+        .uses_grease()
+        .then(|| grease_value(config.provider().secure_random))
+        .transpose()?;
     // Defense in depth: the ECH state should be None if ECH is disabled based on config
     // builder semantics.
     let forbids_tls12 = input.protocol.is_quic() || ech_state.is_some();
@@ -605,12 +615,7 @@ fn emit_client_hello_for_retry(
                             })
                     })
                     .copied()
-                    .chain(
-                        config
-                            .client_hello_profile
-                            .uses_grease()
-                            .then_some(NamedGroup(0x0a0a)),
-                    )
+                    .chain(grease.map(NamedGroup))
                     .collect(),
             },
         ),
@@ -644,7 +649,7 @@ fn emit_client_hello_for_retry(
         .client_hello_profile
         .uses_grease()
     {
-        exts.grease = Some(());
+        exts.grease_extension = Some(ExtensionType(grease.expect("GREASE value is present")));
     }
 
     if let Some(TransportParameters::Quic(v)) = &extra_exts.transport_parameters {
@@ -810,7 +815,7 @@ fn emit_client_hello_for_retry(
         .client_hello_profile
         .uses_grease()
     {
-        cipher_suites.insert(0, CipherSuite(0x0a0a));
+        cipher_suites.insert(0, CipherSuite(grease.expect("GREASE value is present")));
     }
 
     if supported_versions.tls12 {
