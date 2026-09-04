@@ -16,7 +16,7 @@ use crate::check::inappropriate_handshake_message;
 use crate::common_state::{EarlyDataEvent, Event, Output, OutputEvent, Protocol};
 use crate::conn::{Input, StateMachine};
 use crate::crypto::cipher::Payload;
-use crate::crypto::kx::{KeyExchangeAlgorithm, StartedKeyExchange, SupportedKxGroup};
+use crate::crypto::kx::{KeyExchangeAlgorithm, NamedGroup, StartedKeyExchange, SupportedKxGroup};
 use crate::crypto::{CipherSuite, CryptoProvider, rand};
 use crate::enums::{
     ApplicationProtocol, CertificateType, ContentType, HandshakeType, ProtocolVersion,
@@ -605,6 +605,12 @@ fn emit_client_hello_for_retry(
                             })
                     })
                     .copied()
+                    .chain(
+                        config
+                            .client_hello_profile
+                            .uses_grease()
+                            .then_some(NamedGroup(0x0a0a)),
+                    )
                     .collect(),
             },
         ),
@@ -633,6 +639,13 @@ fn emit_client_hello_for_retry(
         supported_versions: Some(supported_versions),
         ..Default::default()
     });
+
+    if config
+        .client_hello_profile
+        .uses_grease()
+    {
+        exts.grease = Some(());
+    }
 
     if let Some(TransportParameters::Quic(v)) = &extra_exts.transport_parameters {
         exts.transport_parameters = Some(v.clone());
@@ -792,6 +805,13 @@ fn emit_client_hello_for_retry(
             })
             .collect(),
     };
+
+    if config
+        .client_hello_profile
+        .uses_grease()
+    {
+        cipher_suites.insert(0, CipherSuite(0x0a0a));
+    }
 
     if supported_versions.tls12 {
         // We don't do renegotiation at all, in fact.

@@ -32,7 +32,7 @@ the server generates a temporary certificate and key for each connection.
 The sample client config uses three top-level sections:
 
 - `reality`: REALITY handshake material (`shortId`, `publicKey`,
-  `serverName`, `version`)
+  `serverName`, `version`, and optional `clientHelloProfile`)
 - `anytls`: shared AnyTLS settings (`password`, plus the client-side
   session-pool knobs)
 - `client`: client-only runtime defaults such as `listen`, `serverAddr`,
@@ -49,11 +49,18 @@ knobs:
 | Field                  | Default  | Description                                                             |
 | ---------------------- | -------- | ----------------------------------------------------------------------- |
 | `password`             | required | AnyTLS shared password                                                  |
-| `clientId`             | omitted  | Reserved client identity value; not functionality yet                   |
+| `clientId`             | omitted  | Optional UUID sent in the AnyTLS authentication padding                 |
 | `idleCheckSecs`        | 30       | How often to reap idle AnyTLS sessions                                  |
 | `idleTimeoutSecs`      | 30       | Idle session lifetime before close                                      |
 | `minIdleSessions`      | 0        | Minimum warm idle sessions to keep                                      |
 | `maxStreamsPerSession` | 8        | Maximum logical streams per session; set to `1` to disable multiplexing |
+
+### ClientHello profiles
+
+Set `reality.clientHelloProfile` to `chrome`, `firefox`, or `safari` to use a
+browser-like ClientHello ordering with RFC 8701 GREASE values. These are
+anti-fingerprinting profiles, not byte-for-byte or version-specific browser
+clones. Omit the field or use `default` to retain the provider defaults.
 
 ### Probe proxy
 

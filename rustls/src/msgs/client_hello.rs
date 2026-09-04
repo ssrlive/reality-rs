@@ -233,6 +233,10 @@ extension_struct! {
         /// Encrypted client hello outer extensions (RFC 9849)
         ExtensionType::EncryptedClientHelloOuterExtensions =>
             pub(crate) encrypted_client_hello_outer: Option<Vec<ExtensionType>>,
+
+        /// A GREASE extension (RFC 8701).
+        ExtensionType::GREASE =>
+            pub(crate) grease: Option<()>,
     } + {
         /// Order randomization seed.
         pub(crate) order_seed: u16,
@@ -276,6 +280,7 @@ impl ClientExtensions<'_> {
             renegotiation_info,
             encrypted_client_hello,
             encrypted_client_hello_outer,
+            grease,
             order_seed,
             contiguous_extensions,
         } = self;
@@ -306,6 +311,7 @@ impl ClientExtensions<'_> {
             renegotiation_info: renegotiation_info.map(|x| x.into_owned()),
             encrypted_client_hello,
             encrypted_client_hello_outer,
+            grease,
             order_seed,
             contiguous_extensions,
         }

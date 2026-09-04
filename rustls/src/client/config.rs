@@ -182,6 +182,7 @@ pub struct ClientConfig {
 
 /// A conservative browser ClientHello profile.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ClientHelloProfile {
     /// Use the provider and verifier defaults.
     #[default]
@@ -294,6 +295,10 @@ impl ClientHelloProfile {
                 ExtensionType::KeyShare,
             ],
         }
+    }
+
+    pub(crate) fn uses_grease(self) -> bool {
+        !matches!(self, Self::Default)
     }
 }
 

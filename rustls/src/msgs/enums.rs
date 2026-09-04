@@ -84,6 +84,9 @@ enum_builder! {
 }
 
 impl ExtensionType {
+    /// The reserved GREASE extension value from RFC 8701.
+    pub(crate) const GREASE: Self = Self(0x0a0a);
+
     /// Returns true if the extension type can be compressed in an "inner" client hello for ECH.
     ///
     /// This function should only return true for extension types where the inner hello and outer
