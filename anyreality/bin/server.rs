@@ -971,7 +971,9 @@ fn parse_reality_version(version: &str) -> [u8; 3] {
     let mut parsed = [0u8; 3];
     for (index, chunk) in version
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .enumerate()
     {
         parsed[index] = parse_hex_byte(chunk[0], chunk[1]);
@@ -1015,7 +1017,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>> {
     }
 
     let mut bytes = Vec::with_capacity(input.len() / 2);
-    for chunk in input.as_bytes().chunks_exact(2) {
+    for chunk in input.as_bytes().as_chunks::<2>().0 {
         bytes.push(parse_hex_byte(chunk[0], chunk[1]));
     }
     Ok(bytes)

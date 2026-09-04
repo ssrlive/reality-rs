@@ -1479,7 +1479,9 @@ fn parse_reality_short_id_prefix(short_id: &str) -> Option<[u8; 8]> {
     let mut parsed = [0u8; 8];
     for (index, chunk) in short_id
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .enumerate()
     {
         parsed[index] = parse_hex_byte_checked(chunk[0], chunk[1])?;
@@ -1635,7 +1637,9 @@ fn parse_reality_version_checked(version: &str) -> Option<[u8; 3]> {
     let mut parsed = [0u8; 3];
     for (index, chunk) in version
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .enumerate()
     {
         parsed[index] = parse_hex_byte_checked(chunk[0], chunk[1])?;

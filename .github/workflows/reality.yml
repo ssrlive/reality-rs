@@ -6,11 +6,11 @@ permissions:
 on:
   push:
     branches:
-      - '**'
-    tags-ignore: ['*']
+      - "**"
+    tags-ignore: ["*"]
   pull_request:
     branches:
-      - '**'
+      - "**"
   workflow_dispatch:
 
 concurrency:
@@ -35,12 +35,14 @@ jobs:
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Install NASM for aws-lc-rs on Windows
         if: runner.os == 'Windows'
@@ -49,6 +51,10 @@ jobs:
       - name: Install ninja-build tool for aws-lc-fips-sys on Windows
         if: runner.os == 'Windows'
         uses: seanmiddleditch/gha-setup-ninja@v6
+
+      - run: cargo fmt --all -- --check
+
+      - run: cargo clippy -- -D warnings
 
       - name: Run REALITY smoke test
         shell: bash
@@ -60,7 +66,7 @@ jobs:
 
       - name: Upload REALITY smoke logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: reality-smoke-logs-${{ matrix.os }}
           path: target/tmp/
