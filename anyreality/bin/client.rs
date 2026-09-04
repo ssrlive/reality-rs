@@ -65,7 +65,7 @@ struct Args {
 
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
     #[arg(long, default_value = "info")]
-    log: String,
+    log: log::LevelFilter,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -98,18 +98,22 @@ struct ClientAnytlsConfigFile {
     #[serde(default)]
     password: Option<String>,
     #[serde(default)]
+    client_id: Option<uuid::Uuid>,
+    #[serde(default)]
     idle_check_secs: Option<u64>,
     #[serde(default)]
     idle_timeout_secs: Option<u64>,
     #[serde(default)]
     min_idle_sessions: Option<usize>,
+    #[serde(default)]
+    max_streams_per_session: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientRuntimeConfigFile {
     #[serde(default)]
-    listen: Option<String>,
+    listen: Option<SocketAddr>,
     #[serde(default)]
     server_addr: Option<String>,
     #[serde(default)]
@@ -118,13 +122,15 @@ struct ClientRuntimeConfigFile {
 
 #[derive(Clone, Debug)]
 struct RealityClientConfigResolved {
-    listen: String,
+    listen: SocketAddr,
     server_addr: String,
     probe_proxy: Option<SocketAddr>,
     password: String,
+    client_id: Option<uuid::Uuid>,
     idle_check_secs: u64,
     idle_timeout_secs: u64,
     min_idle_sessions: usize,
+    max_streams_per_session: usize,
     public_key: String,
     short_id: String,
     version: String,
@@ -138,14 +144,15 @@ struct DialCtx {
     tls_config: Arc<ClientConfig>,
     server_name: String,
     password_sha256: [u8; 32],
+    client_id: Option<uuid::Uuid>,
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.clone()))
-        .init();
+    let log = args.log.to_string();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log)).init();
 
     let resolved = resolve_client_config(&args.config)?;
     let tls_config = Arc::new(build_client_config(&resolved)?);
@@ -159,6 +166,7 @@ async fn main() -> Result<()> {
         tls_config,
         server_name: server_name.clone(),
         password_sha256: Sha256::digest(resolved.password.as_bytes()).into(),
+        client_id: resolved.client_id,
         padding: padding.clone(),
     });
 
@@ -174,7 +182,7 @@ async fn main() -> Result<()> {
         Duration::from_secs(resolved.idle_check_secs),
         Duration::from_secs(resolved.idle_timeout_secs),
         resolved.min_idle_sessions,
-        DEFAULT_MAX_STREAMS_PER_SESSION,
+        resolved.max_streams_per_session,
     ));
 
     log::info!(
@@ -184,10 +192,7 @@ async fn main() -> Result<()> {
         server_name
     );
 
-    let listen: SocketAddr = resolved
-        .listen
-        .parse()
-        .context("parse --listen")?;
+    let listen: SocketAddr = resolved.listen;
     let listener = TcpListener::bind(listen).await?;
     let auth = Arc::new(NoAuth);
 
@@ -263,11 +268,19 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
         .map(|v| u16::try_from(v).unwrap_or(0))
         .unwrap_or(0);
 
+    let client_id_bytes = ctx
+        .client_id
+        .map(|client_id| client_id.to_string().into_bytes())
+        .unwrap_or_default();
+    let padding_len = padding_len.max(client_id_bytes.len() as u16);
+
     let mut auth = Vec::with_capacity(34 + padding_len as usize);
     auth.extend_from_slice(&ctx.password_sha256);
     auth.extend_from_slice(&padding_len.to_be_bytes());
     if padding_len > 0 {
-        auth.resize(auth.len() + padding_len as usize, 0);
+        let start = auth.len();
+        auth.resize(start + padding_len as usize, 0);
+        auth[start..start + client_id_bytes.len()].copy_from_slice(&client_id_bytes);
     }
     bridge.write_all(&auth).await?;
 
@@ -667,8 +680,7 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
 
     let listen = client
         .listen
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1:1080".to_string());
+        .unwrap_or_else(|| "127.0.0.1:1080".parse().unwrap());
     let server_addr = client
         .server_addr
         .clone()
@@ -681,12 +693,18 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
         bail!("anytls.password must not be empty");
     }
 
+    let client_id = anytls.client_id;
+
     let idle_check_secs = anytls.idle_check_secs.unwrap_or(30);
     let idle_timeout_secs = anytls.idle_timeout_secs.unwrap_or(30);
     // Keep the idle floor at zero by default so timed-out sessions are not
     // preserved indefinitely. Users can opt back in via config if they want
     // a warm pool.
     let min_idle_sessions = anytls.min_idle_sessions.unwrap_or(0);
+    let max_streams_per_session = anytls
+        .max_streams_per_session
+        .unwrap_or(DEFAULT_MAX_STREAMS_PER_SESSION)
+        .max(1);
 
     let short_id = reality
         .short_id
@@ -710,9 +728,11 @@ fn resolve_client_config(config_path: &Path) -> Result<RealityClientConfigResolv
         server_addr,
         probe_proxy: client.probe_proxy,
         password,
+        client_id,
         idle_check_secs,
         idle_timeout_secs,
         min_idle_sessions,
+        max_streams_per_session,
         short_id,
         public_key,
         version,

@@ -46,12 +46,14 @@ The binary now reads runtime values from the config file. The CLI only takes
 The `anytls` section carries the shared password and the client-side pool
 knobs:
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `password` | required | AnyTLS shared password |
-| `idleCheckSecs` | 30 | How often to reap idle AnyTLS sessions |
-| `idleTimeoutSecs` | 30 | Idle session lifetime before close |
-| `minIdleSessions` | 5 | Minimum warm idle sessions to keep |
+| Field                  | Default  | Description                                                             |
+| ---------------------- | -------- | ----------------------------------------------------------------------- |
+| `password`             | required | AnyTLS shared password                                                  |
+| `clientId`             | omitted  | Reserved client identity value; not functionality yet                   |
+| `idleCheckSecs`        | 30       | How often to reap idle AnyTLS sessions                                  |
+| `idleTimeoutSecs`      | 30       | Idle session lifetime before close                                      |
+| `minIdleSessions`      | 0        | Minimum warm idle sessions to keep                                      |
+| `maxStreamsPerSession` | 8        | Maximum logical streams per session; set to `1` to disable multiplexing |
 
 ### Probe proxy
 

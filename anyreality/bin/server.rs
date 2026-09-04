@@ -74,7 +74,7 @@ struct Args {
 
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
     #[arg(long, default_value = "info")]
-    log: String,
+    log: log::LevelFilter,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -189,8 +189,8 @@ impl ClientHelloVerifier for ExampleRealityVerifier {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log.clone()))
-        .init();
+    let log = args.log.to_string();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log)).init();
 
     if args.gen_reality_keys {
         if args.config.is_some() {
@@ -294,12 +294,20 @@ async fn handle_connection(
         return Ok(());
     }
     let padding_len = u16::from_be_bytes([auth[32], auth[33]]);
+    let mut padding_buf = vec![0u8; padding_len as usize];
     if padding_len > 0 {
-        let mut padding_buf = vec![0u8; padding_len as usize];
         bridge
             .read_exact(&mut padding_buf)
             .await
             .context("read anytls padding")?;
+    }
+    if padding_buf.len() >= 36 {
+        if let Some(client_id) = std::str::from_utf8(&padding_buf[..36])
+            .ok()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        {
+            log::info!("anytls client id: {client_id}");
+        }
     }
 
     // 4) Hand the carrier to anytls and run the session loop.

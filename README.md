@@ -3,15 +3,14 @@
 This repository contains a fork of `rustls` for a REALITY-wrapped AnyTLS proxy implementation.
 Key user-facing binaries live in `anyreality/`:
 
-- `anyreality-client`: a SOCKS5 client that tunnels traffic over REALITY+TLS
+- `anyreality-client`: a SOCKS5/HTTP client that tunnels traffic over REALITY+TLS
   and the AnyTLS session protocol.
 - `anyreality-server`: the corresponding server that accepts REALITY+TLS
   connections and forwards streams to upstream targets.
 
 If you only want to run the proxy pair quickly on a Linux system, the
-convenience installer is provided at `install/installer.sh` (it generates a
-local CA, server cert, REALITY keys, writes configs and attempts to enable a
-systemd service).
+convenience installer is provided at `install/installer.sh` (it generates
+REALITY keys, writes configs and attempts to enable a systemd service).
 
 [中文版安装指南](install.md)
 
@@ -98,8 +97,8 @@ for implementing the cryptography algorithms used in TLS. In Rustls, a
 [`crypto::CryptoProvider`] represents a collection of crypto primitive implementations.
 
 By providing a custom instance of the [`crypto::CryptoProvider`] struct, you
-can replace all cryptography dependencies of rustls.  This is a route to being portable
-to a wider set of architectures and environments, or compliance requirements.  See the
+can replace all cryptography dependencies of rustls. This is a route to being portable
+to a wider set of architectures and environments, or compliance requirements. See the
 [`crypto::CryptoProvider`] documentation for more details.
 
 [`crypto::CryptoProvider`]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html
@@ -117,12 +116,12 @@ From 0.24, users must explicitly provide a crypto provider when constructing `Cl
 
 The Rustls project currently maintains two cryptography providers:
 
-* [`rustls-aws-lc-rs`] - a provider that uses the [`aws-lc-rs`] crate for cryptography.
-While this provider can be harder to build on [some platforms][aws-lc-rs-platforms-faq], it provides excellent
-performance and a complete feature set (including post-quantum algorithms).
-* [`rustls-ring`] - a provider that uses the [`ring`] crate for cryptography. This
-provider is easier to build on a variety of platforms, but has a more limited feature set
-(for example, it does not support post-quantum algorithms).
+- [`rustls-aws-lc-rs`] - a provider that uses the [`aws-lc-rs`] crate for cryptography.
+  While this provider can be harder to build on [some platforms][aws-lc-rs-platforms-faq], it provides excellent
+  performance and a complete feature set (including post-quantum algorithms).
+- [`rustls-ring`] - a provider that uses the [`ring`] crate for cryptography. This
+  provider is easier to build on a variety of platforms, but has a more limited feature set
+  (for example, it does not support post-quantum algorithms).
 
 The Rustls team recommends using the [`rustls-aws-lc-rs`] crate for its complete feature set
 and performance. See [the aws-lc-rs FAQ][aws-lc-rs-platforms-faq] for more details of the
@@ -145,16 +144,16 @@ was enabled by default.)
 
 The community has also started developing third-party providers for Rustls:
 
-* [`boring-rustls-provider`] - a work-in-progress provider that uses [`boringssl`] for
-cryptography.
-* [`rustls-ccm`] - adds AES-CCM cipher suites (TLS 1.2 and 1.3) using [`RustCrypto`], for IoT/constrained-device protocols (IEEE 2030.5, Matter, RFC 7925).
-* [`rustls-graviola`] - a provider that uses [`graviola`] for cryptography.
-* [`rustls-mbedtls-provider`] - a provider that uses [`mbedtls`] for cryptography.
-* [`rustls-openssl`] - a provider that uses [OpenSSL] for cryptography.
-* [`rustls-rustcrypto`] - an experimental provider that uses the crypto primitives
-from [`RustCrypto`] for cryptography.
-* [`rustls-symcrypt`] - a provider that uses Microsoft's [SymCrypt] library.
-* [`rustls-wolfcrypt-provider`] - a work-in-progress provider that uses [`wolfCrypt`] for cryptography.
+- [`boring-rustls-provider`] - a work-in-progress provider that uses [`boringssl`] for
+  cryptography.
+- [`rustls-ccm`] - adds AES-CCM cipher suites (TLS 1.2 and 1.3) using [`RustCrypto`], for IoT/constrained-device protocols (IEEE 2030.5, Matter, RFC 7925).
+- [`rustls-graviola`] - a provider that uses [`graviola`] for cryptography.
+- [`rustls-mbedtls-provider`] - a provider that uses [`mbedtls`] for cryptography.
+- [`rustls-openssl`] - a provider that uses [OpenSSL] for cryptography.
+- [`rustls-rustcrypto`] - an experimental provider that uses the crypto primitives
+  from [`RustCrypto`] for cryptography.
+- [`rustls-symcrypt`] - a provider that uses Microsoft's [SymCrypt] library.
+- [`rustls-wolfcrypt-provider`] - a work-in-progress provider that uses [`wolfCrypt`] for cryptography.
 
 [`rustls-ccm`]: https://github.com/jsulmont/rustls-ccm
 [`rustls-graviola`]: https://crates.io/crates/rustls-graviola
@@ -249,7 +248,7 @@ Rustls is distributed under the following three licenses:
 - ISC license.
 
 These are included as LICENSE-APACHE, LICENSE-MIT and LICENSE-ISC
-respectively.  You may use this software under the terms of any
+respectively. You may use this software under the terms of any
 of these licenses, at your option.
 
 # Project Membership

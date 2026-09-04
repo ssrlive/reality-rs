@@ -45,6 +45,7 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 toml = { workspace = true }
+uuid = { version = "1.24", features = ["serde"] }
 webpki-roots = { workspace = true }
 
 [lints]

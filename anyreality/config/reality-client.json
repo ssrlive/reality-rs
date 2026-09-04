@@ -6,6 +6,8 @@
         "serverName": "test"
     },
     "anytls": {
+        "clientId": null,
+        "maxStreamsPerSession": 8,
         "password": "reality-smoke-password",
         "idleCheckSecs": 30,
         "idleTimeoutSecs": 30,
