@@ -237,11 +237,10 @@ fn reality_certificate_fields(
     let _ = der_tlv(der, &mut outer)?;
     let (sig_tag, sig_start, sig_end) = der_tlv(der, &mut outer)?;
     if sig_tag != 0x03 || sig_end - sig_start != 65 || der[sig_start] != 0 {
-        return Err(Error::General(format!(
-            "signature shape tag={sig_tag:#x} len={} unused={}",
-            sig_end - sig_start,
-            der[sig_start]
-        )));
+        // Only REALITY's temporary Ed25519 certificate has a 64-byte outer
+        // signature. Ordinary certificates use other signature formats and
+        // must be delegated to the configured TLS verifier.
+        return Ok(None);
     }
     let first_start = tbs;
     let (first_tag, _, _) = der_tlv(der, &mut tbs)?;
@@ -1226,6 +1225,17 @@ mod tests {
             &public_key,
             &signature[..63],
         ));
+    }
+
+    #[test]
+    fn ordinary_p256_certificate_is_not_treated_as_reality_certificate() {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let certificate = params.self_signed(&key_pair).unwrap();
+
+        let fields = reality_certificate_fields(&CertificateDer::from(certificate.der().to_vec())).unwrap();
+
+        assert!(fields.is_none());
     }
 
     #[test]

@@ -384,9 +384,13 @@ async fn handle_http_connect(mut stream: TcpStream, client: Arc<Client>) -> Resu
     let target = Address::try_from(target).context("invalid HTTP CONNECT target")?;
 
     let session = client.create_stream().await?;
-    session
+    if let Err(err) = session
         .write(&Vec::<u8>::from(target.clone()))
-        .await?;
+        .await
+    {
+        let _ = session.terminate().await;
+        return Err(err.into());
+    }
     stream
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
@@ -449,7 +453,7 @@ async fn handle_tcp_connect(
 ) -> Result<()> {
     let bind_addr = Address::from(connect_req.local_addr()?);
 
-    // Open the anytls stream *before* confirming success to the SOCKS client.
+    // Open the anytls stream before reporting success to the SOCKS client.
     let session = match client.create_stream().await {
         Ok(s) => s,
         Err(err) => {
@@ -477,8 +481,8 @@ async fn handle_tcp_connect(
         return Err(err.into());
     }
 
-    // Stream is open and the address is en-route; now confirm success to the
-    // local SOCKS client.
+    // The target address is queued; report success and let the stream watchdog
+    // handle a missing v2 SYNACK.
     let ready = connect_req
         .reply(Reply::Succeeded, bind_addr)
         .await?;
