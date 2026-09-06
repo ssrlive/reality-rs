@@ -1233,7 +1233,8 @@ mod tests {
         let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
         let certificate = params.self_signed(&key_pair).unwrap();
 
-        let fields = reality_certificate_fields(&CertificateDer::from(certificate.der().to_vec())).unwrap();
+        let fields =
+            reality_certificate_fields(&CertificateDer::from(certificate.der().to_vec())).unwrap();
 
         assert!(fields.is_none());
     }

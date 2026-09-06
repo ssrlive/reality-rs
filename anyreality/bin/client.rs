@@ -55,16 +55,17 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
 const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 8;
+const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
     /// Path to the grouped client config (`.toml` or `.json`).
-    #[arg(long)]
+    #[arg(short, long)]
     config: PathBuf,
 
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
-    #[arg(long, default_value = "info")]
+    #[arg(short, long, default_value = "info")]
     log: log::LevelFilter,
 }
 
@@ -344,12 +345,12 @@ async fn handle_socks(incoming: IncomingConnection, client: Arc<Client>) -> Resu
     }
 }
 
-async fn handle_http_connect(mut stream: TcpStream, client: Arc<Client>) -> Result<()> {
+async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> Result<()> {
     let mut request = Vec::new();
     let read_headers = async {
         loop {
             let mut byte = [0u8; 1];
-            let count = stream.read(&mut byte).await?;
+            let count = tcp_stream.read(&mut byte).await?;
             if count == 0 {
                 bail!("HTTP proxy client closed before sending headers");
             }
@@ -376,7 +377,7 @@ async fn handle_http_connect(mut stream: TcpStream, client: Arc<Client>) -> Resu
     let method = fields.next().unwrap_or_default();
     let target = fields.next().unwrap_or_default();
     if !method.eq_ignore_ascii_case("CONNECT") {
-        stream
+        tcp_stream
             .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
             .await?;
         return Ok(());
@@ -391,15 +392,15 @@ async fn handle_http_connect(mut stream: TcpStream, client: Arc<Client>) -> Resu
         let _ = session.terminate().await;
         return Err(err.into());
     }
-    if let Err(err) = session.wait_for_handshake().await {
+    if let Err(err) = wait_for_stream_handshake(&session).await {
         let _ = session.terminate().await;
         return Err(err.into());
     }
-    stream
+    tcp_stream
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
 
-    let (mut local_read, mut local_write) = stream.into_split();
+    let (mut local_read, mut local_write) = tcp_stream.into_split();
     let session_w = session.clone();
     let session_r = session.clone();
     let l2r = tokio::spawn(async move {
@@ -485,7 +486,7 @@ async fn handle_tcp_connect(
         return Err(err.into());
     }
 
-    if let Err(err) = session.wait_for_handshake().await {
+    if let Err(err) = wait_for_stream_handshake(&session).await {
         let _ = session.terminate().await;
         if let Ok(mut failed) = connect_req
             .reply(Reply::GeneralFailure, Address::unspecified())
@@ -565,8 +566,19 @@ async fn handle_tcp_connect(
     Ok(())
 }
 
-async fn finish_logical_stream(session: &Arc<AnytlsStream>) -> std::io::Result<()> {
-    session.close().await
+async fn finish_logical_stream(stream: &Arc<AnytlsStream>) -> std::io::Result<()> {
+    stream.close().await
+}
+
+async fn wait_for_stream_handshake(stream: &Arc<AnytlsStream>) -> std::io::Result<()> {
+    tokio::time::timeout(STREAM_HANDSHAKE_TIMEOUT, stream.wait_for_handshake())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("timed out waiting for SYNACK on stream {}", stream.id()),
+            )
+        })?
 }
 
 fn is_nonfatal_local_disconnect(error: &std::io::Error) -> bool {
@@ -618,7 +630,7 @@ async fn handle_udp_associate(
         reply.shutdown().await?;
         return Err(err);
     }
-    if let Err(err) = session.wait_for_handshake().await {
+    if let Err(err) = wait_for_stream_handshake(&session).await {
         let _ = session.terminate().await;
         let mut reply = associate_req
             .reply(Reply::GeneralFailure, Address::unspecified())
@@ -681,11 +693,11 @@ async fn handle_udp_associate(
     result
 }
 
-async fn setup_uot_request(session: &Arc<AnytlsStream>) -> Result<()> {
+async fn setup_uot_request(stream: &Arc<AnytlsStream>) -> Result<()> {
     let sentinel: Vec<u8> = uot_sentinel_destination().into();
-    session.write(&sentinel).await?;
+    stream.write(&sentinel).await?;
     let request_bytes: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified()).into();
-    session.write(&request_bytes).await?;
+    stream.write(&request_bytes).await?;
     Ok(())
 }
 
@@ -846,16 +858,13 @@ fn parse_hex_nibble(value: u8) -> u8 {
     }
 }
 
+type ReadFuture = Box<dyn core::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>;
+
 // === AsyncRead adapter for AnytlsSession (so UoT helpers can drive it) ===
 
 struct AnytlsStreamReader {
     inner: Arc<AnytlsStream>,
-    #[allow(clippy::type_complexity)]
-    read_fut: Option<
-        core::pin::Pin<
-            Box<dyn core::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>,
-        >,
-    >,
+    read_fut: Option<core::pin::Pin<ReadFuture>>,
 }
 
 impl AnytlsStreamReader {

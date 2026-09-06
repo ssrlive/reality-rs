@@ -15,9 +15,9 @@
 //!    address and bidirectionally relay between the upstream socket and
 //!    the anytls session.
 //!
-//! Note: this fork treats one anytls session as a loop of logical flows.
-//! Each flow reads one destination address, relays until completion, then
-//! returns to the loop to accept the next address on the same session.
+//! Each inbound AnyTLS logical stream is handled in its own task, so an
+//! upstream relay that is still draining cannot block later multiplexed
+//! streams on the same carrier.
 
 use anyreality::async_bridge;
 
@@ -59,21 +59,23 @@ use tokio::net::{TcpListener, TcpStream as TokioTcpStream, UdpSocket};
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_HELLO_MAX_WIRE_SIZE: usize = 128 * 1024;
+const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 128;
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
     /// Path to the grouped server config (`.toml` or `.json`).
     /// Optional — not required when using `--gen-reality-keys`.
-    #[arg(long)]
+    #[arg(short, long)]
     config: Option<PathBuf>,
 
     /// Generate an X25519 REALITY keypair (prints privateKey base64url and shortId hex) and exit
-    #[arg(long = "gen-reality-keys")]
+    #[arg(short, long)]
     gen_reality_keys: bool,
 
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
-    #[arg(long, default_value = "info")]
+    #[arg(short, long, default_value = "info")]
     log: log::LevelFilter,
 }
 
@@ -315,12 +317,13 @@ async fn handle_connection(
         Box::new(bridge),
         Box::new(|session: Arc<AnytlsStream>| {
             tokio::spawn(async move {
-                if let Err(error) = handle_session(session).await {
-                    log::debug!("session error: {error:#}");
+                if let Err(error) = handle_stream(session).await {
+                    log::debug!("stream error: {error:#}");
                 }
             });
         }),
         padding,
+        DEFAULT_MAX_STREAMS_PER_SESSION,
     )
     .await;
 
@@ -330,53 +333,61 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn handle_session(session: Arc<AnytlsStream>) -> Result<()> {
-    let mut reader = AnytlsStreamReader::new(session.clone());
-    loop {
-        if session.is_terminated().await {
+async fn handle_stream(stream: Arc<AnytlsStream>) -> Result<()> {
+    let mut reader = AnytlsStreamReader::new(stream.clone());
+    let destination = match Address::retrieve_from_async_stream(&mut reader).await {
+        Ok(destination) => destination,
+        Err(error) if stream.is_terminated().await || is_error_of_session_broken(&error) => {
             return Ok(());
         }
+        Err(error) => return Err(error.into()),
+    };
 
-        let destination = match Address::retrieve_from_async_stream(&mut reader).await {
-            Ok(destination) => destination,
-            Err(error) if session.is_terminated().await || is_error_of_session_broken(&error) => {
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
-        };
-
-        if uot_is_sentinel_destination(&destination) {
-            let request = uot_get_request_from_stream(&mut reader).await?;
-            match request.mode {
-                UotMode::Connected => {
-                    handle_uot_connected(session.clone(), &mut reader, &request).await?
-                }
-                UotMode::Datagram => handle_uot_datagram(session.clone(), &mut reader).await?,
-            }
-        } else {
-            handle_tcp_stream(session.clone(), destination).await?;
+    if uot_is_sentinel_destination(&destination) {
+        let request = uot_get_request_from_stream(&mut reader).await?;
+        match request.mode {
+            UotMode::Connected => handle_uot_connected(stream, &mut reader, &request).await,
+            UotMode::Datagram => handle_uot_datagram(stream, &mut reader).await,
         }
+    } else {
+        handle_tcp_stream(stream, destination).await
     }
 }
 
-async fn handle_tcp_stream(session: Arc<AnytlsStream>, destination: Address) -> Result<()> {
+async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> Result<()> {
     let dst = destination.to_string();
-    let mut outbound = match TokioTcpStream::connect(&dst).await {
-        Ok(s) => s,
-        Err(err) => {
-            log::debug!("connect upstream {dst} failed: {err}");
-            session
-                .handshake_failure(&err.to_string())
-                .await?;
-            session.close().await?;
-            return Err(err.into());
-        }
-    };
+    let mut outbound =
+        match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TokioTcpStream::connect(&dst)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => {
+                log::debug!("connect upstream {dst} failed: {err}");
+                stream
+                    .handshake_failure(&err.to_string())
+                    .await?;
+                stream.close().await?;
+                return Err(err.into());
+            }
+            Err(_) => {
+                let err = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "connect upstream {dst} timed out after {}s",
+                        UPSTREAM_CONNECT_TIMEOUT.as_secs()
+                    ),
+                );
+                log::debug!("{err}");
+                stream
+                    .handshake_failure(&err.to_string())
+                    .await?;
+                stream.close().await?;
+                return Err(err.into());
+            }
+        };
     outbound.set_nodelay(true).ok();
-    session.handshake_success().await?;
+    stream.handshake_success().await?;
 
-    let session_read = session.clone();
-    let session_write = session.clone();
+    let session_read = stream.clone();
+    let session_write = stream.clone();
     let (mut up_read, mut up_write) = outbound.split();
 
     let s2u = async {
@@ -430,11 +441,11 @@ async fn handle_tcp_stream(session: Arc<AnytlsStream>, destination: Address) -> 
 }
 
 async fn handle_uot_datagram(
-    session: Arc<AnytlsStream>,
+    stream: Arc<AnytlsStream>,
     reader: &mut AnytlsStreamReader,
 ) -> Result<()> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
-    session.handshake_success().await?;
+    stream.handshake_success().await?;
     let mut buf = vec![0u8; 65_535];
 
     let result: Result<()> = async {
@@ -453,7 +464,7 @@ async fn handle_uot_datagram(
                         Some(&Address::from(source)),
                         &buf[..n],
                     )?;
-                    session.write(&frame).await?;
+                    stream.write(&frame).await?;
                 }
             }
         }
@@ -461,26 +472,26 @@ async fn handle_uot_datagram(
     .await;
 
     if result.is_err() {
-        let _ = session.close().await;
+        let _ = stream.close().await;
     }
     result
 }
 
 async fn handle_uot_connected(
-    session: Arc<AnytlsStream>,
+    stream: Arc<AnytlsStream>,
     reader: &mut AnytlsStreamReader,
     request: &UotRequest,
 ) -> Result<()> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     let dst = request.destination.to_string();
     if let Err(err) = udp.connect(&dst).await {
-        session
+        stream
             .handshake_failure(&err.to_string())
             .await?;
-        session.close().await?;
+        stream.close().await?;
         return Err(err.into());
     }
-    session.handshake_success().await?;
+    stream.handshake_success().await?;
     let mut buf = vec![0u8; 65_535];
 
     let result: Result<()> = async {
@@ -493,7 +504,7 @@ async fn handle_uot_connected(
                 res = udp.recv(&mut buf) => {
                     let n = res?;
                     let frame = uot_encode_packet(UotMode::Connected, None, &buf[..n])?;
-                    session.write(&frame).await?;
+                    stream.write(&frame).await?;
                 }
             }
         }
@@ -501,7 +512,7 @@ async fn handle_uot_connected(
     .await;
 
     if result.is_err() {
-        let _ = session.close().await;
+        let _ = stream.close().await;
     }
     result
 }
@@ -590,15 +601,15 @@ fn build_server_config(reality: &ServerConfigResolved) -> Result<ServerConfig> {
 }
 
 fn is_reality_client_hello(
-    stream: &std::net::TcpStream,
+    tcp_stream: &std::net::TcpStream,
     server_private_key: &[u8],
     short_id: &[u8],
     version: &[u8; 3],
 ) -> Result<bool> {
-    stream
+    tcp_stream
         .set_nonblocking(false)
         .context("set socket blocking for ClientHello peek")?;
-    stream
+    tcp_stream
         .set_read_timeout(Some(Duration::from_secs(1)))
         .context("set ClientHello peek timeout")?;
 
@@ -609,7 +620,7 @@ fn is_reality_client_hello(
         if Instant::now() >= deadline {
             bail!("timed out waiting for ClientHello")
         }
-        let available = match stream.peek(&mut buf) {
+        let available = match tcp_stream.peek(&mut buf) {
             Ok(available) => available,
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(error) => return Err(error).context("peek ClientHello"),
@@ -908,17 +919,17 @@ fn generate_reality_keypair() -> Result<()> {
 }
 
 async fn handle_raw_tls_fallback(
-    client: std::net::TcpStream,
+    tcp_client: std::net::TcpStream,
     allowed_server_names: Arc<Vec<String>>,
 ) -> Result<()> {
-    client.set_read_timeout(Some(Duration::from_secs(1)))?;
+    tcp_client.set_read_timeout(Some(Duration::from_secs(1)))?;
     let mut buffer = vec![0u8; 2048];
     let deadline = Instant::now() + CLIENT_HELLO_TIMEOUT;
     let handshake = loop {
         if Instant::now() >= deadline {
             bail!("timed out waiting for fallback ClientHello");
         }
-        let available = match client.peek(&mut buffer) {
+        let available = match tcp_client.peek(&mut buffer) {
             Ok(available) => available,
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => 0,
             Err(error) => return Err(error.into()),
@@ -944,8 +955,8 @@ async fn handle_raw_tls_fallback(
         bail!("fallback rejected unexpected SNI: {server_name}");
     }
 
-    client.set_nonblocking(true)?;
-    let client = TokioTcpStream::from_std(client)?;
+    tcp_client.set_nonblocking(true)?;
+    let client = TokioTcpStream::from_std(tcp_client)?;
     let mut upstream = TokioTcpStream::connect((server_name.as_str(), 443)).await?;
     let mut client = client;
     tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
