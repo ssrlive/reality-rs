@@ -368,7 +368,7 @@ async fn handle_tcp_stream(session: Arc<AnytlsStream>, destination: Address) -> 
             session
                 .handshake_failure(&err.to_string())
                 .await?;
-            session.terminate().await?;
+            session.close().await?;
             return Err(err.into());
         }
     };
@@ -461,7 +461,7 @@ async fn handle_uot_datagram(
     .await;
 
     if result.is_err() {
-        let _ = session.terminate().await;
+        let _ = session.close().await;
     }
     result
 }
@@ -477,7 +477,7 @@ async fn handle_uot_connected(
         session
             .handshake_failure(&err.to_string())
             .await?;
-        session.terminate().await?;
+        session.close().await?;
         return Err(err.into());
     }
     session.handshake_success().await?;
@@ -501,7 +501,7 @@ async fn handle_uot_connected(
     .await;
 
     if result.is_err() {
-        let _ = session.terminate().await;
+        let _ = session.close().await;
     }
     result
 }

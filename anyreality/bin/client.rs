@@ -391,6 +391,10 @@ async fn handle_http_connect(mut stream: TcpStream, client: Arc<Client>) -> Resu
         let _ = session.terminate().await;
         return Err(err.into());
     }
+    if let Err(err) = session.wait_for_handshake().await {
+        let _ = session.terminate().await;
+        return Err(err.into());
+    }
     stream
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
@@ -481,8 +485,17 @@ async fn handle_tcp_connect(
         return Err(err.into());
     }
 
-    // The target address is queued; report success and let the stream watchdog
-    // handle a missing v2 SYNACK.
+    if let Err(err) = session.wait_for_handshake().await {
+        let _ = session.terminate().await;
+        if let Ok(mut failed) = connect_req
+            .reply(Reply::GeneralFailure, Address::unspecified())
+            .await
+        {
+            let _ = failed.shutdown().await;
+        }
+        return Err(err.into());
+    }
+
     let ready = connect_req
         .reply(Reply::Succeeded, bind_addr)
         .await?;
@@ -604,6 +617,14 @@ async fn handle_udp_associate(
             .await?;
         reply.shutdown().await?;
         return Err(err);
+    }
+    if let Err(err) = session.wait_for_handshake().await {
+        let _ = session.terminate().await;
+        let mut reply = associate_req
+            .reply(Reply::GeneralFailure, Address::unspecified())
+            .await?;
+        reply.shutdown().await?;
+        return Err(err.into());
     }
 
     let mut reply = associate_req
