@@ -50,60 +50,60 @@ default-members = [
 resolver = "2"
 
 [workspace.dependencies]
-anyhow = "1.0.73"
-asn1 = "0.24"
-async-trait = "0.1.74"
-aws-lc-rs = { version = "1.14", default-features = false }
-base64 = "0.22"
+anyhow = "1.0.104"
+asn1 = "0.24.1"
+async-trait = "0.1.92"
+aws-lc-rs = { version = "1.18.1", default-features = false }
+base64 = "0.23.1"
 bencher = "0.1.5"
-brotli = { version = "8", default-features = false, features = ["std"] }
-brotli-decompressor = "5.0.0"
-byteorder = "1.4.3"
-clap = { version = "4.3.21", features = ["derive", "env"] }
-crabgrind = "0.2.5"
-criterion = "0.8"
-env_logger = "0.11"
-graviola = "0.3"
-hashbrown = { version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
-hex = "0.4"
-hickory-resolver = { version = "0.26", features = ["https-aws-lc-rs", "webpki-roots"] }
-hpke-rs = "0.6"
-hpke-rs-crypto = "0.6"
-hpke-rs-rust-crypto = "0.6"
-itertools = "0.14"
-log = { version = "0.4.8" }
-macro_rules_attribute = "0.2"
-mio = { version = "1", features = ["net", "os-poll"] }
-num-bigint = "0.4.4"
-once_cell = { version = "1.16", default-features = false, features = ["alloc", "race"] }
-openssl = "0.10"
-pki-types = { package = "rustls-pki-types", version = "1.14", features = ["alloc"] }
-rayon = "1.7"
-rcgen = { version = "0.14.4", features = ["pem", "aws_lc_rs"], default-features = false }
-regex = "1"
-ring = "0.17"
-rustc-hash = "2"
+brotli = { version = "9.0.0", default-features = false, features = ["std"] }
+brotli-decompressor = "6.0.0"
+byteorder = "1.5.0"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+crabgrind = "0.3.1"
+criterion = "0.8.2"
+env_logger = "0.11.11"
+graviola = "0.4.1"
+hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }
+hex = "0.4.3"
+hickory-resolver = { version = "0.26.2", features = ["https-aws-lc-rs", "webpki-roots"] }
+hpke-rs = "0.7.0"
+hpke-rs-crypto = "0.7.0"
+hpke-rs-rust-crypto = "0.7.0"
+itertools = "0.15.0"
+log = { version = "0.4.34" }
+macro_rules_attribute = "0.2.3"
+mio = { version = "1.2.3", features = ["net", "os-poll"] }
+num-bigint = "0.5.1"
+once_cell = { version = "1.21.4", default-features = false, features = ["alloc", "race"] }
+openssl = "0.10.81"
+pki-types = { package = "rustls-pki-types", version = "1.15.1", features = ["alloc"] }
+rayon = "1.12.0"
+rcgen = { version = "0.14.10", features = ["pem", "aws_lc_rs"], default-features = false }
+regex = "1.13.1"
+ring = "0.17.14"
+rustc-hash = "2.1.3"
 rustls-fuzzing-provider = { path = "rustls-fuzzing-provider/" }
-rustls-graviola = { version = "0.3" }
+rustls-graviola = { version = "0.4.0" }
 rustls-test = { path = "rustls-test/", default-features = false }
 rustls-util = { path = "rustls-util/" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.11"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
 socks5-impl = "0.9.6"
-subtle = { version = "2.5.0", default-features = false }
-time = { version = "0.3.6", default-features = false }
-tikv-jemallocator = "0.6"
-tokio = { version = "1.34", features = ["io-util", "macros", "net", "rt"] }
-tokio-rustls = "0.26"
-toml = "0.8"
+subtle = { version = "2.6.1", default-features = false }
+time = { version = "0.3.55", default-features = false }
+tikv-jemallocator = "0.7.0"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt"] }
+tokio-rustls = "0.26.5"
+toml = "1.1.5"
 webpki = { package = "rustls-webpki", version = "=0.104.0-alpha.6", features = [
   "alloc",
 ], default-features = false }
-webpki-roots = "1"
-x509-parser = "0.18"
-zeroize = "1.8"
-zlib-rs = "0.6"
+webpki-roots = "1.0.9"
+x509-parser = "0.18.1"
+zeroize = "1.9.0"
+zlib-rs = "0.6.7"
 
 [profile.bench]
 codegen-units = 1
