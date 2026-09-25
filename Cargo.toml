@@ -57,9 +57,9 @@ aws-lc-rs = { version = "1.18.1", default-features = false }
 base64 = "0.23.1"
 bencher = "0.1.5"
 brotli = { version = "9.0.0", default-features = false, features = ["std"] }
-brotli-decompressor = "6.0.0"
+brotli-decompressor = "6.0.1"
 byteorder = "1.5.0"
-clap = { version = "4.6.6", features = ["derive", "env"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 crabgrind = "0.3.1"
 criterion = "0.8.2"
 env_logger = "0.11.11"
@@ -96,14 +96,14 @@ time = { version = "0.3.55", default-features = false }
 tikv-jemallocator = "0.7.0"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt"] }
 tokio-rustls = "0.26.5"
-toml = "1.1.5"
+toml = "1.1.6"
 webpki = { package = "rustls-webpki", version = "=0.104.0-alpha.7", features = [
   "alloc",
 ], default-features = false }
 webpki-roots = "1.0.9"
 x509-parser = "0.18.1"
 zeroize = "1.9.0"
-zlib-rs = "0.6.7"
+zlib-rs = "0.6.8"
 
 [profile.bench]
 codegen-units = 1

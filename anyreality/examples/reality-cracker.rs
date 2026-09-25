@@ -178,8 +178,7 @@ enum ProbeMode {
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = CliConfig::parse();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(cli.log.clone()))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(cli.log.clone())).init();
 
     let probes = Arc::new(load_probes(&cli)?);
     let probe_states: SharedProbeStates = Arc::new(Mutex::new(HashMap::new()));
@@ -206,11 +205,7 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
-async fn handle_connection(
-    stream: TcpStream,
-    probes: Arc<Vec<ProbeSpec>>,
-    probe_states: SharedProbeStates,
-) -> std::io::Result<()> {
+async fn handle_connection(stream: TcpStream, probes: Arc<Vec<ProbeSpec>>, probe_states: SharedProbeStates) -> std::io::Result<()> {
     let peer_addr = stream.peer_addr()?;
     let (stream_reader, mut client_writer) = stream.into_split();
     let (method, target, mut request_reader) = read_request(stream_reader).await?;
@@ -226,9 +221,7 @@ async fn handle_connection(
     let upstream_peer = upstream.peer_addr()?;
     let upstream_key = upstream_peer.to_string();
     let response = b"HTTP/1.1 200 Connection established\r\n\r\n";
-    client_writer
-        .write_all(response)
-        .await?;
+    client_writer.write_all(response).await?;
     let (mut server_reader, mut server_writer) = upstream.into_split();
 
     let state = Arc::new(Mutex::new(ConnectionState::default()));
@@ -281,11 +274,7 @@ async fn handle_connection(
                 Ok(0) => return,
                 Ok(n) => n,
                 Err(err) => {
-                    log::error!(
-                        "server->client read error for {}: {}",
-                        target_for_probe,
-                        err
-                    );
+                    log::error!("server->client read error for {}: {}", target_for_probe, err);
                     return;
                 }
             };
@@ -302,10 +291,7 @@ async fn handle_connection(
 
                     if info.selected_version == TLS13_SELECTED_VERSION && !guard.replay_started {
                         if let Some(client_hello) = guard.observed_client_hello.clone() {
-                            if let Some(round_no) = start_server_probe_round(
-                                &shared_probe_states,
-                                &upstream_key_for_probe,
-                            ) {
+                            if let Some(round_no) = start_server_probe_round(&shared_probe_states, &upstream_key_for_probe) {
                                 guard.replay_started = true;
                                 replay_args = Some((
                                     target_for_probe.clone(),
@@ -323,38 +309,16 @@ async fn handle_connection(
                     }
                 }
 
-                if let Some((
-                    target,
-                    server_key,
-                    sni,
-                    client_hello,
-                    probes,
-                    shared_probe_states,
-                    round_no,
-                )) = replay_args
-                {
+                if let Some((target, server_key, sni, client_hello, probes, shared_probe_states, round_no)) = replay_args {
                     tokio::spawn(async move {
-                        run_replay_probe(
-                            &target,
-                            &server_key,
-                            &sni,
-                            client_hello,
-                            probes,
-                            shared_probe_states,
-                            round_no,
-                        )
-                        .await;
+                        run_replay_probe(&target, &server_key, &sni, client_hello, probes, shared_probe_states, round_no).await;
                     });
                 }
                 sniff_buffer.clear();
             }
 
             if let Err(err) = client_writer.write_all(&buf[..n]).await {
-                log::error!(
-                    "server->client write error for {}: {}",
-                    target_for_probe,
-                    err
-                );
+                log::error!("server->client write error for {}: {}", target_for_probe, err);
                 return;
             }
         }
@@ -379,12 +343,7 @@ async fn run_replay_probe(
     let mut session_id_len = 0u8;
     let mut before_hash = 0u32;
     let mut after_hash = 0u32;
-    if randomize_client_hello_legacy_session_id(
-        &mut randomized,
-        &mut session_id_len,
-        &mut before_hash,
-        &mut after_hash,
-    ) {
+    if randomize_client_hello_legacy_session_id(&mut randomized, &mut session_id_len, &mut before_hash, &mut after_hash) {
         log::info!(
             "TLS replay B randomized ClientHello legacy_session_id len={} before={:08x} after={:08x}",
             session_id_len,
@@ -418,8 +377,7 @@ async fn run_replay_probe(
     let mismatch = !probe_rounds_match(&a.results, &b.results);
     let alarm_condition = replay_probe_matches_alarm_condition(&a.results, &b.results);
     let round_matches = alarm_condition;
-    let (matched_rounds, final_match) =
-        finish_server_probe_round(&probe_states, server_key, round_matches, false);
+    let (matched_rounds, final_match) = finish_server_probe_round(&probe_states, server_key, round_matches, false);
 
     if round_matches && !final_match {
         log::info!(
@@ -465,9 +423,7 @@ async fn run_replay_probe(
 
 fn start_server_probe_round(probe_states: &SharedProbeStates, target: &str) -> Option<u32> {
     let mut guard = probe_states.lock().unwrap();
-    let state = guard
-        .entry(target.to_string())
-        .or_default();
+    let state = guard.entry(target.to_string()).or_default();
     if state.excluded || state.in_progress || state.matched_rounds >= REQUIRED_CONFIRMATION_ROUNDS {
         return None;
     }
@@ -476,12 +432,7 @@ fn start_server_probe_round(probe_states: &SharedProbeStates, target: &str) -> O
     Some(state.matched_rounds + 1)
 }
 
-fn finish_server_probe_round(
-    probe_states: &SharedProbeStates,
-    target: &str,
-    matched: bool,
-    retry_later: bool,
-) -> (u32, bool) {
+fn finish_server_probe_round(probe_states: &SharedProbeStates, target: &str, matched: bool, retry_later: bool) -> (u32, bool) {
     let mut guard = probe_states.lock().unwrap();
     let Some(state) = guard.get_mut(target) else {
         return (0, false);
@@ -511,12 +462,7 @@ struct ReplayRound {
     results: Vec<ReplayProbeResult>,
 }
 
-async fn run_replay_probe_round(
-    target: &str,
-    client_hello: &[u8],
-    attempt: usize,
-    probes: &[ProbeSpec],
-) -> ReplayRound {
+async fn run_replay_probe_round(target: &str, client_hello: &[u8], attempt: usize, probes: &[ProbeSpec]) -> ReplayRound {
     if probes.is_empty() {
         return ReplayRound {
             status: ReplayRoundStatus::Valid,
@@ -546,14 +492,8 @@ async fn run_replay_probe_round(
         }
     }
 
-    if results
-        .iter()
-        .any(|result| result.connection_failed)
-    {
-        log::warn!(
-            "TLS replay attempt={} discarded; connection failed in at least one probe",
-            attempt
-        );
+    if results.iter().any(|result| result.connection_failed) {
+        log::warn!("TLS replay attempt={} discarded; connection failed in at least one probe", attempt);
         return ReplayRound {
             status: ReplayRoundStatus::ConnectionError,
             results,
@@ -561,10 +501,7 @@ async fn run_replay_probe_round(
     }
 
     if !probe_round_has_signal(&results) {
-        log::warn!(
-            "TLS replay attempt={} discarded; all probes returned NONE",
-            attempt
-        );
+        log::warn!("TLS replay attempt={} discarded; all probes returned NONE", attempt);
         return ReplayRound {
             status: ReplayRoundStatus::NoSignal,
             results,
@@ -638,26 +575,13 @@ async fn replay_client_hello_to_server_once(
 
     if let Err(err) = stream.set_nodelay(true) {
         *status_out = ReplayStatus::SocketFailed;
-        log::warn!(
-            "TLS replay attempt={} server={} socket_failed error={}",
-            attempt,
-            target,
-            err
-        );
+        log::warn!("TLS replay attempt={} server={} socket_failed error={}", attempt, target, err);
         return false;
     }
 
-    if timeout(REPLAY_TIMEOUT, stream.write_all(client_hello))
-        .await
-        .is_err()
-        || stream.write_all(&[]).await.is_err()
-    {
+    if timeout(REPLAY_TIMEOUT, stream.write_all(client_hello)).await.is_err() || stream.write_all(&[]).await.is_err() {
         *status_out = ReplayStatus::SendFailed;
-        log::warn!(
-            "TLS replay attempt={} server={} failed=send_failed",
-            attempt,
-            target
-        );
+        log::warn!("TLS replay attempt={} server={} failed=send_failed", attempt, target);
         return false;
     }
 
@@ -697,11 +621,7 @@ async fn replay_client_hello_to_server_once(
             }
             Ok(result) => match result {
                 Ok(0) => {
-                    *status_out = if got_response {
-                        ReplayStatus::Ok
-                    } else {
-                        ReplayStatus::Closed
-                    };
+                    *status_out = if got_response { ReplayStatus::Ok } else { ReplayStatus::Closed };
                     if appdata_close.sent && appdata_close.status == ProbeStatus::None {
                         appdata_close.status = ProbeStatus::Fin;
                     }
@@ -718,11 +638,7 @@ async fn replay_client_hello_to_server_once(
 
                     if appdata_close.sent {
                         append_with_cap(&mut post_probe_data, &response[..n], 65_536);
-                        if buffer_contains_record_from_tail(
-                            &post_probe_data,
-                            0x17,
-                            TLS13_ENCRYPTED_ALERT_RECORD_LEN,
-                        ) {
+                        if buffer_contains_record_from_tail(&post_probe_data, 0x17, TLS13_ENCRYPTED_ALERT_RECORD_LEN) {
                             appdata_close.status = ProbeStatus::Alert;
                             *status_out = ReplayStatus::Ok;
                             break;
@@ -852,10 +768,7 @@ fn load_probes(cli: &CliConfig) -> std::io::Result<Vec<ProbeSpec>> {
     let custom_probe_lines = collect_custom_probe_lines(cli)?;
     let mut probe_lines = match cli.probe_mode {
         ProbeMode::Replace => Vec::new(),
-        ProbeMode::Append => DEFAULT_PROBE_LINES
-            .iter()
-            .map(|line| (*line).to_string())
-            .collect(),
+        ProbeMode::Append => DEFAULT_PROBE_LINES.iter().map(|line| (*line).to_string()).collect(),
     };
 
     if custom_probe_lines.is_empty() {
@@ -864,10 +777,7 @@ fn load_probes(cli: &CliConfig) -> std::io::Result<Vec<ProbeSpec>> {
         }
         let probes = load_default_probes();
         if probes.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "no probes were loaded",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no probes were loaded"));
         }
         return Ok(probes);
     }
@@ -892,12 +802,7 @@ fn parse_probe_specs(lines: &[String]) -> std::io::Result<Vec<ProbeSpec>> {
         .map(|(index, line)| {
             parse_hex_line(line.as_str())
                 .map(|bytes| ProbeSpec { bytes })
-                .map_err(|_| {
-                    Error::new(
-                        InvalidInput,
-                        format!("invalid probe hex at entry {}: {}", index + 1, line),
-                    )
-                })
+                .map_err(|_| Error::new(InvalidInput, format!("invalid probe hex at entry {}: {}", index + 1, line)))
         })
         .collect();
 
@@ -943,11 +848,7 @@ fn buffer_contains_record_from_tail(data: &[u8], record_type: u8, record_len: u1
     }
 
     for pos in (0..=data.len() - full_len).rev() {
-        if data[pos] == record_type
-            && data[pos + 1] == 0x03
-            && data[pos + 2] == 0x03
-            && read_be16(&data[pos + 3..pos + 5]) == record_len
-        {
+        if data[pos] == record_type && data[pos + 1] == 0x03 && data[pos + 2] == 0x03 && read_be16(&data[pos + 3..pos + 5]) == record_len {
             return true;
         }
     }
@@ -958,10 +859,7 @@ fn buffer_contains_record_from_tail(data: &[u8], record_type: u8, record_len: u1
 fn replay_status_is_connection_error(status: ReplayStatus) -> bool {
     matches!(
         status,
-        ReplayStatus::SocketFailed
-            | ReplayStatus::NonblockFailed
-            | ReplayStatus::BindFailed
-            | ReplayStatus::ConnectFailed
+        ReplayStatus::SocketFailed | ReplayStatus::NonblockFailed | ReplayStatus::BindFailed | ReplayStatus::ConnectFailed
     )
 }
 
@@ -977,15 +875,11 @@ fn probe_rounds_match(a: &[ReplayProbeResult], b: &[ReplayProbeResult]) -> bool 
     a.len() == b.len()
         && a.iter()
             .zip(b.iter())
-            .all(|(left, right)| {
-                replay_result_probe_status(left) == replay_result_probe_status(right)
-            })
+            .all(|(left, right)| replay_result_probe_status(left) == replay_result_probe_status(right))
 }
 
 fn probe_round_has_signal(results: &[ReplayProbeResult]) -> bool {
-    results
-        .iter()
-        .any(|result| replay_result_probe_status(result) != ProbeStatus::None)
+    results.iter().any(|result| replay_result_probe_status(result) != ProbeStatus::None)
 }
 
 fn report_filter_matches_a_fingerprint(results: &[ReplayProbeResult]) -> bool {
@@ -1041,12 +935,7 @@ fn format_client_hello(target: &str, info: &ClientHelloInfo) -> String {
     let mut parts = Vec::new();
     parts.push(format!(
         "TLS ClientHello target={} record_version=0x{:02x}{:02x} legacy_version=0x{:04x} cipher_suites={} extensions={}",
-        target,
-        info.record_version_major,
-        info.record_version_minor,
-        info.legacy_version,
-        info.cipher_suite_count,
-        info.extension_count
+        target, info.record_version_major, info.record_version_minor, info.legacy_version, info.cipher_suite_count, info.extension_count
     ));
     if !info.sni.is_empty() {
         parts.push(format!("sni={}", info.sni));
@@ -1061,10 +950,7 @@ fn format_client_hello(target: &str, info: &ClientHelloInfo) -> String {
 }
 
 fn format_server_hello(target: &str, info: &ServerHelloInfo) -> String {
-    format!(
-        "TLS ServerHello target={} selected_version=0x{:04x}",
-        target, info.selected_version
-    )
+    format!("TLS ServerHello target={} selected_version=0x{:04x}", target, info.selected_version)
 }
 
 fn parse_client_hello(data: &[u8]) -> Option<(ClientHelloInfo, usize)> {
@@ -1076,9 +962,7 @@ fn parse_client_hello(data: &[u8]) -> Option<(ClientHelloInfo, usize)> {
 
     let tls_record_len = read_be16(&record[3..5]);
     let hs_len = read_be24(&record[6..9]);
-    if (tls_record_len as usize) + 5 > record_len
-        || (hs_len as usize) + 9 > (tls_record_len as usize) + 5
-    {
+    if (tls_record_len as usize) + 5 > record_len || (hs_len as usize) + 9 > (tls_record_len as usize) + 5 {
         return None;
     }
 
@@ -1122,8 +1006,7 @@ fn parse_client_hello(data: &[u8]) -> Option<(ClientHelloInfo, usize)> {
         let extensions_len = read_be16(&body[off..off + 2]) as usize;
         off += 2;
         if off + extensions_len <= body.len() {
-            let (sni, alpn, versions, extension_count) =
-                parse_extensions(&body[off..off + extensions_len]);
+            let (sni, alpn, versions, extension_count) = parse_extensions(&body[off..off + extensions_len]);
             info.sni = sni;
             info.alpn = alpn;
             info.supported_versions = versions;
@@ -1143,9 +1026,7 @@ fn parse_server_hello(data: &[u8]) -> Option<ServerHelloInfo> {
 
     let tls_record_len = read_be16(&record[3..5]);
     let hs_len = read_be24(&record[6..9]);
-    if (tls_record_len as usize) + 5 > record_len
-        || (hs_len as usize) + 9 > (tls_record_len as usize) + 5
-    {
+    if (tls_record_len as usize) + 5 > record_len || (hs_len as usize) + 9 > (tls_record_len as usize) + 5 {
         return None;
     }
 
@@ -1291,13 +1172,7 @@ fn parse_extensions(exts: &[u8]) -> (String, String, String, usize) {
 fn printable_string(bytes: &[u8]) -> String {
     bytes
         .iter()
-        .map(|&b| {
-            if (0x20..=0x7e).contains(&b) {
-                b as char
-            } else {
-                '.'
-            }
-        })
+        .map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { '.' })
         .collect()
 }
 
@@ -1340,30 +1215,18 @@ fn randomize_client_hello_legacy_session_id(
     true
 }
 
-async fn read_request(
-    stream: OwnedReadHalf,
-) -> std::io::Result<(String, String, TokioBufReader<OwnedReadHalf>)> {
+async fn read_request(stream: OwnedReadHalf) -> std::io::Result<(String, String, TokioBufReader<OwnedReadHalf>)> {
     let mut reader = TokioBufReader::new(stream);
 
     let mut first_line = String::new();
-    if reader
-        .read_line(&mut first_line)
-        .await?
-        == 0
-    {
+    if reader.read_line(&mut first_line).await? == 0 {
         use std::io::ErrorKind::UnexpectedEof;
         return Err(std::io::Error::new(UnexpectedEof, "empty request"));
     }
 
     let mut parts = first_line.split_whitespace();
-    let method = parts
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let target = parts
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    let method = parts.next().unwrap_or_default().to_string();
+    let target = parts.next().unwrap_or_default().to_string();
 
     loop {
         let mut line = String::new();

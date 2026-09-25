@@ -1,7 +1,7 @@
 [package]
 name = "anyreality"
 version = "0.4.2"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [[bin]]
@@ -14,7 +14,7 @@ path = "bin/server.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-anytls = { version = "0.3.15", default-features = false, features = [
+anytls = { version = "0.4.1", default-features = false, features = [
     "core",
     "uot",
     "runtime",

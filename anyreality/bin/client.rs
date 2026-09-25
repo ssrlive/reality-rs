@@ -22,12 +22,9 @@
 use anyreality::{AnytlsStreamReader, async_bridge};
 
 use anyhow::{Context, Result, anyhow, bail};
-use anytls::AsyncReadWrite;
-use anytls::core::PaddingFactory;
-use anytls::proxy::session::{Client, Stream as AnytlsStream};
-use anytls::runtime::DefaultPaddingFactory;
-use anytls::uot::{
-    UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination,
+use anytls::{
+    AsyncReadWrite, Client, DEFAULT_SCHEME, PaddingFactory, Stream as AnytlsStream, UotMode, UotRequest, uot_encode_packet,
+    uot_get_packet_from_stream, uot_sentinel_destination,
 };
 use clap::Parser;
 use core::net::SocketAddr;
@@ -39,9 +36,7 @@ use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
 use socks5_impl::protocol::{Address, Reply};
 use socks5_impl::server::auth::NoAuth;
-use socks5_impl::server::connection::{
-    ClientConnection as SocksClientConnection, IncomingConnection, associate, connect,
-};
+use socks5_impl::server::connection::{ClientConnection as SocksClientConnection, IncomingConnection, associate, connect};
 use socks5_impl::server::{AssociatedUdpSocket, UdpAssociate};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,17 +54,16 @@ const DEFAULT_CLIENT_HELLO_PROFILE: &str = "default";
 const DEFAULT_HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_HTTP_HEADER_LIMIT: usize = 16 * 1024;
 const DEFAULT_PADDING_LEN: usize = 0;
-const STREAM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
     /// Path to the grouped client config (`.toml` or `.json`).
-    #[arg(short, long)]
+    #[arg(short, long, value_name = "FILE")]
     config: PathBuf,
 
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
-    #[arg(short, long, default_value = DEFAULT_LOG_LEVEL)]
+    #[arg(short, long, value_name = "LEVEL", default_value = DEFAULT_LOG_LEVEL)]
     log: log::LevelFilter,
 }
 
@@ -145,40 +139,18 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log)).init();
 
     let resolved = resolve_client_config(&args.config)?;
-    let reality = resolved
-        .reality
-        .as_ref()
-        .expect("validated reality config");
-    let anytls = resolved
-        .anytls
-        .as_ref()
-        .expect("validated anytls config");
-    let client = resolved
-        .client
-        .as_ref()
-        .expect("validated client config");
+    let reality = resolved.reality.as_ref().expect("validated reality config");
+    let anytls = resolved.anytls.as_ref().expect("validated anytls config");
+    let client = resolved.client.as_ref().expect("validated client config");
     let tls_config = Arc::new(build_rustls_client_config(reality)?);
-    let listen = client
-        .listen
-        .expect("validated client listen address");
-    let server_addr = client
-        .server_addr
-        .clone()
-        .expect("validated client server address");
-    let server_name = reality
-        .server_name
-        .clone()
-        .expect("validated reality server name");
-    let padding = DefaultPaddingFactory::load();
+    let listen = client.listen.expect("validated client listen address");
+    let server_addr = client.server_addr.clone().expect("validated client server address");
+    let server_name = reality.server_name.clone().expect("validated reality server name");
+    let padding = Arc::new(tokio::sync::RwLock::new(
+        PaddingFactory::new(DEFAULT_SCHEME).expect("valid default padding scheme"),
+    ));
 
-    let password_sha256 = Sha256::digest(
-        anytls
-            .password
-            .as_deref()
-            .expect("validated anytls password")
-            .as_bytes(),
-    )
-    .into();
+    let password_sha256 = Sha256::digest(anytls.password.as_deref().expect("validated anytls password").as_bytes()).into();
 
     let dial_ctx = Arc::new(DialCtx {
         server_addr: server_addr.clone(),
@@ -193,17 +165,16 @@ async fn main() -> Result<()> {
     // anytls Client owns the session pool. On every `create_stream()` it
     // picks an idle session or invokes `dial_out` to build a new one.
     let dial_ctx_for_dial = dial_ctx.clone();
-    let anytls_client = Arc::new(Client::new(
-        Box::new(move || {
+    let anytls_client = Client::new(
+        Arc::new(move || {
             let ctx = dial_ctx_for_dial.clone();
             Box::pin(async move { dial_carrier(ctx).await })
         }),
         padding,
-        Duration::from_secs(anytls.idle_check_secs.unwrap()),
         Duration::from_secs(anytls.idle_timeout_secs.unwrap()),
-        anytls.min_idle_sessions.unwrap(),
         anytls.max_streams_per_session.unwrap(),
-    ));
+        Duration::ZERO,
+    );
 
     log::info!(
         "REALITY+anytls client: mixed SOCKS5/HTTP {} -> {} (sni={})",
@@ -222,12 +193,8 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let result = match detect_local_proxy_protocol(&stream).await {
                 Ok(None) => Ok(()),
-                Ok(Some(LocalProxyProtocol::Socks5)) => {
-                    handle_socks(IncomingConnection::new(stream, auth), anytls_client).await
-                }
-                Ok(Some(LocalProxyProtocol::Http)) => {
-                    handle_http_connect(stream, anytls_client).await
-                }
+                Ok(Some(LocalProxyProtocol::Socks5)) => handle_socks(IncomingConnection::new(stream, auth), anytls_client).await,
+                Ok(Some(LocalProxyProtocol::Http)) => handle_http_connect(stream, anytls_client).await,
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
@@ -257,16 +224,15 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
     let server_name = ctx.server_name.clone();
     let tls = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
         std_tcp.set_nonblocking(false)?;
-        let server_name = rustls::pki_types::ServerName::try_from(server_name)
-            .map_err(|err| std::io::Error::other(format!("invalid sni: {err}")))?;
+        let server_name =
+            rustls::pki_types::ServerName::try_from(server_name).map_err(|err| std::io::Error::other(format!("invalid sni: {err}")))?;
         let mut conn = tls_config
             .connect(server_name)
             .build()
             .map_err(|err| std::io::Error::other(format!("rustls build: {err}")))?;
         let mut sock = std_tcp;
         while conn.is_handshaking() {
-            complete_io(&mut sock, &mut conn)
-                .map_err(|err| std::io::Error::other(format!("reality handshake: {err}")))?;
+            complete_io(&mut sock, &mut conn).map_err(|err| std::io::Error::other(format!("reality handshake: {err}")))?;
         }
         Ok(StreamOwned::new(conn, sock))
     })
@@ -274,8 +240,7 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
     .map_err(|err| std::io::Error::other(format!("join handshake task: {err}")))??;
 
     // 3) Bridge blocking TLS into an async duplex carrier.
-    let mut bridge = async_bridge::into_async(tls)
-        .map_err(|err| std::io::Error::other(format!("async bridge: {err}")))?;
+    let mut bridge = async_bridge::into_async(tls).map_err(|err| std::io::Error::other(format!("async bridge: {err}")))?;
 
     // 4) Send anytls auth header:
     //    sha256(password) || u16be(padding_len) || padding_len zero bytes
@@ -307,25 +272,16 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
     Ok(Box::new(bridge) as Box<dyn AsyncReadWrite>)
 }
 
-async fn connect_via_probe_proxy(
-    proxy_addr: SocketAddr,
-    target: &str,
-) -> std::io::Result<TcpStream> {
+async fn connect_via_probe_proxy(proxy_addr: SocketAddr, target: &str) -> std::io::Result<TcpStream> {
     let mut stream = TcpStream::connect(proxy_addr).await?;
     stream.set_nodelay(true)?;
 
-    let connect_request = format!(
-        "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
-    );
-    stream
-        .write_all(connect_request.as_bytes())
-        .await?;
+    let connect_request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Connection: Keep-Alive\r\n\r\n");
+    stream.write_all(connect_request.as_bytes()).await?;
 
     let mut reader = TokioBufReader::new(stream);
     let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .await?;
+    reader.read_line(&mut status_line).await?;
     if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
         return Err(std::io::Error::other(format!(
             "HTTP proxy CONNECT failed: {}",
@@ -351,12 +307,8 @@ async fn handle_socks(incoming: IncomingConnection, client: Arc<Client>) -> Resu
     let request = authenticated.wait_request().await?;
 
     match request {
-        SocksClientConnection::Connect(connect_req, target) => {
-            handle_tcp_connect(connect_req, target, &client).await
-        }
-        SocksClientConnection::UdpAssociate(associate_req, _) => {
-            handle_udp_associate(associate_req, &client).await
-        }
+        SocksClientConnection::Connect(connect_req, target) => handle_tcp_connect(connect_req, target, &client).await,
+        SocksClientConnection::UdpAssociate(associate_req, _) => handle_udp_associate(associate_req, &client).await,
         SocksClientConnection::Bind(_, _) => bail!("SOCKS BIND is not supported"),
     }
 }
@@ -385,10 +337,7 @@ async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> 
         .with_context(|| http_header_timeout_context(&request))??;
 
     let text = std::str::from_utf8(&request).context("HTTP proxy request is not UTF-8")?;
-    let request_line = text
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow!("HTTP proxy request is empty"))?;
+    let request_line = text.lines().next().ok_or_else(|| anyhow!("HTTP proxy request is empty"))?;
     let mut fields = request_line.split_whitespace();
     let method = fields.next().unwrap_or_default();
     let target = fields.next().unwrap_or_default();
@@ -400,50 +349,32 @@ async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> 
     }
     let target = Address::try_from(target).context("invalid HTTP CONNECT target")?;
 
-    let session = client.create_stream().await?;
+    let session = Arc::new(client.create_stream().await?);
     log::debug!(
         "session={} stream={} stage=target_submit protocol=http-connect peer={:?} target={target}",
-        session.session_id(),
+        session.session_id().unwrap_or_default(),
         session.id(),
         tcp_stream.peer_addr()
     );
-    if let Err(err) = session
-        .write(&Vec::<u8>::from(target.clone()))
-        .await
-    {
-        let _ = session.terminate().await;
+    if let Err(err) = session.write(&Vec::<u8>::from(target.clone())).await {
         return Err(err.into());
     }
-    if let Err(err) = wait_for_stream_handshake(&session).await {
-        let _ = session.terminate().await;
-        return Err(err.into());
-    }
-    if let Err(error) = tcp_stream
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await
-    {
-        let _ = session.close().await;
+    if let Err(error) = tcp_stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await {
         return Err(error.into());
     }
-    anyreality::relay_tcp(tcp_stream, session).await?;
+    let mut reader = AnytlsStreamReader::new(session.clone());
+    anyreality::relay_tcp(tcp_stream, session, &mut reader).await?;
     Ok(())
 }
 
-async fn handle_tcp_connect(
-    connect_req: connect::Connect<connect::NeedReply>,
-    target: Address,
-    client: &Client,
-) -> Result<()> {
+async fn handle_tcp_connect(connect_req: connect::Connect<connect::NeedReply>, target: Address, client: &Arc<Client>) -> Result<()> {
     let bind_addr = Address::from(connect_req.local_addr()?);
 
     // Open the anytls stream before reporting success to the SOCKS client.
     let session = match client.create_stream().await {
-        Ok(s) => s,
+        Ok(s) => Arc::new(s),
         Err(err) => {
-            if let Ok(mut failed) = connect_req
-                .reply(Reply::GeneralFailure, Address::unspecified())
-                .await
-            {
+            if let Ok(mut failed) = connect_req.reply(Reply::GeneralFailure, Address::unspecified()).await {
                 let _ = failed.shutdown().await;
             }
             return Err(err.into());
@@ -454,43 +385,25 @@ async fn handle_tcp_connect(
     // format. Becomes the data of the first cmdPSH frame.
     log::debug!(
         "session={} stream={} stage=target_submit protocol=socks5 target={target}",
-        session.session_id(),
+        session.session_id().unwrap_or_default(),
         session.id()
     );
     let addr_bytes: Vec<u8> = target.clone().into();
     if let Err(err) = session.write(&addr_bytes).await {
-        let _ = session.terminate().await;
-        if let Ok(mut failed) = connect_req
-            .reply(Reply::GeneralFailure, Address::unspecified())
-            .await
-        {
+        if let Ok(mut failed) = connect_req.reply(Reply::GeneralFailure, Address::unspecified()).await {
             let _ = failed.shutdown().await;
         }
         return Err(err.into());
     }
 
-    if let Err(err) = wait_for_stream_handshake(&session).await {
-        let _ = session.terminate().await;
-        if let Ok(mut failed) = connect_req
-            .reply(Reply::GeneralFailure, Address::unspecified())
-            .await
-        {
-            let _ = failed.shutdown().await;
-        }
-        return Err(err.into());
-    }
-
-    let ready = match connect_req
-        .reply(Reply::Succeeded, bind_addr)
-        .await
-    {
+    let ready = match connect_req.reply(Reply::Succeeded, bind_addr).await {
         Ok(ready) => ready,
         Err(error) => {
-            let _ = session.close().await;
             return Err(error.into());
         }
     };
-    anyreality::relay_tcp(ready, session).await?;
+    let mut reader = AnytlsStreamReader::new(session.clone());
+    anyreality::relay_tcp(ready, session, &mut reader).await?;
     log::trace!("tcp tunnel to {target} closed");
     Ok(())
 }
@@ -509,15 +422,9 @@ async fn detect_local_proxy_protocol(stream: &TcpStream) -> Result<Option<LocalP
     match first_byte[0] {
         0x05 => Ok(Some(LocalProxyProtocol::Socks5)),
         byte if byte.is_ascii_alphabetic() => Ok(Some(LocalProxyProtocol::Http)),
-        0x04 => bail!(
-            "SOCKS4 is not supported; configure this application to use SOCKS5 or HTTP CONNECT"
-        ),
-        0x16 => bail!(
-            "TLS handshake prefix on plaintext proxy port; use HTTP CONNECT or SOCKS5, not an HTTPS proxy"
-        ),
-        byte => bail!(
-            "unsupported local proxy protocol (first_byte=0x{byte:02x}); expected SOCKS5 or HTTP CONNECT"
-        ),
+        0x04 => bail!("SOCKS4 is not supported; configure this application to use SOCKS5 or HTTP CONNECT"),
+        0x16 => bail!("TLS handshake prefix on plaintext proxy port; use HTTP CONNECT or SOCKS5, not an HTTPS proxy"),
+        byte => bail!("unsupported local proxy protocol (first_byte=0x{byte:02x}); expected SOCKS5 or HTTP CONNECT"),
     }
 }
 
@@ -526,10 +433,7 @@ fn http_header_timeout_context(request: &[u8]) -> String {
         "tls-handshake"
     } else if request.starts_with(b"CONNECT ") {
         "http-connect"
-    } else if request
-        .first()
-        .is_some_and(u8::is_ascii_alphabetic)
-    {
+    } else if request.first().is_some_and(u8::is_ascii_alphabetic) {
         "ascii-method-or-other"
     } else if request.is_empty() {
         "empty"
@@ -556,25 +460,15 @@ mod http_diagnostic_tests {
             (0x16, None),
             (0x00, None),
         ] {
-            let listener = TcpListener::bind("127.0.0.1:0")
-                .await
-                .unwrap();
-            let mut sender = TcpStream::connect(listener.local_addr().unwrap())
-                .await
-                .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut sender = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
             let (receiver, _) = listener.accept().await.unwrap();
             let mut payload = [0u8; 26];
             payload[0] = prefix;
-            sender
-                .write_all(&payload)
+            sender.write_all(&payload).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(1), detect_local_proxy_protocol(&receiver))
                 .await
-                .unwrap();
-            let result = tokio::time::timeout(
-                Duration::from_secs(1),
-                detect_local_proxy_protocol(&receiver),
-            )
-            .await
-            .expect("protocol detection must not wait for HTTP headers");
+                .expect("protocol detection must not wait for HTTP headers");
             if let Some(expected) = expected {
                 assert_eq!(result.unwrap(), Some(expected));
                 let mut byte = [0u8; 1];
@@ -609,51 +503,12 @@ mod http_diagnostic_tests {
     }
 }
 
-async fn wait_for_stream_handshake(stream: &Arc<AnytlsStream>) -> std::io::Result<()> {
-    let started = tokio::time::Instant::now();
-    log::debug!(
-        "session={} stream={} stage=handshake_wait",
-        stream.session_id(),
-        stream.id()
-    );
-    let result =
-        match tokio::time::timeout(STREAM_HANDSHAKE_TIMEOUT, stream.wait_for_handshake()).await {
-            Ok(result) => result,
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "timed out waiting for SYNACK",
-            )),
-        };
-    log::debug!(
-        "session={} stream={} stage=handshake_complete elapsed_ms={} result={result:?}",
-        stream.session_id(),
-        stream.id(),
-        started.elapsed().as_millis()
-    );
-    result.map_err(|error| {
-        std::io::Error::new(
-            error.kind(),
-            format!(
-                "{error} (session={}, stream={}, elapsed_ms={})",
-                stream.session_id(),
-                stream.id(),
-                started.elapsed().as_millis()
-            ),
-        )
-    })
-}
-
-async fn handle_udp_associate(
-    associate_req: UdpAssociate<associate::NeedReply>,
-    client: &Client,
-) -> Result<()> {
+async fn handle_udp_associate(associate_req: UdpAssociate<associate::NeedReply>, client: &Arc<Client>) -> Result<()> {
     let listen_ip = associate_req.local_addr()?.ip();
     let udp = match UdpSocket::bind(SocketAddr::from((listen_ip, 0))).await {
         Ok(socket) => socket,
         Err(err) => {
-            let mut reply = associate_req
-                .reply(Reply::GeneralFailure, Address::unspecified())
-                .await?;
+            let mut reply = associate_req.reply(Reply::GeneralFailure, Address::unspecified()).await?;
             reply.shutdown().await?;
             return Err(err.into());
         }
@@ -661,11 +516,9 @@ async fn handle_udp_associate(
     let listen_addr = udp.local_addr()?;
 
     let session = match client.create_stream().await {
-        Ok(s) => s,
+        Ok(s) => Arc::new(s),
         Err(err) => {
-            let mut reply = associate_req
-                .reply(Reply::GeneralFailure, Address::unspecified())
-                .await?;
+            let mut reply = associate_req.reply(Reply::GeneralFailure, Address::unspecified()).await?;
             reply.shutdown().await?;
             return Err(err.into());
         }
@@ -675,29 +528,15 @@ async fn handle_udp_associate(
     //   sentinel address (SocksAddr) + UotRequest{Datagram, unspecified}
     log::debug!(
         "session={} stream={} stage=target_submit protocol=uot",
-        session.session_id(),
+        session.session_id().unwrap_or_default(),
         session.id()
     );
     if let Err(err) = setup_uot_request(&session).await {
-        let _ = session.terminate().await;
-        let mut reply = associate_req
-            .reply(Reply::GeneralFailure, Address::unspecified())
-            .await?;
+        let mut reply = associate_req.reply(Reply::GeneralFailure, Address::unspecified()).await?;
         reply.shutdown().await?;
         return Err(err);
     }
-    if let Err(err) = wait_for_stream_handshake(&session).await {
-        let _ = session.terminate().await;
-        let mut reply = associate_req
-            .reply(Reply::GeneralFailure, Address::unspecified())
-            .await?;
-        reply.shutdown().await?;
-        return Err(err.into());
-    }
-
-    let mut reply = associate_req
-        .reply(Reply::Succeeded, Address::from(listen_addr))
-        .await?;
+    let mut reply = associate_req.reply(Reply::Succeeded, Address::from(listen_addr)).await?;
     let listen_udp = Arc::new(AssociatedUdpSocket::from((udp, MAX_UDP_RELAY_PACKET_SIZE)));
     // Pin the UDP association to the first sender; ignore packets from other sources.
     let incoming_addr = Arc::new(tokio::sync::Mutex::new(Option::<SocketAddr>::None));
@@ -715,9 +554,7 @@ async fn handle_udp_associate(
                 match *guard {
                     None => *guard = Some(src_addr),
                     Some(pinned) if pinned != src_addr => {
-                        log::debug!(
-                            "UDP ASSOCIATE: dropping packet from {src_addr} (pinned to {pinned})"
-                        );
+                        log::debug!("UDP ASSOCIATE: dropping packet from {src_addr} (pinned to {pinned})");
                         drop(guard);
                         continue;
                     }
@@ -730,21 +567,17 @@ async fn handle_udp_associate(
         };
         let download = async {
             loop {
-                let (source, payload) =
-                    uot_get_packet_from_stream(UotMode::Datagram, &mut session_reader).await?;
+                let (source, payload) = uot_get_packet_from_stream(UotMode::Datagram, &mut session_reader).await?;
                 let Some(incoming) = *incoming_addr.lock().await else {
                     continue;
                 };
                 let source = source.ok_or_else(|| anyhow!("UoT datagram missing source"))?;
-                listen_udp
-                    .send_to(&payload, 0, source, incoming)
-                    .await?;
+                listen_udp.send_to(&payload, 0, source, incoming).await?;
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
         };
         tokio::select! {
-            _ = session.wait_for_abort() => Err(anyhow!("AnyTLS stream aborted")),
             result = upload => result,
             result = download => result,
             res = reply.wait_until_closed() => {
@@ -753,11 +586,6 @@ async fn handle_udp_associate(
         }
     };
 
-    if result.is_ok() {
-        let _ = session.close().await;
-    } else {
-        let _ = session.terminate().await;
-    }
     let _ = reply.shutdown().await;
     result
 }
@@ -826,23 +654,13 @@ fn resolve_client_config(config_path: &Path) -> Result<ClientConfigFile> {
     };
 
     if let Some(client) = file_config.client.as_mut() {
-        client
-            .listen
-            .get_or_insert_with(|| DEFAULT_LISTEN_ADDR.parse().unwrap());
+        client.listen.get_or_insert_with(|| DEFAULT_LISTEN_ADDR.parse().unwrap());
     }
     if let Some(anytls) = file_config.anytls.as_mut() {
-        anytls
-            .idle_check_secs
-            .get_or_insert(DEFAULT_IDLE_CHECK_SECS);
-        anytls
-            .idle_timeout_secs
-            .get_or_insert(DEFAULT_IDLE_TIMEOUT_SECS);
-        anytls
-            .min_idle_sessions
-            .get_or_insert(DEFAULT_MIN_IDLE_SESSIONS);
-        anytls
-            .max_streams_per_session
-            .get_or_insert(DEFAULT_MAX_STREAMS_PER_SESSION);
+        anytls.idle_check_secs.get_or_insert(DEFAULT_IDLE_CHECK_SECS);
+        anytls.idle_timeout_secs.get_or_insert(DEFAULT_IDLE_TIMEOUT_SECS);
+        anytls.min_idle_sessions.get_or_insert(DEFAULT_MIN_IDLE_SESSIONS);
+        anytls.max_streams_per_session.get_or_insert(DEFAULT_MAX_STREAMS_PER_SESSION);
         if let Some(max_streams) = anytls.max_streams_per_session.as_mut() {
             *max_streams = (*max_streams).max(1);
         }
@@ -885,11 +703,7 @@ fn build_rustls_client_config(args: &ClientRealityConfig) -> Result<rustls::Clie
 
 fn load_root_store() -> rustls::RootCertStore {
     let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(
-        webpki_roots::TLS_SERVER_ROOTS
-            .iter()
-            .cloned(),
-    );
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     root_store
 }
 
@@ -908,13 +722,7 @@ fn parse_reality_version(version: &str) -> [u8; 3] {
     let version = version.trim();
     assert_eq!(version.len(), 6, "REALITY version must be 6 hex digits");
     let mut parsed = [0u8; 3];
-    for (index, chunk) in version
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .enumerate()
-    {
+    for (index, chunk) in version.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         parsed[index] = parse_hex_byte(chunk[0], chunk[1]);
     }
     parsed

@@ -9,6 +9,9 @@ import subprocess
 import sys
 import time
 
+CURL_CONNECT_TIMEOUT_SECONDS = 5
+CURL_MAX_TIME_SECONDS = 20
+
 
 def binary_path(repo_root, name):
     exe = name + ('.exe' if os.name == 'nt' else '')
@@ -277,7 +280,7 @@ Examples:
             raise RuntimeError('Timed out waiting for HTTP target')
 
         print(f'Starting formal server on {server_listen}')
-        server_entry = start_process(repo_root, [server_binary, '--config', server_config_path], 'reality-server')
+        server_entry = start_process(repo_root, [server_binary, '--log', 'trace', '--config', server_config_path], 'reality-server')
         entries.append(server_entry)
         time.sleep(0.5)
         assert_process_running(server_entry, 'Formal server')
@@ -285,7 +288,7 @@ Examples:
             raise RuntimeError('Timed out waiting for formal server')
 
         print(f'Starting formal client on {client_listen}')
-        client_entry = start_process(repo_root, [client_binary, '--config', client_config_path], 'reality-client')
+        client_entry = start_process(repo_root, [client_binary, '--log', 'trace', '--config', client_config_path], 'reality-client')
         entries.append(client_entry)
         time.sleep(0.5)
         assert_process_running(client_entry, 'Formal client')
@@ -294,14 +297,20 @@ Examples:
 
         print('Running SOCKS5 smoke request')
         response = subprocess.run(
-            ['curl', '--silent', '--show-error', '--socks5-hostname', client_listen, target_uri],
+            [
+                'curl', '--silent', '--show-error',
+                '--connect-timeout', str(CURL_CONNECT_TIMEOUT_SECONDS),
+                '--max-time', str(CURL_MAX_TIME_SECONDS),
+                '--socks5-hostname', client_listen, target_uri,
+            ],
             cwd=repo_root,
             capture_output=True,
             text=True,
+            timeout=CURL_MAX_TIME_SECONDS + 5,
         )
         if response.returncode != 0:
             show_logs(entries)
-            raise RuntimeError('curl exited with a non-zero status')
+            raise RuntimeError(f'curl exited with status {response.returncode}: {response.stderr.strip()}')
 
         smoke_response = response.stdout
         print(f'Smoke response: {smoke_response.rstrip()}')
@@ -310,15 +319,18 @@ Examples:
         http_response = subprocess.run(
             [
                 'curl', '--silent', '--show-error', '--fail', '--proxytunnel',
+                '--connect-timeout', str(CURL_CONNECT_TIMEOUT_SECONDS),
+                '--max-time', str(CURL_MAX_TIME_SECONDS),
                 '--proxy', f'http://{client_listen}', '--noproxy', '', target_uri,
             ],
             cwd=repo_root,
             capture_output=True,
             text=True,
+            timeout=CURL_MAX_TIME_SECONDS + 5,
         )
         if http_response.returncode != 0:
             show_logs(entries)
-            raise RuntimeError('HTTP CONNECT curl probe exited with a non-zero status')
+            raise RuntimeError(f'HTTP CONNECT curl probe exited with status {http_response.returncode}: {http_response.stderr.strip()}')
 
         http_smoke_response = http_response.stdout
         print(f'HTTP CONNECT response: {http_smoke_response.rstrip()}')
@@ -326,14 +338,21 @@ Examples:
         server_host, server_port = split_endpoint(server_listen)
         print(f'Running direct SNI fallback probe to baidu.com on {server_listen}')
         fallback = subprocess.run(
-            ['curl', '--silent', '--show-error', '--fail', '--resolve', f'baidu.com:{server_port}:{server_host}', f'https://baidu.com:{server_port}/'],
+            [
+                'curl', '--silent', '--show-error', '--fail',
+                '--connect-timeout', str(CURL_CONNECT_TIMEOUT_SECONDS),
+                '--max-time', str(CURL_MAX_TIME_SECONDS),
+                '--resolve', f'baidu.com:{server_port}:{server_host}',
+                f'https://baidu.com:{server_port}/',
+            ],
             cwd=repo_root,
             capture_output=True,
             text=True,
+            timeout=CURL_MAX_TIME_SECONDS + 5,
         )
         if fallback.returncode != 0:
             show_logs(entries)
-            raise RuntimeError('Fallback curl probe exited with a non-zero status')
+            raise RuntimeError(f'Fallback curl probe exited with status {fallback.returncode}: {fallback.stderr.strip()}')
 
         print(f'Fallback probe response: {fallback.stdout.rstrip()}')
 

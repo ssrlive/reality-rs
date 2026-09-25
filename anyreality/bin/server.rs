@@ -24,10 +24,10 @@ use anyreality::{AnytlsStreamReader, async_bridge};
 use aes_gcm::aead::AeadInOut;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use anyhow::{Context, Result, bail};
-use anytls::core::PaddingFactory;
-use anytls::proxy::session::{Stream as AnytlsStream, new_server_session};
-use anytls::runtime::DefaultPaddingFactory;
-use anytls::uot::{UotMode, UotRequest, uot_get_request_from_stream, uot_is_sentinel_destination};
+use anytls::{
+    DEFAULT_SCHEME, PaddingFactory, Session, Stream as AnytlsStream, UotMode, UotRequest, uot_get_request_from_stream,
+    uot_is_sentinel_destination,
+};
 use aws_lc_rs::agreement;
 use aws_lc_rs::encoding::{AsBigEndian, Curve25519SeedBin};
 use base64::Engine;
@@ -40,9 +40,7 @@ use rustls::Connection;
 use rustls::ServerConfig;
 use rustls::ServerConnection;
 use rustls::crypto::SelectedCredential;
-use rustls::server::{
-    ClientHello, ClientHelloVerifier, RealityClientHello, ServerCredentialResolver,
-};
+use rustls::server::{ClientHello, ClientHelloVerifier, RealityClientHello, ServerCredentialResolver};
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
@@ -58,13 +56,14 @@ const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_HELLO_MAX_WIRE_SIZE: usize = 128 * 1024;
 const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 128;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_SESSION_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
     /// Path to the grouped server config (`.toml` or `.json`).
     /// Optional — not required when using `--gen-reality-keys`.
-    #[arg(short, long)]
+    #[arg(short, long, value_name = "FILE")]
     config: Option<PathBuf>,
 
     /// Generate an X25519 REALITY keypair (prints privateKey base64url and shortId hex) and exit
@@ -72,7 +71,7 @@ struct Args {
     gen_reality_keys: bool,
 
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
-    #[arg(short, long, default_value = "info")]
+    #[arg(short, long, value_name = "LEVEL", default_value = "info")]
     log: log::LevelFilter,
 }
 
@@ -134,46 +133,29 @@ struct ExampleRealityVerifier {
 struct RejectCredentialResolver;
 
 impl ServerCredentialResolver for RejectCredentialResolver {
-    fn resolve(
-        &self,
-        _client_hello: &ClientHello<'_>,
-    ) -> Result<SelectedCredential, rustls::Error> {
+    fn resolve(&self, _client_hello: &ClientHello<'_>) -> Result<SelectedCredential, rustls::Error> {
         Err(rustls::Error::NoSuitableCertificate)
     }
 }
 
 impl ClientHelloVerifier for ExampleRealityVerifier {
-    fn verify_client_hello(
-        &self,
-        client_hello: &RealityClientHello<'_>,
-    ) -> core::result::Result<(), rustls::Error> {
+    fn verify_client_hello(&self, client_hello: &RealityClientHello<'_>) -> core::result::Result<(), rustls::Error> {
         if !self.server_names.is_empty() {
             let server_name = client_hello
                 .server_name()
                 .map(|name| name.as_ref())
                 .ok_or_else(|| rustls::Error::General("REALITY verifier requires SNI".into()))?;
 
-            if !self
-                .server_names
-                .iter()
-                .any(|allowed| allowed == server_name)
-            {
-                return Err(rustls::Error::General(
-                    "REALITY verifier rejected an unexpected server_name".into(),
-                ));
+            if !self.server_names.iter().any(|allowed| allowed == server_name) {
+                return Err(rustls::Error::General("REALITY verifier rejected an unexpected server_name".into()));
             }
         }
 
-        self.inner
-            .verify_client_hello(client_hello)
+        self.inner.verify_client_hello(client_hello)
     }
 
-    fn reality_auth_key(
-        &self,
-        client_hello: &RealityClientHello<'_>,
-    ) -> core::result::Result<Option<[u8; 32]>, rustls::Error> {
-        self.inner
-            .reality_auth_key(client_hello)
+    fn reality_auth_key(&self, client_hello: &RealityClientHello<'_>) -> core::result::Result<Option<[u8; 32]>, rustls::Error> {
+        self.inner.reality_auth_key(client_hello)
     }
 
     fn hash_config(&self, h: &mut dyn Hasher) {
@@ -199,15 +181,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let config_path = args
-        .config
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("--config is required"))?;
+    let config_path = args.config.as_ref().ok_or_else(|| anyhow::anyhow!("--config is required"))?;
     let resolved = resolve_server_config(config_path)?;
     let tls_config = Arc::new(build_server_config(&resolved)?);
     let allowed_server_names = Arc::new(resolved.server_names.clone());
     let password_sha256: [u8; 32] = Sha256::digest(resolved.password.as_bytes()).into();
-    let padding = DefaultPaddingFactory::load();
+    let padding = Arc::new(tokio::sync::RwLock::new(
+        PaddingFactory::new(DEFAULT_SCHEME).expect("valid default padding scheme"),
+    ));
     let reality_private_key = Arc::new(parse_reality_private_key(&resolved.private_key)?);
     let reality_short_id = Arc::new(parse_reality_short_id_fixed(&resolved.short_id)?);
     let reality_version = parse_reality_version(&resolved.version);
@@ -262,33 +243,25 @@ async fn handle_connection(
     // scanners on this port would freeze every live carrier's SYNACK traffic.
     let detect_key = reality_private_key.clone();
     let detect_short_id = reality_short_id.clone();
-    let (is_reality, std_stream) =
-        tokio::task::spawn_blocking(move || -> Result<(bool, std::net::TcpStream)> {
-            let is_reality = is_reality_client_hello(
-                &std_stream,
-                detect_key.as_slice(),
-                detect_short_id.as_slice(),
-                &reality_version,
-            )?;
-            Ok((is_reality, std_stream))
-        })
-        .await??;
+    let (is_reality, std_stream) = tokio::task::spawn_blocking(move || -> Result<(bool, std::net::TcpStream)> {
+        let is_reality = is_reality_client_hello(&std_stream, detect_key.as_slice(), detect_short_id.as_slice(), &reality_version)?;
+        Ok((is_reality, std_stream))
+    })
+    .await??;
     if !is_reality {
         return handle_raw_tls_fallback(std_stream, allowed_server_names).await;
     }
 
     // 1) REALITY blocking handshake on a worker thread.
-    let tls = tokio::task::spawn_blocking(
-        move || -> Result<StreamOwned<ServerConnection, std::net::TcpStream>> {
-            let mut sock = std_stream;
-            sock.set_nonblocking(false)?;
-            let mut conn = ServerConnection::new(reality_config)?;
-            while conn.is_handshaking() {
-                complete_io(&mut sock, &mut conn).context("complete REALITY handshake")?;
-            }
-            Ok(StreamOwned::new(conn, sock))
-        },
-    )
+    let tls = tokio::task::spawn_blocking(move || -> Result<StreamOwned<ServerConnection, std::net::TcpStream>> {
+        let mut sock = std_stream;
+        sock.set_nonblocking(false)?;
+        let mut conn = ServerConnection::new(reality_config)?;
+        while conn.is_handshaking() {
+            complete_io(&mut sock, &mut conn).context("complete REALITY handshake")?;
+        }
+        Ok(StreamOwned::new(conn, sock))
+    })
     .await??;
 
     // 2) Bridge into async.
@@ -296,10 +269,7 @@ async fn handle_connection(
 
     // 3) Read anytls auth: 32 sha256(password) + u16be padding_len + padding.
     let mut auth = [0u8; 34];
-    bridge
-        .read_exact(&mut auth)
-        .await
-        .context("read anytls auth header")?;
+    bridge.read_exact(&mut auth).await.context("read anytls auth header")?;
     if auth[..32] != password_sha256[..] {
         log::debug!("anytls auth failed for an inbound REALITY peer");
         return Ok(());
@@ -307,46 +277,49 @@ async fn handle_connection(
     let padding_len = u16::from_be_bytes([auth[32], auth[33]]);
     let mut padding_buf = vec![0u8; padding_len as usize];
     if padding_len > 0 {
-        bridge
-            .read_exact(&mut padding_buf)
-            .await
-            .context("read anytls padding")?;
+        bridge.read_exact(&mut padding_buf).await.context("read anytls padding")?;
     }
-    if padding_buf.len() >= 36 {
-        if let Some(client_id) = std::str::from_utf8(&padding_buf[..36])
+    if padding_buf.len() >= 36
+        && let Some(client_id) = std::str::from_utf8(&padding_buf[..36])
             .ok()
             .and_then(|value| uuid::Uuid::parse_str(value).ok())
-        {
-            log::info!("anytls client id: {client_id}");
-        }
+    {
+        log::info!("anytls client id: {client_id}");
     }
 
     // 4) Hand the carrier to anytls and run the session loop.
-    let session = new_server_session(
+    let session = Session::new_server(
+        NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         Box::new(bridge),
-        Box::new(|session: Arc<AnytlsStream>| {
-            tokio::spawn(async move {
-                let session_id = session.session_id();
-                let stream_id = session.id();
-                if let Err(error) = handle_stream(session).await {
-                    log::warn!("session={session_id} stream={stream_id} stage=stream_failed reason={error:#}");
-                }
-            });
-        }),
         padding,
         DEFAULT_MAX_STREAMS_PER_SESSION,
-    )
-    .await;
-
-    log::debug!(
-        "session={} peer={peer_addr} stage=authenticated_session",
-        session.id
     );
+    let session_id = session.id();
+
+    log::debug!("session={} peer={peer_addr} stage=authenticated_session", session_id);
     if let Err(error) = session.run().await {
-        log::debug!(
-            "session={} peer={peer_addr} stage=session_ended reason={error}",
-            session.id
-        );
+        log::debug!("session={} peer={peer_addr} stage=session_ended reason={error}", session_id);
+        return Ok(());
+    }
+    loop {
+        match session.accept_stream().await {
+            Ok(stream) => {
+                tokio::spawn(async move {
+                    let stream = Arc::new(stream);
+                    let stream_id = stream.id();
+                    if let Err(error) = handle_stream(stream.clone()).await {
+                        log::warn!("session={session_id} stream={stream_id} stage=stream_failed reason={error:#}");
+                    }
+                });
+            }
+            Err(error) if !session.is_closed() => {
+                log::debug!("session={session_id} peer={peer_addr} stage=stream_rejected reason={error}");
+            }
+            Err(error) => {
+                log::debug!("session={session_id} peer={peer_addr} stage=session_ended reason={error}");
+                break;
+            }
+        }
     }
     Ok(())
 }
@@ -360,13 +333,13 @@ async fn handle_stream(stream: Arc<AnytlsStream>) -> Result<()> {
     stream.handshake_success().await?;
     log::debug!(
         "session={} stream={} stage=target_read_start",
-        stream.session_id(),
+        stream.session_id().unwrap_or_default(),
         stream.id()
     );
     let mut reader = AnytlsStreamReader::new(stream.clone());
     let destination = match Address::retrieve_from_async_stream(&mut reader).await {
         Ok(destination) => destination,
-        Err(error) if stream.is_terminated().await || is_error_of_session_broken(&error) => {
+        Err(error) if is_error_of_session_broken(&error) => {
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -374,7 +347,7 @@ async fn handle_stream(stream: Arc<AnytlsStream>) -> Result<()> {
 
     log::debug!(
         "session={} stream={} stage=target_read_complete target={destination}",
-        stream.session_id(),
+        stream.session_id().unwrap_or_default(),
         stream.id()
     );
     if uot_is_sentinel_destination(&destination) {
@@ -384,97 +357,82 @@ async fn handle_stream(stream: Arc<AnytlsStream>) -> Result<()> {
             UotMode::Datagram => handle_uot_datagram(stream, &mut reader).await,
         }
     } else {
-        handle_tcp_stream(stream, destination).await
+        handle_tcp_stream(stream, destination, &mut reader).await
     }
 }
 
-async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address) -> Result<()> {
+async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address, reader: &mut AnytlsStreamReader) -> Result<()> {
     let dst = destination.to_string();
     let started = tokio::time::Instant::now();
     log::debug!(
         "session={} stream={} stage=upstream_connect_start target={dst}",
-        stream.session_id(),
+        stream.session_id().unwrap_or_default(),
         stream.id()
     );
-    let outbound = match tokio::time::timeout(
-        UPSTREAM_CONNECT_TIMEOUT,
-        TokioTcpStream::connect(&dst),
-    )
-    .await
-    {
+    let outbound = match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TokioTcpStream::connect(&dst)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(err)) => {
             log::debug!(
                 "session={} stream={} stage=upstream_connect_failed elapsed_ms={} target={dst} reason={err}",
-                stream.session_id(),
+                stream.session_id().unwrap_or_default(),
                 stream.id(),
                 started.elapsed().as_millis()
             );
             // SYNACK was already sent on accept; the upstream is simply dead,
             // so close the stream instead of emitting a duplicate SYNACK.
-            stream.close().await?;
+            stream.shutdown_write().await?;
             return Err(err.into());
         }
         Err(_) => {
             let err = std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!(
-                    "connect upstream {dst} timed out after {}s",
-                    UPSTREAM_CONNECT_TIMEOUT.as_secs()
-                ),
+                format!("connect upstream {dst} timed out after {}s", UPSTREAM_CONNECT_TIMEOUT.as_secs()),
             );
             log::debug!(
                 "session={} stream={} stage=upstream_connect_timeout elapsed_ms={} reason={err}",
-                stream.session_id(),
+                stream.session_id().unwrap_or_default(),
                 stream.id(),
                 started.elapsed().as_millis()
             );
             // SYNACK was already sent on accept; just close on timeout.
-            stream.close().await?;
+            stream.shutdown_write().await?;
             return Err(err.into());
         }
     };
     log::debug!(
         "session={} stream={} stage=upstream_connect_complete elapsed_ms={}",
-        stream.session_id(),
+        stream.session_id().unwrap_or_default(),
         stream.id(),
         started.elapsed().as_millis()
     );
     outbound.set_nodelay(true).ok();
 
-    anyreality::relay_tcp(outbound, stream).await?;
+    anyreality::relay_tcp(outbound, stream, reader).await?;
     Ok(())
 }
 
-async fn handle_uot_datagram(
-    stream: Arc<AnytlsStream>,
-    reader: &mut AnytlsStreamReader,
-) -> Result<()> {
+async fn handle_uot_datagram(stream: Arc<AnytlsStream>, reader: &mut AnytlsStreamReader) -> Result<()> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     let result = anyreality::relay_uot(&udp, &stream, reader, UotMode::Datagram).await;
 
     if result.is_err() {
-        let _ = stream.close().await;
+        let _ = stream.shutdown_write().await;
     }
     result.map_err(Into::into)
 }
 
-async fn handle_uot_connected(
-    stream: Arc<AnytlsStream>,
-    reader: &mut AnytlsStreamReader,
-    request: &UotRequest,
-) -> Result<()> {
+async fn handle_uot_connected(stream: Arc<AnytlsStream>, reader: &mut AnytlsStreamReader, request: &UotRequest) -> Result<()> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     let dst = request.destination.to_string();
     if let Err(err) = udp.connect(&dst).await {
         // SYNACK was already sent on accept; close on connect failure.
-        stream.close().await?;
+        stream.shutdown_write().await?;
         return Err(err.into());
     }
     let result = anyreality::relay_uot(&udp, &stream, reader, UotMode::Connected).await;
 
     if result.is_err() {
-        let _ = stream.close().await;
+        let _ = stream.shutdown_write().await;
     }
     result.map_err(Into::into)
 }
@@ -496,10 +454,7 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("server config requires a [server] section"))?;
 
-    let listen = server
-        .listen
-        .clone()
-        .unwrap_or_else(|| "[::]:443".to_string());
+    let listen = server.listen.clone().unwrap_or_else(|| "[::]:443".to_string());
     let password = anytls
         .password
         .clone()
@@ -587,10 +542,7 @@ fn is_reality_client_hello(
             // A SO_RCVTIMEO timeout surfaces as TimedOut or WouldBlock (EAGAIN
             // on Linux); both mean "no data yet", so keep waiting until the
             // deadline instead of failing an otherwise valid slow client.
-            Err(error)
-                if error.kind() == std::io::ErrorKind::TimedOut
-                    || error.kind() == std::io::ErrorKind::WouldBlock =>
-            {
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut || error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(1));
                 continue;
             }
@@ -617,32 +569,24 @@ fn is_reality_client_hello(
         }
 
         let private_key =
-            agreement::PrivateKey::from_private_key(&agreement::X25519, server_private_key)
-                .context("parse REALITY private key bytes")?;
+            agreement::PrivateKey::from_private_key(&agreement::X25519, server_private_key).context("parse REALITY private key bytes")?;
         if parsed.key_share.is_empty() {
             return Ok(false);
         }
         let peer_public = agreement::UnparsedPublicKey::new(&agreement::X25519, &parsed.key_share);
-        let reality_key = agreement::agree(
-            &private_key,
-            peer_public,
-            aws_lc_rs::error::Unspecified,
-            |secret| Ok::<Vec<u8>, aws_lc_rs::error::Unspecified>(Vec::from(secret)),
-        )
+        let reality_key = agreement::agree(&private_key, peer_public, aws_lc_rs::error::Unspecified, |secret| {
+            Ok::<Vec<u8>, aws_lc_rs::error::Unspecified>(Vec::from(secret))
+        })
         .map_err(|_| anyhow::anyhow!("failed to compute REALITY shared secret"))?;
 
         let hk = Hkdf::<Sha256>::new(Some(&parsed.random[..20]), &reality_key);
         let mut sealing_key = [0u8; 32];
-        hk.expand(b"REALITY", &mut sealing_key)
-            .context("derive REALITY sealing key")?;
+        hk.expand(b"REALITY", &mut sealing_key).context("derive REALITY sealing key")?;
 
         let cipher = Aes256Gcm::new(&sealing_key.into());
         let mut decrypted = parsed.session_id.clone();
         let nonce = Nonce::try_from(&parsed.random[20..32])?;
-        if cipher
-            .decrypt_in_place(&nonce, &parsed.raw_client_hello, &mut decrypted)
-            .is_err()
-        {
+        if cipher.decrypt_in_place(&nonce, &parsed.raw_client_hello, &mut decrypted).is_err() {
             return Ok(false);
         }
 
@@ -694,9 +638,7 @@ fn collect_client_hello(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
             if handshake[0] != 1 {
                 bail!("not a ClientHello")
             }
-            let client_hello_len = ((handshake[1] as usize) << 16)
-                | ((handshake[2] as usize) << 8)
-                | handshake[3] as usize;
+            let client_hello_len = ((handshake[1] as usize) << 16) | ((handshake[2] as usize) << 8) | handshake[3] as usize;
             let total_len = client_hello_len
                 .checked_add(4)
                 .ok_or_else(|| anyhow::anyhow!("ClientHello length overflow"))?;
@@ -706,11 +648,11 @@ fn collect_client_hello(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
             expected_len = Some(total_len);
         }
 
-        if let Some(expected_len) = expected_len {
-            if handshake.len() >= expected_len {
-                handshake.truncate(expected_len);
-                return Ok(Some(handshake));
-            }
+        if let Some(expected_len) = expected_len
+            && handshake.len() >= expected_len
+        {
+            handshake.truncate(expected_len);
+            return Ok(Some(handshake));
         }
     }
 
@@ -722,8 +664,7 @@ fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello> {
         bail!("not a ClientHello")
     }
 
-    let handshake_len =
-        ((bytes[1] as usize) << 16) | ((bytes[2] as usize) << 8) | (bytes[3] as usize);
+    let handshake_len = ((bytes[1] as usize) << 16) | ((bytes[2] as usize) << 8) | (bytes[3] as usize);
     if handshake_len < 34 || handshake_len + 4 > bytes.len() {
         bail!("truncated ClientHello")
     }
@@ -738,10 +679,7 @@ fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello> {
     );
     offset = random_end;
 
-    let session_id_len = *body
-        .get(offset)
-        .ok_or_else(|| anyhow::anyhow!("missing session ID length"))?
-        as usize;
+    let session_id_len = *body.get(offset).ok_or_else(|| anyhow::anyhow!("missing session ID length"))? as usize;
     offset += 1;
 
     let session_id_offset = offset;
@@ -756,8 +694,7 @@ fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello> {
     take_bytes(body, &mut offset, cipher_suites_len, "cipher suites")?;
     let compression_len = *body
         .get(offset)
-        .ok_or_else(|| anyhow::anyhow!("missing compression methods length"))?
-        as usize;
+        .ok_or_else(|| anyhow::anyhow!("missing compression methods length"))? as usize;
     offset += 1 + compression_len;
     if offset > body.len() {
         bail!("truncated ClientHello after compression")
@@ -803,15 +740,8 @@ fn read_u16(bytes: &[u8], offset: &mut usize, field: &str) -> Result<usize> {
     Ok(u16::from_be_bytes([value[0], value[1]]) as usize)
 }
 
-fn take_bytes<'a>(
-    bytes: &'a [u8],
-    offset: &mut usize,
-    length: usize,
-    field: &str,
-) -> Result<&'a [u8]> {
-    let end = offset
-        .checked_add(length)
-        .ok_or_else(|| anyhow::anyhow!("ClientHello overflow"))?;
+fn take_bytes<'a>(bytes: &'a [u8], offset: &mut usize, length: usize, field: &str) -> Result<&'a [u8]> {
+    let end = offset.checked_add(length).ok_or_else(|| anyhow::anyhow!("ClientHello overflow"))?;
     let value = bytes
         .get(*offset..end)
         .ok_or_else(|| anyhow::anyhow!("truncated ClientHello {field}"))?;
@@ -856,16 +786,11 @@ fn parse_x25519_key_share(extension: &[u8]) -> Result<Option<Vec<u8>>> {
 
 fn generate_reality_keypair() -> Result<()> {
     // Generate an X25519 private key and derive public, then print Xray-style fields.
-    let priv_key = agreement::PrivateKey::generate(&agreement::X25519)
-        .context("generate X25519 private key")?;
-    let pub_key = priv_key
-        .compute_public_key()
-        .context("compute public key")?;
+    let priv_key = agreement::PrivateKey::generate(&agreement::X25519).context("generate X25519 private key")?;
+    let pub_key = priv_key.compute_public_key().context("compute public key")?;
 
     // Extract raw private seed bytes (32 bytes)
-    let raw_priv: Curve25519SeedBin<'_> = priv_key
-        .as_be_bytes()
-        .context("extract private key bytes")?;
+    let raw_priv: Curve25519SeedBin<'_> = priv_key.as_be_bytes().context("extract private key bytes")?;
     let priv_bytes = raw_priv.as_ref();
 
     // base64url no-padding privateKey (Xray style)
@@ -889,55 +814,41 @@ fn generate_reality_keypair() -> Result<()> {
     Ok(())
 }
 
-async fn handle_raw_tls_fallback(
-    tcp_client: std::net::TcpStream,
-    allowed_server_names: Arc<Vec<String>>,
-) -> Result<()> {
+async fn handle_raw_tls_fallback(tcp_client: std::net::TcpStream, allowed_server_names: Arc<Vec<String>>) -> Result<()> {
     // The SNI sniff also does blocking reads for up to CLIENT_HELLO_TIMEOUT;
     // keep it on the blocking pool so it never occupies an async worker thread.
-    let (server_name, tcp_client) =
-        tokio::task::spawn_blocking(move || -> Result<(String, std::net::TcpStream)> {
-            tcp_client.set_read_timeout(Some(Duration::from_secs(1)))?;
-            let mut buffer = vec![0u8; 2048];
-            let deadline = Instant::now() + CLIENT_HELLO_TIMEOUT;
-            let handshake = loop {
-                if Instant::now() >= deadline {
-                    bail!("timed out waiting for fallback ClientHello");
-                }
-                let available = match tcp_client.peek(&mut buffer) {
-                    Ok(available) => available,
-                    // Timeout on a slow client shows up as TimedOut or
-                    // WouldBlock (EAGAIN on Linux); keep waiting either way.
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::TimedOut
-                            || error.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
-                        0
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                let Some(handshake) = collect_client_hello(&buffer[..available])? else {
-                    if buffer.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
-                        bail!("ClientHello exceeds maximum size");
-                    }
-                    buffer.resize((buffer.len() * 2).min(CLIENT_HELLO_MAX_WIRE_SIZE), 0);
-                    thread::sleep(Duration::from_millis(1));
-                    continue;
-                };
-                break handshake;
+    let (server_name, tcp_client) = tokio::task::spawn_blocking(move || -> Result<(String, std::net::TcpStream)> {
+        tcp_client.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let mut buffer = vec![0u8; 2048];
+        let deadline = Instant::now() + CLIENT_HELLO_TIMEOUT;
+        let handshake = loop {
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for fallback ClientHello");
+            }
+            let available = match tcp_client.peek(&mut buffer) {
+                Ok(available) => available,
+                // Timeout on a slow client shows up as TimedOut or
+                // WouldBlock (EAGAIN on Linux); keep waiting either way.
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut || error.kind() == std::io::ErrorKind::WouldBlock => 0,
+                Err(error) => return Err(error.into()),
             };
-            let parsed = parse_client_hello(&handshake)?;
-            let server_name = parsed
-                .server_name
-                .ok_or_else(|| anyhow::anyhow!("fallback requires SNI"))?;
-            Ok((server_name, tcp_client))
-        })
-        .await??;
+            let Some(handshake) = collect_client_hello(&buffer[..available])? else {
+                if buffer.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
+                    bail!("ClientHello exceeds maximum size");
+                }
+                buffer.resize((buffer.len() * 2).min(CLIENT_HELLO_MAX_WIRE_SIZE), 0);
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            break handshake;
+        };
+        let parsed = parse_client_hello(&handshake)?;
+        let server_name = parsed.server_name.ok_or_else(|| anyhow::anyhow!("fallback requires SNI"))?;
+        Ok((server_name, tcp_client))
+    })
+    .await??;
 
-    if !allowed_server_names
-        .iter()
-        .any(|allowed| allowed == &server_name)
-    {
+    if !allowed_server_names.iter().any(|allowed| allowed == &server_name) {
         bail!("fallback rejected unexpected SNI: {server_name}");
     }
 
@@ -951,11 +862,7 @@ async fn handle_raw_tls_fallback(
 
 fn load_server_config_file(path: &Path) -> Result<ServerConfigFile> {
     let contents = std::fs::read_to_string(path)?;
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-    {
+    match path.extension().and_then(|ext| ext.to_str()).unwrap_or_default() {
         "json" => Ok(serde_json::from_str(&contents)?),
         "toml" => Ok(toml::from_str(&contents)?),
         _ => bail!("unsupported REALITY config format: {}", path.display()),
@@ -966,13 +873,7 @@ fn parse_reality_version(version: &str) -> [u8; 3] {
     let version = version.trim();
     assert_eq!(version.len(), 6, "REALITY version must be 6 hex digits");
     let mut parsed = [0u8; 3];
-    for (index, chunk) in version
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .enumerate()
-    {
+    for (index, chunk) in version.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         parsed[index] = parse_hex_byte(chunk[0], chunk[1]);
     }
     parsed
@@ -1005,10 +906,7 @@ fn parse_reality_short_id_fixed(short_id: &str) -> Result<[u8; 8]> {
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>> {
-    let input = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-        .unwrap_or(value);
+    let input = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value);
     if !input.len().is_multiple_of(2) {
         bail!("REALITY short_id hex string must contain an even number of digits")
     }

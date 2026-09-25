@@ -20,7 +20,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 
 use rustls::Connection;
 use rustls_util::StreamOwned;
@@ -47,15 +47,10 @@ const SOCKET_POLL: Duration = Duration::from_millis(5);
 /// not reading), so outbound traffic keeps flowing without a tight spin.
 const BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
 
-type Reservation = Pin<
-    Box<dyn Future<Output = Result<mpsc::OwnedPermit<Vec<u8>>, mpsc::error::SendError<()>>> + Send>,
->;
+type Reservation = Pin<Box<dyn Future<Output = Result<mpsc::OwnedPermit<Vec<u8>>, mpsc::error::SendError<()>>> + Send>>;
 
-fn would_block(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
+fn would_block(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
 /// Async view over the REALITY TLS carrier. Reads pull decrypted bytes produced
@@ -74,7 +69,7 @@ pub struct BridgeStream {
 
 /// Convert a fully handshaken blocking REALITY TLS stream into an async stream
 /// usable as `Box<dyn AsyncReadWrite>`.
-pub fn into_async<C>(tls: StreamOwned<C, std::net::TcpStream>) -> io::Result<BridgeStream>
+pub fn into_async<C>(tls: StreamOwned<C, std::net::TcpStream>) -> std::io::Result<BridgeStream>
 where
     C: Connection + Send + 'static,
 {
@@ -98,7 +93,7 @@ fn pump<C>(
     mut tls: StreamOwned<C, std::net::TcpStream>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     mut outbound_rx: mpsc::Receiver<Vec<u8>>,
-) -> io::Result<()>
+) -> std::io::Result<()>
 where
     C: Connection + Send + 'static,
 {
@@ -106,26 +101,18 @@ where
     // kernel while idle instead of busy-polling, and a timeout simply surfaces
     // as WouldBlock (EAGAIN on Linux) which the loop treats as "no progress".
     tls.sock.set_nonblocking(false)?;
-    tls.sock
-        .set_read_timeout(Some(SOCKET_POLL))?;
-    tls.sock
-        .set_write_timeout(Some(SOCKET_POLL))?;
+    tls.sock.set_read_timeout(Some(SOCKET_POLL))?;
+    tls.sock.set_write_timeout(Some(SOCKET_POLL))?;
 
     let result = pump_io(&mut tls, &inbound_tx, &mut outbound_rx);
 
     tls.conn.send_close_notify();
     let _ = tls.flush();
-    let _ = tls
-        .sock
-        .shutdown(std::net::Shutdown::Both);
+    let _ = tls.sock.shutdown(std::net::Shutdown::Both);
     result
 }
 
-fn pump_io<T: Read + Write>(
-    tls: &mut T,
-    inbound_tx: &mpsc::Sender<Vec<u8>>,
-    outbound_rx: &mut mpsc::Receiver<Vec<u8>>,
-) -> io::Result<()> {
+fn pump_io<T: Read + Write>(tls: &mut T, inbound_tx: &mpsc::Sender<Vec<u8>>, out_rx: &mut mpsc::Receiver<Vec<u8>>) -> std::io::Result<()> {
     let mut buf = vec![0u8; PUMP_BUFFER];
     let mut out_buf: Vec<u8> = Vec::new();
     let mut inbound_pending: Option<Vec<u8>> = None;
@@ -135,7 +122,7 @@ fn pump_io<T: Read + Write>(
         // 1) Collect queued app -> TLS bytes, bounded so the worker never holds
         //    much ahead of what it has flushed (keeps control frames near front).
         while out_buf.len() < OUTBOUND_HIGH_WATER {
-            match outbound_rx.try_recv() {
+            match out_rx.try_recv() {
                 Ok(chunk) => out_buf.extend_from_slice(&chunk),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -197,19 +184,13 @@ fn pump_io<T: Read + Write>(
 }
 
 impl AsyncRead for BridgeStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
         if self.leftover_pos < self.leftover.len() {
             let start = self.leftover_pos;
-            let count = buf
-                .remaining()
-                .min(self.leftover.len() - start);
+            let count = buf.remaining().min(self.leftover.len() - start);
             buf.put_slice(&self.leftover[start..start + count]);
             self.leftover_pos += count;
             if self.leftover_pos == self.leftover.len() {
@@ -235,22 +216,12 @@ impl AsyncRead for BridgeStream {
 }
 
 impl AsyncWrite for BridgeStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         if this.outbound.is_none() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "write after shutdown",
-            )));
+            return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "write after shutdown")));
         }
-        let mut reserving = this
-            .reserving
-            .lock()
-            .expect("bridge reservation lock poisoned");
+        let mut reserving = this.reserving.lock().expect("bridge reservation lock poisoned");
         loop {
             if let Some(reservation) = reserving.as_mut() {
                 return match reservation.as_mut().poll(cx) {
@@ -262,37 +233,27 @@ impl AsyncWrite for BridgeStream {
                     }
                     Poll::Ready(Err(_)) => {
                         *reserving = None;
-                        Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "REALITY bridge closed",
-                        )))
+                        Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "REALITY bridge closed")))
                     }
                     Poll::Pending => Poll::Pending,
                 };
             }
             // Acquire capacity before committing to a write so the anytls writer
             // is backpressured when the carrier falls behind.
-            let sender = this
-                .outbound
-                .as_ref()
-                .expect("checked above")
-                .clone();
+            let sender = this.outbound.as_ref().expect("checked above").clone();
             *reserving = Some(Box::pin(sender.reserve_owned()));
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         // Dropping the sender signals end-of-stream to the worker, which then
         // sends a TLS close_notify.
-        *this
-            .reserving
-            .lock()
-            .expect("bridge reservation lock poisoned") = None;
+        *this.reserving.lock().expect("bridge reservation lock poisoned") = None;
         this.outbound = None;
         Poll::Ready(Ok(()))
     }
@@ -312,9 +273,9 @@ mod tests {
     }
 
     impl Read for CountingTransport {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             if self.remaining == 0 {
-                return Err(io::ErrorKind::WouldBlock.into());
+                return Err(std::io::ErrorKind::WouldBlock.into());
             }
             let count = buffer.len().min(self.remaining);
             buffer[..count].fill(42);
@@ -324,14 +285,12 @@ mod tests {
     }
 
     impl Write for CountingTransport {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.written
-                .send(buffer.to_vec())
-                .unwrap();
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.written.send(buffer.to_vec()).unwrap();
             Ok(buffer.len())
         }
 
-        fn flush(&mut self) -> io::Result<()> {
+        fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
@@ -345,26 +304,24 @@ mod tests {
         }
 
         impl Read for BufferedTransport {
-            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
-                Err(io::ErrorKind::WouldBlock.into())
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
         }
 
         impl Write for BufferedTransport {
-            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
                 self.pending.extend_from_slice(buffer);
                 Ok(buffer.len())
             }
 
-            fn flush(&mut self) -> io::Result<()> {
+            fn flush(&mut self) -> std::io::Result<()> {
                 if !self.pending.is_empty() {
                     if !self.blocked_once {
                         self.blocked_once = true;
-                        return Err(io::ErrorKind::WouldBlock.into());
+                        return Err(std::io::ErrorKind::WouldBlock.into());
                     }
-                    self.flushed
-                        .send(core::mem::take(&mut self.pending))
-                        .unwrap();
+                    self.flushed.send(core::mem::take(&mut self.pending)).unwrap();
                 }
                 Ok(())
             }
@@ -382,17 +339,11 @@ mod tests {
             pump_io(&mut transport, &inbound_tx, &mut outbound_rx)
         });
 
-        outbound_tx
-            .send(b"pending".to_vec())
-            .await
-            .unwrap();
+        outbound_tx.send(b"pending".to_vec()).await.unwrap();
         let result = received.recv_timeout(Duration::from_secs(1));
         drop(outbound_tx);
         worker.join().unwrap().unwrap();
-        assert_eq!(
-            result.expect("pending TLS output must be retried without new app data"),
-            b"pending"
-        );
+        assert_eq!(result.expect("pending TLS output must be retried without new app data"), b"pending");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -410,21 +361,10 @@ mod tests {
 
         // The app never reads inbound; once the inbound channel fills, the
         // worker must still deliver queued outbound writes.
-        outbound_tx
-            .send(b"first".to_vec())
-            .await
-            .unwrap();
-        assert_eq!(
-            received
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap(),
-            b"first"
-        );
+        outbound_tx.send(b"first".to_vec()).await.unwrap();
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), b"first");
         tokio::time::sleep(Duration::from_millis(20)).await;
-        outbound_tx
-            .send(b"next".to_vec())
-            .await
-            .unwrap();
+        outbound_tx.send(b"next".to_vec()).await.unwrap();
         let next = received.recv_timeout(Duration::from_secs(1));
 
         // Draining the inbound side lets the worker resume reading the transport.
@@ -467,18 +407,18 @@ mod tests {
             fail: Arc<AtomicBool>,
         }
         impl Read for StalledTransport {
-            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
-                Err(io::ErrorKind::WouldBlock.into())
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
         }
         impl Write for StalledTransport {
-            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
                 if self.fail.load(Ordering::Acquire) {
-                    return Err(io::ErrorKind::BrokenPipe.into());
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
                 }
-                Err(io::ErrorKind::WouldBlock.into())
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
-            fn flush(&mut self) -> io::Result<()> {
+            fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
         }
@@ -508,9 +448,7 @@ mod tests {
         let max_absorbed = OUTBOUND_HIGH_WATER / 4096 + OUTBOUND_CHANNEL_CAP;
         let mut blocked = false;
         for _ in 0..(max_absorbed + 16) {
-            match tokio::time::timeout(Duration::from_millis(200), stream.write_all(&[7u8; 4096]))
-                .await
-            {
+            match tokio::time::timeout(Duration::from_millis(200), stream.write_all(&[7u8; 4096])).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => break,
                 Err(_) => {
@@ -519,10 +457,7 @@ mod tests {
                 }
             }
         }
-        assert!(
-            blocked,
-            "writer must be backpressured by a stalled transport"
-        );
+        assert!(blocked, "writer must be backpressured by a stalled transport");
 
         // Let the worker terminate instead of spinning on the stalled transport.
         fail.store(true, Ordering::Release);
