@@ -45,6 +45,8 @@ use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
 use socks5_impl::protocol::{Address, AsyncStreamOperation};
+use std::io::{Read, Write};
+use std::net::{TcpStream as StdTcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -54,6 +56,7 @@ use tokio::net::{TcpListener, TcpStream as TokioTcpStream, UdpSocket};
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_HELLO_MAX_WIRE_SIZE: usize = 128 * 1024;
+const SERVER_HELLO_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 128;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_SESSION_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -97,6 +100,8 @@ struct ServerRealityConfigFile {
     version: Option<String>,
     #[serde(default)]
     server_names: Option<Vec<String>>,
+    #[serde(default)]
+    dest: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
@@ -121,6 +126,7 @@ struct ServerConfigResolved {
     short_id: String,
     version: String,
     server_names: Vec<String>,
+    dest: Option<String>,
 }
 
 #[derive(Debug)]
@@ -192,6 +198,7 @@ async fn main() -> Result<()> {
     let reality_private_key = Arc::new(parse_reality_private_key(&resolved.private_key)?);
     let reality_short_id = Arc::new(parse_reality_short_id_fixed(&resolved.short_id)?);
     let reality_version = parse_reality_version(&resolved.version);
+    let reality_dest = resolved.dest.clone();
 
     let listener = TcpListener::bind(&resolved.listen).await?;
     log::info!("REALITY+anytls server listening on {}", resolved.listen);
@@ -203,6 +210,7 @@ async fn main() -> Result<()> {
         let padding = padding.clone();
         let reality_private_key = reality_private_key.clone();
         let reality_short_id = reality_short_id.clone();
+        let reality_dest = reality_dest.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_connection(
                 stream,
@@ -213,6 +221,7 @@ async fn main() -> Result<()> {
                 reality_private_key,
                 reality_short_id,
                 reality_version,
+                reality_dest,
             )
             .await
             {
@@ -231,6 +240,7 @@ async fn handle_connection(
     reality_private_key: Arc<Vec<u8>>,
     reality_short_id: Arc<[u8; 8]>,
     reality_version: [u8; 3],
+    reality_dest: Option<String>,
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
     let peer_addr = stream.peer_addr()?;
@@ -243,20 +253,33 @@ async fn handle_connection(
     // scanners on this port would freeze every live carrier's SYNACK traffic.
     let detect_key = reality_private_key.clone();
     let detect_short_id = reality_short_id.clone();
-    let (is_reality, std_stream) = tokio::task::spawn_blocking(move || -> Result<(bool, std::net::TcpStream)> {
-        let is_reality = is_reality_client_hello(&std_stream, detect_key.as_slice(), detect_short_id.as_slice(), &reality_version)?;
-        Ok((is_reality, std_stream))
-    })
-    .await??;
-    if !is_reality {
+    let (client_hello, std_stream) =
+        tokio::task::spawn_blocking(move || -> Result<(Option<RealityClientHelloProbe>, std::net::TcpStream)> {
+            let client_hello = is_reality_client_hello(&std_stream, detect_key.as_slice(), detect_short_id.as_slice(), &reality_version)?;
+            Ok((client_hello, std_stream))
+        })
+        .await??;
+    let Some(client_hello) = client_hello else {
         return handle_raw_tls_fallback(std_stream, allowed_server_names).await;
-    }
+    };
+    let probe_destination =
+        select_server_hello_probe_destination(reality_dest.as_deref(), client_hello.server_name.as_deref(), &allowed_server_names);
 
     // 1) REALITY blocking handshake on a worker thread.
     let tls = tokio::task::spawn_blocking(move || -> Result<StreamOwned<ServerConnection, std::net::TcpStream>> {
         let mut sock = std_stream;
         sock.set_nonblocking(false)?;
         let mut conn = ServerConnection::new(reality_config)?;
+        if let Some(dest) = probe_destination {
+            match probe_server_hello(&dest, &client_hello.wire) {
+                Ok(template) => {
+                    if let Err(error) = conn.set_reality_server_hello_template(&template) {
+                        log::debug!("REALITY ServerHello template rejected for {dest}: {error}");
+                    }
+                }
+                Err(error) => log::debug!("REALITY ServerHello probe failed for {dest}: {error:#}"),
+            }
+        }
         while conn.is_handshaking() {
             complete_io(&mut sock, &mut conn).context("complete REALITY handshake")?;
         }
@@ -483,6 +506,12 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
     if server_names.is_empty() {
         bail!("reality.serverNames must not be empty for fallback");
     }
+    let dest = reality
+        .dest
+        .as_deref()
+        .map(str::trim)
+        .filter(|dest| !dest.is_empty())
+        .map(str::to_owned);
 
     Ok(ServerConfigResolved {
         listen,
@@ -491,6 +520,7 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
         short_id,
         version,
         server_names,
+        dest,
     })
 }
 
@@ -522,7 +552,7 @@ fn is_reality_client_hello(
     server_private_key: &[u8],
     short_id: &[u8],
     version: &[u8; 3],
-) -> Result<bool> {
+) -> Result<Option<RealityClientHelloProbe>> {
     tcp_stream
         .set_nonblocking(false)
         .context("set socket blocking for ClientHello peek")?;
@@ -549,10 +579,10 @@ fn is_reality_client_hello(
             Err(error) => return Err(error).context("peek ClientHello"),
         };
         if available == 0 {
-            return Ok(false);
+            return Ok(None);
         }
 
-        let Some(handshake) = collect_client_hello(&buf[..available])? else {
+        let Some(client_hello) = collect_client_hello(&buf[..available])? else {
             if buf.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
                 bail!("ClientHello exceeds maximum size")
             }
@@ -561,17 +591,17 @@ fn is_reality_client_hello(
             continue;
         };
 
-        let Ok(parsed) = parse_client_hello(&handshake) else {
-            return Ok(false);
+        let Ok(parsed) = parse_client_hello(&client_hello.handshake) else {
+            return Ok(None);
         };
         if parsed.session_id.len() != 32 {
-            return Ok(false);
+            return Ok(None);
         }
 
         let private_key =
             agreement::PrivateKey::from_private_key(&agreement::X25519, server_private_key).context("parse REALITY private key bytes")?;
         if parsed.key_share.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let peer_public = agreement::UnparsedPublicKey::new(&agreement::X25519, &parsed.key_share);
         let reality_key = agreement::agree(&private_key, peer_public, aws_lc_rs::error::Unspecified, |secret| {
@@ -587,21 +617,45 @@ fn is_reality_client_hello(
         let mut decrypted = parsed.session_id.clone();
         let nonce = Nonce::try_from(&parsed.random[20..32])?;
         if cipher.decrypt_in_place(&nonce, &parsed.raw_client_hello, &mut decrypted).is_err() {
-            return Ok(false);
+            return Ok(None);
         }
 
         if decrypted.len() != 16 || decrypted[3] != 0 {
-            return Ok(false);
+            return Ok(None);
         }
         if &decrypted[..3] != version.as_slice() {
-            return Ok(false);
+            return Ok(None);
         }
         if &decrypted[8..16] != short_id {
-            return Ok(false);
+            return Ok(None);
         }
 
-        return Ok(true);
+        return Ok(Some(RealityClientHelloProbe {
+            wire: client_hello.wire,
+            server_name: parsed.server_name,
+        }));
     }
+}
+
+struct RealityClientHelloProbe {
+    wire: Vec<u8>,
+    server_name: Option<String>,
+}
+
+fn select_server_hello_probe_destination(
+    configured_dest: Option<&str>,
+    server_name: Option<&str>,
+    allowed_server_names: &[String],
+) -> Option<String> {
+    if let Some(dest) = configured_dest {
+        return Some(dest.to_owned());
+    }
+
+    let server_name = server_name?;
+    allowed_server_names
+        .iter()
+        .any(|allowed| allowed == server_name)
+        .then(|| format!("{server_name}:443"))
 }
 
 struct ParsedClientHello {
@@ -612,7 +666,12 @@ struct ParsedClientHello {
     server_name: Option<String>,
 }
 
-fn collect_client_hello(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+struct CollectedClientHello {
+    handshake: Vec<u8>,
+    wire: Vec<u8>,
+}
+
+fn collect_client_hello(bytes: &[u8]) -> Result<Option<CollectedClientHello>> {
     let mut offset = 0;
     let mut handshake = Vec::new();
     let mut expected_len = None;
@@ -652,11 +711,70 @@ fn collect_client_hello(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
             && handshake.len() >= expected_len
         {
             handshake.truncate(expected_len);
-            return Ok(Some(handshake));
+            return Ok(Some(CollectedClientHello {
+                handshake,
+                wire: bytes[..offset].to_vec(),
+            }));
         }
     }
 
     Ok(None)
+}
+
+fn probe_server_hello(destination: &str, client_hello: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut last_error = None;
+    for address in destination.to_socket_addrs()? {
+        match StdTcpStream::connect_timeout(&address, SERVER_HELLO_PROBE_TIMEOUT) {
+            Ok(mut stream) => {
+                stream.set_read_timeout(Some(SERVER_HELLO_PROBE_TIMEOUT))?;
+                stream.set_write_timeout(Some(SERVER_HELLO_PROBE_TIMEOUT))?;
+                stream.write_all(client_hello)?;
+
+                let mut record_header = [0u8; 5];
+                stream.read_exact(&mut record_header)?;
+                if record_header[0] != 22 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "destination did not send a TLS handshake record",
+                    ));
+                }
+                let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
+                if !(4..=18_432).contains(&record_len) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "destination sent an invalid TLS handshake record length",
+                    ));
+                }
+                let mut payload = vec![0u8; record_len];
+                stream.read_exact(&mut payload)?;
+                if payload[0] != 2 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "destination did not send ServerHello first",
+                    ));
+                }
+                let handshake_len = ((payload[1] as usize) << 16) | ((payload[2] as usize) << 8) | payload[3] as usize;
+                let server_hello_len = 4usize
+                    .checked_add(handshake_len)
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid ServerHello length"))?;
+                if server_hello_len > payload.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "destination split ServerHello across TLS records",
+                    ));
+                }
+                payload.truncate(server_hello_len);
+                return Ok(payload);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("could not resolve ServerHello probe destination {destination}"),
+        )
+    }))
 }
 
 fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello> {
@@ -832,7 +950,7 @@ async fn handle_raw_tls_fallback(tcp_client: std::net::TcpStream, allowed_server
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut || error.kind() == std::io::ErrorKind::WouldBlock => 0,
                 Err(error) => return Err(error.into()),
             };
-            let Some(handshake) = collect_client_hello(&buffer[..available])? else {
+            let Some(client_hello) = collect_client_hello(&buffer[..available])? else {
                 if buffer.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
                     bail!("ClientHello exceeds maximum size");
                 }
@@ -840,7 +958,7 @@ async fn handle_raw_tls_fallback(tcp_client: std::net::TcpStream, allowed_server
                 thread::sleep(Duration::from_millis(1));
                 continue;
             };
-            break handshake;
+            break client_hello.handshake;
         };
         let parsed = parse_client_hello(&handshake)?;
         let server_name = parsed.server_name.ok_or_else(|| anyhow::anyhow!("fallback requires SNI"))?;
@@ -938,7 +1056,9 @@ fn is_error_of_session_broken(error: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_client_hello, parse_client_hello};
+    use super::{ServerConfigFile, collect_client_hello, parse_client_hello, probe_server_hello, select_server_hello_probe_destination};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn malformed_client_hello_returns_error_without_panicking() {
@@ -972,7 +1092,70 @@ mod tests {
         let collected = collect_client_hello(&records)
             .unwrap()
             .expect("fragmented ClientHello should be complete");
-        assert_eq!(collected, handshake);
-        assert!(parse_client_hello(&collected).is_ok());
+        assert_eq!(collected.handshake, handshake);
+        assert_eq!(collected.wire, records);
+        assert!(parse_client_hello(&collected.handshake).is_ok());
+    }
+
+    #[test]
+    fn reality_dest_is_optional_in_toml_and_json() {
+        let toml: ServerConfigFile = toml::from_str("[reality]\ndest = \"decoy.example:443\"\n").unwrap();
+        assert_eq!(toml.reality.unwrap().dest.as_deref(), Some("decoy.example:443"));
+
+        let json: ServerConfigFile = serde_json::from_str(r#"{"reality":{"dest":"decoy.example:443"}}"#).unwrap();
+        assert_eq!(json.reality.unwrap().dest.as_deref(), Some("decoy.example:443"));
+
+        let without_dest: ServerConfigFile = toml::from_str("[reality]\n").unwrap();
+        assert_eq!(without_dest.reality.unwrap().dest, None);
+    }
+
+    #[test]
+    fn server_hello_probe_uses_allowlisted_sni_when_dest_is_absent() {
+        let allowed = vec!["decoy.example".to_string()];
+        assert_eq!(
+            select_server_hello_probe_destination(None, Some("decoy.example"), &allowed).as_deref(),
+            Some("decoy.example:443")
+        );
+    }
+
+    #[test]
+    fn server_hello_probe_requires_allowed_sni_without_explicit_dest() {
+        let allowed = vec!["decoy.example".to_string()];
+        assert_eq!(select_server_hello_probe_destination(None, None, &allowed), None);
+        assert_eq!(
+            select_server_hello_probe_destination(None, Some("attacker.example"), &allowed),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_server_hello_probe_dest_overrides_sni() {
+        let allowed = vec!["decoy.example".to_string()];
+        assert_eq!(
+            select_server_hello_probe_destination(Some("target.example:8443"), Some("decoy.example"), &allowed).as_deref(),
+            Some("target.example:8443")
+        );
+    }
+
+    #[test]
+    fn server_hello_probe_preserves_client_hello_wire_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client_hello = vec![22, 3, 3, 0, 4, 1, 0, 0, 0];
+        let expected_client_hello = client_hello.clone();
+        let expected_server_hello = vec![2, 0, 0, 4, 0, 0, 0, 0];
+        let server_hello_record = [22, 3, 3, 0, 8, 2, 0, 0, 4, 0, 0, 0, 0];
+
+        let target = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut received = vec![0; expected_client_hello.len()];
+            stream.read_exact(&mut received).unwrap();
+            assert_eq!(received, expected_client_hello);
+            stream.write_all(&server_hello_record).unwrap();
+        });
+
+        let template = probe_server_hello(&address.to_string(), &client_hello).unwrap();
+        target.join().unwrap();
+        assert_eq!(template, expected_server_hello);
     }
 }

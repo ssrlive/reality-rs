@@ -51,6 +51,40 @@ impl ServerConnection {
         })
     }
 
+    /// Use a target ServerHello as the template for this connection's REALITY handshake.
+    ///
+    /// `server_hello` must be one encoded TLS ServerHello handshake message, without its record
+    /// header. The template is used only for TLS 1.3 and its session ID and key share are replaced
+    /// with values for this connection. Call this before processing the ClientHello.
+    pub fn set_reality_server_hello_template(&mut self, server_hello: &[u8]) -> Result<(), Error> {
+        match &mut self.inner.core.state {
+            Ok(ServerState::ClientHello(state))
+                if state
+                    .reality_server_hello_template
+                    .is_none() =>
+            {
+                if state
+                    .config
+                    .client_hello_verifier
+                    .is_none()
+                {
+                    return Err(Error::General(
+                        "REALITY ServerHello template requires a ClientHello verifier".into(),
+                    ));
+                }
+                state.reality_server_hello_template = Some(server_hello.to_vec());
+                Ok(())
+            }
+            Ok(ServerState::ClientHello(_)) => Err(Error::General(
+                "REALITY ServerHello template already configured".into(),
+            )),
+            Ok(_) => Err(Error::General(
+                "REALITY ServerHello template must be set before ClientHello processing".into(),
+            )),
+            Err(err) => Err(err.clone()),
+        }
+    }
+
     /// Retrieves the server name, if any, used to select the certificate and
     /// private key.
     ///

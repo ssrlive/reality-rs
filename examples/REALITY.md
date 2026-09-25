@@ -32,6 +32,7 @@
 
 * 客户端生成符合当前实现约定的 REALITY `session_id`。
 * 服务端在很早阶段读取 `ClientHello`，决定是继续 REALITY/TLS 路径，还是转发到 decoy 后端。
+* `tlsserver-mio` 可按 `reality.dest` 将原始 `ClientHello` 发给目标站，异步采样其 TLS 1.3 ServerHello；认证成功时保留目标 ServerHello 的原始编码、扩展顺序和 random，只替换 session_id 与本地 ECDH key_share。
 * decoy 转发可以按规则匹配，例如：
   * `serverNames`
   * `alpns`
@@ -41,6 +42,8 @@
 ### 还没做到什么
 
 这不是“完整复刻 Xray REALITY”。
+
+当前只借用目标站的 ServerHello 外观；证书仍由本地临时 Ed25519 证书提供，后续加密握手记录尚未按目标站长度做完整 padding/分片仿真。浏览器 ClientHello profile 也不是字节级 uTLS 指纹。
 
 当前实现更准确的定位是：
 
@@ -170,34 +173,21 @@
 * `FallbackMatcher`
 * `select_fallback_target()`
 
-#### 第二层：REALITY 预筛
+#### 第二层：REALITY 密码学验证
 
-即使某个连接的 SNI 命中了允许值，也不代表它一定是我们期望的 REALITY 客户端。
+示例层不会仅凭 `session_id` 前缀判定客户端身份。命中路由后，Rustls verifier 会校验 TLS 版本、X25519 share、REALITY AES-GCM 头、时间戳和 short_id；失败时不向客户端发送 TLS alert，而是转到 fallback。
 
-所以当前实现还会检查预读到的原始 `ClientHello.session_id`：
+目标采样步骤会把同一份 ClientHello 发给 `dest` 并读取第一个 TLS handshake record。采样在有界 worker pool 中运行，不阻塞 mio reactor；模板不可用或与协商参数不兼容时，认证握手仍可退回普通 Rustls ServerHello。
 
-* 是否长度为 32
-* version 前缀是否匹配
-* short_id 前缀是否匹配
+### 第 4 步：认证成功后使用目标 ServerHello 模板
 
-对应关键函数：
+服务端把原始 ServerHello handshake bytes（不含 TLS record header）交给单连接的 Rustls 状态机。Rustls 保留其他原始字段和扩展编码，仅替换 session_id 与本地 ephemeral key_share；TLS transcript 使用的 bytes 与线上发送内容完全一致，TLS handshake secret 仍来自本地 X25519 ECDH。
 
-* `client_hello_session_id()`
-* `session_id_matches_reality()`
+本地 REALITY 临时证书及其 HMAC 认证仍由 `RealityServerCredentialResolver` 生成，不会从目标站复制证书。TLS 1.3 ServerHello 本身也不包含证书。
 
-这一步的效果是：
+目标模板通过 `ServerConnection::set_reality_server_hello_template()` 在处理 ClientHello 前设置；模板 cipher、group 或 share 长度不匹配时拒绝使用。
 
-* 看起来不像 REALITY 的连接，即使 SNI 合法，也能被导向 decoy。
-
-### 第 4 步：如果是 REALITY/TLS 路径，就继续握手
-
-如果连接没有被分流，代码会把之前缓冲的字节重新喂回正常 TLS 连接状态机：
-
-* `start_tls_from_accept_buffer()`
-
-然后继续标准 Rustls 握手和数据收发。
-
-### 第 5 步：如果不是 REALITY 路径，就进入原始 TCP passthrough
+### 第 5 步：认证失败后进入原始 TCP passthrough
 
 如果连接被判定应该回退，它不会再继续当前 TLS 路径，而是：
 
@@ -289,6 +279,7 @@
 于是当前实现逐步演化出：
 
 * 默认 `fallbackAddress + fallbackPort`
+* 可选 `dest`（`host:port` 或 `[IPv6]:port`），用于目标站 ServerHello 采样；未配置单独 fallback 时也作为默认 fallback
 * 有序 `fallbackRules`
 * 规则 matcher 支持：
   * `serverNames`
@@ -318,6 +309,8 @@
 * 代码主体仍然在 examples 层
 * 验证以 focused tests 和有限 live checks 为主
 * 还没有系统性的并发、长期运行、异常流量、互操作覆盖
+* 目前只复用目标 ServerHello，不仿真目标站后续加密记录长度、padding、分片或 NewSessionTicket 外观
+* 目标 ServerHello 必须在单个 TLS record 内完整到达；目标使用 HelloRetryRequest 或跨 record 分片时，本次采样不会生成模板
 * 还没有完备的观测、统计、回滚、热更新和运维控制
 * 并未宣称达到 Xray 全量语义兼容
 

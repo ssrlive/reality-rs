@@ -79,7 +79,7 @@ mod client_hello {
     use crate::compress::CertCompressor;
     use crate::crypto::cipher::Payload;
     use crate::crypto::kx::SupportedKxGroup;
-    use crate::crypto::{SelectedCredential, Signer};
+    use crate::crypto::{CipherSuite, SelectedCredential, Signer};
     use crate::enums::ApplicationProtocol;
     use crate::msgs::{
         CertificatePayloadTls13, CertificateRequestExtensions, CertificateRequestPayloadTls13,
@@ -258,6 +258,8 @@ mod client_hello {
                 resuming.as_ref(),
                 &input.proof,
                 &st.config,
+                st.reality_server_hello_template
+                    .as_deref(),
             )?;
             if !st.done_retry && !st.protocol.is_quic() {
                 emit_fake_ccs(output);
@@ -526,6 +528,7 @@ mod client_hello {
         resuming: Option<&(usize, Tls13ServerSessionValue<'_>)>,
         proof: &HandshakeAlignedProof,
         config: &ServerConfig,
+        reality_server_hello_template: Option<&[u8]>,
     ) -> Result<KeyScheduleHandshake, Error> {
         // Prepare key exchange; the caller already found the matching SupportedKxGroup
         let (share, kxgroup) = share_and_kxgroup;
@@ -533,26 +536,43 @@ mod client_hello {
         let ckx = kxgroup.start_and_complete(share.payload.bytes())?;
         output.output(OutputEvent::KeyExchangeGroup(kxgroup));
 
+        let key_share = KeyShareEntry::new(ckx.group, ckx.pub_key);
         let extensions = Box::new(ServerExtensions {
-            key_share: Some(KeyShareEntry::new(ckx.group, ckx.pub_key)),
+            key_share: Some(key_share.clone()),
             preshared_key: resuming.map(|&(idx, _)| idx as u16),
             selected_version: Some(ProtocolVersion::TLSv1_3),
             ..Default::default()
         });
 
-        let sh = Message {
-            version: ProtocolVersion::TLSv1_2,
-            payload: MessagePayload::handshake(HandshakeMessagePayload(
-                HandshakePayload::ServerHello(ServerHelloPayload {
-                    legacy_version: ProtocolVersion::TLSv1_2,
-                    random: Random::from(randoms.server),
-                    session_id: *session_id,
-                    cipher_suite: suite.common.suite,
-                    compression_method: Compression::Null,
-                    extensions,
-                }),
-            )),
-        };
+        let sh = reality_server_hello_template
+            .filter(|_| resuming.is_none())
+            .and_then(|template| {
+                match reality_server_hello_from_template(
+                    template,
+                    session_id,
+                    suite.common.suite,
+                    &key_share,
+                ) {
+                    Ok(server_hello) => Some(server_hello),
+                    Err(error) => {
+                        debug!("ignoring incompatible REALITY ServerHello template: {error}");
+                        None
+                    }
+                }
+            })
+            .unwrap_or_else(|| Message {
+                version: ProtocolVersion::TLSv1_2,
+                payload: MessagePayload::handshake(HandshakeMessagePayload(
+                    HandshakePayload::ServerHello(ServerHelloPayload {
+                        legacy_version: ProtocolVersion::TLSv1_2,
+                        random: Random::from(randoms.server),
+                        session_id: *session_id,
+                        cipher_suite: suite.common.suite,
+                        compression_method: Compression::Null,
+                        extensions,
+                    }),
+                )),
+            });
 
         let client_hello_hash = transcript.hash_given(&[]);
 
@@ -599,6 +619,205 @@ mod client_hello {
         );
 
         Ok(key_schedule)
+    }
+
+    fn reality_server_hello_from_template(
+        template: &[u8],
+        session_id: &SessionId,
+        suite: CipherSuite,
+        key_share: &KeyShareEntry,
+    ) -> Result<Message<'static>, Error> {
+        let parsed =
+            MessagePayload::new(ContentType::Handshake, ProtocolVersion::TLSv1_2, template)?
+                .into_owned();
+        let MessagePayload::Handshake { parsed, .. } = parsed else {
+            return Err(Error::General(
+                "REALITY ServerHello template is not a handshake message".into(),
+            ));
+        };
+        let HandshakePayload::ServerHello(server_hello) = &parsed.0 else {
+            return Err(Error::General(
+                "REALITY template is not a ServerHello".into(),
+            ));
+        };
+
+        let Some(template_key_share) = server_hello.key_share.as_ref() else {
+            return Err(Error::General(
+                "REALITY ServerHello template has no key_share".into(),
+            ));
+        };
+        if server_hello.legacy_version != ProtocolVersion::TLSv1_2
+            || server_hello.selected_version != Some(ProtocolVersion::TLSv1_3)
+            || server_hello.cipher_suite != suite
+            || server_hello.preshared_key.is_some()
+            || template_key_share.group != key_share.group
+            || template_key_share.payload.bytes().len() != key_share.payload.bytes().len()
+        {
+            return Err(Error::General(
+                "REALITY ServerHello template does not match the negotiated handshake".into(),
+            ));
+        }
+
+        let mut encoded = template.to_vec();
+        let session_id_offset = 39usize;
+        let session_id_len = *encoded
+            .get(38)
+            .ok_or_else(|| Error::General("truncated REALITY ServerHello template".into()))?
+            as usize;
+        if session_id_len != session_id.as_ref().len() {
+            return Err(Error::General(
+                "REALITY ServerHello template has an unexpected session_id length".into(),
+            ));
+        }
+        let session_id_end = session_id_offset
+            .checked_add(session_id_len)
+            .ok_or_else(|| Error::General("invalid REALITY ServerHello length".into()))?;
+        encoded
+            .get_mut(session_id_offset..session_id_end)
+            .ok_or_else(|| Error::General("truncated REALITY ServerHello template".into()))?
+            .copy_from_slice(session_id.as_ref());
+
+        let (key_share_start, key_share_end) = server_hello_key_share_range(&encoded)?;
+        encoded[key_share_start..key_share_end].copy_from_slice(key_share.payload.bytes());
+
+        let payload =
+            MessagePayload::new(ContentType::Handshake, ProtocolVersion::TLSv1_2, &encoded)?
+                .into_owned();
+        Ok(Message {
+            version: ProtocolVersion::TLSv1_2,
+            payload,
+        })
+    }
+
+    fn server_hello_key_share_range(encoded: &[u8]) -> Result<(usize, usize), Error> {
+        let malformed = || Error::General("malformed REALITY ServerHello template".into());
+        if encoded.len() < 4 || encoded[0] != u8::from(HandshakeType::ServerHello) {
+            return Err(malformed());
+        }
+        let handshake_len =
+            ((encoded[1] as usize) << 16) | ((encoded[2] as usize) << 8) | encoded[3] as usize;
+        if handshake_len != encoded.len() - 4 {
+            return Err(malformed());
+        }
+
+        let session_id_len = *encoded.get(38).ok_or_else(malformed)? as usize;
+        let mut offset = 39usize
+            .checked_add(session_id_len)
+            .ok_or_else(malformed)?;
+        offset = offset
+            .checked_add(3)
+            .ok_or_else(malformed)?;
+        let extensions_len = u16::from_be_bytes(
+            encoded
+                .get(offset..offset + 2)
+                .ok_or_else(malformed)?
+                .try_into()
+                .map_err(|_| malformed())?,
+        ) as usize;
+        offset += 2;
+        let extensions_end = offset
+            .checked_add(extensions_len)
+            .ok_or_else(malformed)?;
+        if extensions_end != encoded.len() {
+            return Err(malformed());
+        }
+
+        while offset < extensions_end {
+            let extension_header = encoded
+                .get(offset..offset + 4)
+                .ok_or_else(malformed)?;
+            let extension_type = u16::from_be_bytes([extension_header[0], extension_header[1]]);
+            let extension_len =
+                u16::from_be_bytes([extension_header[2], extension_header[3]]) as usize;
+            offset += 4;
+            let extension_end = offset
+                .checked_add(extension_len)
+                .ok_or_else(malformed)?;
+            if extension_end > extensions_end {
+                return Err(malformed());
+            }
+            if extension_type == 0x0033 {
+                let key_share_header = encoded
+                    .get(offset..offset + 4)
+                    .ok_or_else(malformed)?;
+                let key_share_len =
+                    u16::from_be_bytes([key_share_header[2], key_share_header[3]]) as usize;
+                let key_share_start = offset + 4;
+                let key_share_end = key_share_start
+                    .checked_add(key_share_len)
+                    .ok_or_else(malformed)?;
+                if key_share_end != extension_end {
+                    return Err(malformed());
+                }
+                return Ok((key_share_start, key_share_end));
+            }
+            offset = extension_end;
+        }
+
+        Err(Error::General(
+            "REALITY ServerHello template has no key_share".into(),
+        ))
+    }
+
+    #[cfg(test)]
+    mod reality_server_hello_tests {
+        use super::*;
+
+        #[test]
+        fn template_rewrite_preserves_unmodified_server_hello_bytes() {
+            let suite = CipherSuite::TLS13_AES_128_GCM_SHA256;
+            let target_share = KeyShareEntry::new(NamedGroup::X25519, vec![0x44; 32]);
+            let server_hello = Message {
+                version: ProtocolVersion::TLSv1_2,
+                payload: MessagePayload::handshake(HandshakeMessagePayload(
+                    HandshakePayload::ServerHello(ServerHelloPayload {
+                        legacy_version: ProtocolVersion::TLSv1_2,
+                        random: Random::from([0x66; 32]),
+                        session_id: SessionId::from([0x33; 32]),
+                        cipher_suite: suite,
+                        compression_method: Compression::Null,
+                        extensions: Box::new(ServerExtensions {
+                            key_share: Some(target_share),
+                            selected_version: Some(ProtocolVersion::TLSv1_3),
+                            ..Default::default()
+                        }),
+                    }),
+                )),
+            };
+            let mut template = match server_hello.payload {
+                MessagePayload::Handshake { encoded, .. } => encoded.bytes().to_vec(),
+                _ => unreachable!(),
+            };
+            let unknown_extension = [0xfa, 0xfa, 0, 3, 1, 2, 3];
+            let extension_len = u16::from_be_bytes([template[74], template[75]]) as usize;
+            template.extend_from_slice(&unknown_extension);
+            template[74..76]
+                .copy_from_slice(&((extension_len + unknown_extension.len()) as u16).to_be_bytes());
+            let handshake_len = template.len() - 4;
+            template[1] = (handshake_len >> 16) as u8;
+            template[2] = (handshake_len >> 8) as u8;
+            template[3] = handshake_len as u8;
+            let session_id = SessionId::from([0x99; 32]);
+            let local_share = KeyShareEntry::new(NamedGroup::X25519, vec![0xaa; 32]);
+
+            let rewritten =
+                reality_server_hello_from_template(&template, &session_id, suite, &local_share)
+                    .unwrap();
+            let rewritten = match rewritten.payload {
+                MessagePayload::Handshake { encoded, .. } => encoded.bytes().to_vec(),
+                _ => unreachable!(),
+            };
+            let (share_start, share_end) = server_hello_key_share_range(&template).unwrap();
+
+            assert_eq!(&rewritten[..39], &template[..39]);
+            assert_eq!(&rewritten[39..71], session_id.as_ref());
+            assert_eq!(&rewritten[71..share_start], &template[71..share_start]);
+            assert_eq!(
+                &rewritten[share_start..share_end],
+                local_share.payload.bytes()
+            );
+            assert_eq!(&rewritten[share_end..], &template[share_end..]);
+        }
     }
 
     fn emit_fake_ccs(output: &mut dyn Output<'_>) {

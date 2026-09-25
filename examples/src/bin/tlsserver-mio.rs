@@ -21,12 +21,14 @@
 //! [mio]: https://docs.rs/mio/latest/mio/
 
 use core::hash::Hasher;
+use core::time::Duration;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream as StdTcpStream;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::{fs, net};
 
 #[path = "../common/reality_config.rs"]
@@ -51,6 +53,9 @@ use reality_config::{RealityFallbackRuleConfig, RealityServerConfig, load_realit
 
 // Token for our listening socket.
 const LISTENER: mio::Token = mio::Token(0);
+const PROBE_WAKE: mio::Token = mio::Token(1);
+const PROBE_WORKERS: usize = 4;
+const MAX_QUEUED_PROBES: usize = 64;
 
 // Which mode the server operates in.
 #[derive(Clone, Debug, Subcommand)]
@@ -75,8 +80,22 @@ struct TlsServer {
     tls_config: Arc<ServerConfig>,
     mode: ServerMode,
     reality_server_names: Vec<String>, // Added field for reality server names
+    reality_destination: Option<FallbackTarget>,
     reality_fallback_target: Option<FallbackTarget>,
     reality_fallback_rules: Vec<FallbackRule>,
+    probe_sender: SyncSender<ServerHelloProbeJob>,
+    probe_receiver: Receiver<ServerHelloProbeCompletion>,
+}
+
+struct ServerHelloProbeCompletion {
+    token: mio::Token,
+    result: io::Result<Vec<u8>>,
+}
+
+struct ServerHelloProbeJob {
+    token: mio::Token,
+    target: FallbackTarget,
+    client_hello: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,9 +189,43 @@ impl TlsServer {
         mode: ServerMode,
         cfg: Arc<ServerConfig>,
         reality_server_names: Vec<String>, // Added parameter for reality server names
+        reality_destination: Option<FallbackTarget>,
         reality_fallback_target: Option<FallbackTarget>,
         reality_fallback_rules: Vec<FallbackRule>,
+        probe_waker: Arc<mio::Waker>,
     ) -> Self {
+        let (probe_sender, probe_jobs) =
+            mpsc::sync_channel::<ServerHelloProbeJob>(MAX_QUEUED_PROBES);
+        let (completion_sender, probe_receiver) = mpsc::channel();
+        let probe_jobs = Arc::new(Mutex::new(probe_jobs));
+        if reality_destination.is_some()
+            || reality_fallback_target.is_some()
+            || !reality_fallback_rules.is_empty()
+        {
+            for _ in 0..PROBE_WORKERS {
+                let job_receiver = probe_jobs.clone();
+                let completion_sender = completion_sender.clone();
+                let probe_waker = probe_waker.clone();
+                std::thread::spawn(move || {
+                    loop {
+                        let job = job_receiver.lock().unwrap().recv();
+                        let Ok(job) = job else {
+                            break;
+                        };
+                        let result = probe_server_hello(&job.target, &job.client_hello);
+                        if completion_sender
+                            .send(ServerHelloProbeCompletion {
+                                token: job.token,
+                                result,
+                            })
+                            .is_ok()
+                        {
+                            let _ = probe_waker.wake();
+                        }
+                    }
+                });
+            }
+        }
         Self {
             server,
             connections: HashMap::new(),
@@ -180,8 +233,11 @@ impl TlsServer {
             tls_config: cfg,
             mode,
             reality_server_names, // Initialize reality server names
+            reality_destination,
             reality_fallback_target,
             reality_fallback_rules,
+            probe_sender,
+            probe_receiver,
         }
     }
 
@@ -202,8 +258,10 @@ impl TlsServer {
                         mode,
                         self.tls_config.clone(),
                         self.reality_server_names.clone(), // Pass reality server names to connection
+                        self.reality_destination.clone(),
                         self.reality_fallback_target.clone(),
                         self.reality_fallback_rules.clone(),
+                        self.probe_sender.clone(),
                     );
                     connection.register(registry);
                     self.connections
@@ -214,6 +272,28 @@ impl TlsServer {
                     println!("encountered error while accepting connection; err={err:?}");
                     return Err(err);
                 }
+            }
+        }
+    }
+
+    fn complete_server_hello_probes(&mut self, registry: &mio::Registry) {
+        while let Ok(completion) = self.probe_receiver.try_recv() {
+            let Some(mut connection) = self
+                .connections
+                .remove(&completion.token)
+            else {
+                continue;
+            };
+
+            connection.finish_server_hello_probe(registry, completion.result);
+            if connection.closing {
+                connection.close(registry);
+            } else if !connection.closed {
+                if !connection.socket_registered {
+                    connection.register(registry);
+                }
+                self.connections
+                    .insert(completion.token, connection);
             }
         }
     }
@@ -239,6 +319,10 @@ enum ConnectionState {
         acceptor: Acceptor,
         buffered: Vec<u8>,
     },
+    Probing {
+        buffered: Vec<u8>,
+        fallback_target: FallbackTarget,
+    },
     Tls(ServerConnection),
     Passthrough,
 }
@@ -256,8 +340,12 @@ struct OpenConnection {
     mode: ServerMode,
     state: ConnectionState,
     tls_config: Arc<ServerConfig>,
+    reality_destination: Option<FallbackTarget>,
     reality_fallback_target: Option<FallbackTarget>,
     reality_fallback_rules: Vec<FallbackRule>,
+    probe_sender: SyncSender<ServerHelloProbeJob>,
+    socket_registered: bool,
+    back_registered: bool,
     back: Option<TcpStream>,
     front_send_buf: Vec<u8>,
     back_send_buf: Vec<u8>,
@@ -290,6 +378,74 @@ fn connect_fallback_backend(target: &FallbackTarget) -> io::Result<StdTcpStream>
     }
 
     StdTcpStream::connect(addrs.as_slice())
+}
+
+fn connect_probe_backend(target: &FallbackTarget) -> io::Result<StdTcpStream> {
+    let addrs = (target.address.as_str(), target.port)
+        .to_socket_addrs()?
+        .collect::<Vec<_>>();
+    let timeout = Duration::from_secs(2);
+    let mut last_error = None;
+    for address in addrs {
+        match StdTcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "could not resolve probe target {}:{}",
+                target.address, target.port
+            ),
+        )
+    }))
+}
+
+fn probe_server_hello(target: &FallbackTarget, client_hello: &[u8]) -> io::Result<Vec<u8>> {
+    let mut stream = connect_probe_backend(target)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(client_hello)?;
+
+    let mut record_header = [0u8; 5];
+    stream.read_exact(&mut record_header)?;
+    if record_header[0] != 22 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "destination did not send a TLS handshake record",
+        ));
+    }
+    let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
+    if !(4..=18_432).contains(&record_len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "destination sent an invalid TLS handshake record length",
+        ));
+    }
+    let mut record_payload = vec![0u8; record_len];
+    stream.read_exact(&mut record_payload)?;
+    if record_payload[0] != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "destination did not send ServerHello first",
+        ));
+    }
+    let handshake_len = ((record_payload[1] as usize) << 16)
+        | ((record_payload[2] as usize) << 8)
+        | record_payload[3] as usize;
+    let server_hello_len = 4usize
+        .checked_add(handshake_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid ServerHello length"))?;
+    if server_hello_len > record_payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "destination split ServerHello across TLS records",
+        ));
+    }
+    record_payload.truncate(server_hello_len);
+    Ok(record_payload)
 }
 
 fn open_back_port(port: u16) -> TcpStream {
@@ -328,10 +484,15 @@ impl OpenConnection {
         mode: ServerMode,
         tls_config: Arc<ServerConfig>,
         reality_server_names: Vec<String>, // Added parameter for reality server names
+        reality_destination: Option<FallbackTarget>,
         reality_fallback_target: Option<FallbackTarget>,
         reality_fallback_rules: Vec<FallbackRule>,
+        probe_sender: SyncSender<ServerHelloProbeJob>,
     ) -> Self {
-        let state = if reality_fallback_target.is_some() {
+        let needs_acceptor = reality_fallback_target.is_some()
+            || reality_destination.is_some()
+            || !reality_fallback_rules.is_empty();
+        let state = if needs_acceptor {
             ConnectionState::Accepting {
                 acceptor: Acceptor::default(),
                 buffered: Vec::new(),
@@ -339,7 +500,7 @@ impl OpenConnection {
         } else {
             ConnectionState::Tls(ServerConnection::new(tls_config.clone()).unwrap())
         };
-        let back = if reality_fallback_target.is_some() {
+        let back = if needs_acceptor {
             None
         } else {
             open_back(&mode)
@@ -352,8 +513,12 @@ impl OpenConnection {
             mode,
             state,
             tls_config,
+            reality_destination,
             reality_fallback_target,
             reality_fallback_rules,
+            probe_sender,
+            socket_registered: false,
+            back_registered: false,
             back,
             front_send_buf: Vec::new(),
             back_send_buf: Vec::new(),
@@ -370,6 +535,7 @@ impl OpenConnection {
         if ev.is_readable() {
             match self.state {
                 ConnectionState::Accepting { .. } => self.do_accept_read(registry),
+                ConnectionState::Probing { .. } => {}
                 ConnectionState::Tls(_) => {
                     self.do_tls_read();
                     self.try_plain_read();
@@ -387,16 +553,12 @@ impl OpenConnection {
                 ConnectionState::Tls(_) => self.do_tls_write_and_handle_error(),
                 ConnectionState::Passthrough => self.flush_passthrough_writes(),
                 ConnectionState::Accepting { .. } => {}
+                ConnectionState::Probing { .. } => {}
             }
         }
 
         if self.closing {
-            let _ = self
-                .socket
-                .shutdown(net::Shutdown::Both);
-            self.close_back();
-            self.closed = true;
-            self.deregister(registry);
+            self.close(registry);
         } else {
             self.reregister(registry);
         }
@@ -414,6 +576,15 @@ impl OpenConnection {
             ConnectionState::Tls(conn) => Some(conn),
             _ => None,
         }
+    }
+
+    fn close(&mut self, registry: &mio::Registry) {
+        let _ = self
+            .socket
+            .shutdown(net::Shutdown::Both);
+        self.close_back();
+        self.closed = true;
+        self.deregister(registry);
     }
 
     /// Close the backend connection for forwarded sessions.
@@ -454,7 +625,7 @@ impl OpenConnection {
                     match self.try_finish_accept(registry) {
                         AcceptProgress::NeedMore => continue,
                         AcceptProgress::Ready
-                        | AcceptProgress::Fallback
+                        | AcceptProgress::Probing
                         | AcceptProgress::Closed => {
                             return;
                         }
@@ -479,35 +650,11 @@ impl OpenConnection {
                         .take_accept_buffer()
                         .unwrap_or_default();
 
-                    // Allowlisted SNI is authenticated by the real verifier first. A
-                    // failed verification falls back without sending a TLS alert.
-                    match self.start_tls_from_buffer(&buffered) {
-                        Ok(()) => {
-                            if self
-                                .tls_conn()
-                                .is_some_and(ServerConnection::wants_write)
-                            {
-                                self.do_tls_write_and_handle_error();
-                            }
-                            return AcceptProgress::Ready;
-                        }
-                        Err(err) => {
-                            debug!("REALITY verification failed; forwarding probe: {err:?}");
-                        }
-                    }
-
-                    match self.start_fallback(registry, buffered, target) {
-                        Ok(()) => {
-                            debug!("forwarding non-REALITY probe to fallback backend");
-                            return AcceptProgress::Fallback;
-                        }
-                        Err(err) => {
-                            error!("failed to connect/write REALITY fallback backend: {err:?}");
-                        }
-                    }
-
-                    self.closing = true;
-                    return AcceptProgress::Closed;
+                    return if self.start_server_hello_probe(registry, buffered, target) {
+                        AcceptProgress::Probing
+                    } else {
+                        AcceptProgress::Closed
+                    };
                 }
 
                 match self.start_tls_from_accept_buffer() {
@@ -540,6 +687,80 @@ impl OpenConnection {
         match &mut self.state {
             ConnectionState::Accepting { buffered, .. } => Some(core::mem::take(buffered)),
             _ => None,
+        }
+    }
+
+    fn start_server_hello_probe(
+        &mut self,
+        registry: &mio::Registry,
+        buffered: Vec<u8>,
+        fallback_target: FallbackTarget,
+    ) -> bool {
+        let probe_target = self
+            .reality_destination
+            .clone()
+            .unwrap_or_else(|| fallback_target.clone());
+        let job = ServerHelloProbeJob {
+            token: self.token,
+            target: probe_target,
+            client_hello: buffered.clone(),
+        };
+        match self.probe_sender.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                error!("REALITY destination probe queue is full");
+                self.closing = true;
+                return false;
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                error!("REALITY destination probe workers are unavailable");
+                self.closing = true;
+                return false;
+            }
+        }
+        self.state = ConnectionState::Probing {
+            buffered,
+            fallback_target,
+        };
+        self.deregister(registry);
+        true
+    }
+
+    fn finish_server_hello_probe(&mut self, registry: &mio::Registry, result: io::Result<Vec<u8>>) {
+        let ConnectionState::Probing {
+            buffered,
+            fallback_target,
+        } = core::mem::replace(&mut self.state, ConnectionState::Passthrough)
+        else {
+            return;
+        };
+        let template = match result {
+            Ok(template) => Some(template),
+            Err(err) => {
+                debug!("REALITY destination ServerHello probe failed: {err:?}");
+                None
+            }
+        };
+
+        match self.start_tls_from_buffer(&buffered, template.as_deref()) {
+            Ok(()) => {
+                if self
+                    .tls_conn()
+                    .is_some_and(ServerConnection::wants_write)
+                {
+                    self.do_tls_write_and_handle_error();
+                }
+            }
+            Err(err) => {
+                debug!("REALITY verification failed; forwarding probe: {err:?}");
+                match self.start_fallback(registry, buffered, fallback_target) {
+                    Ok(()) => debug!("forwarding non-REALITY probe to fallback backend"),
+                    Err(err) => {
+                        error!("failed to connect/write REALITY fallback backend: {err:?}");
+                        self.closing = true;
+                    }
+                }
+            }
         }
     }
 
@@ -583,7 +804,10 @@ impl OpenConnection {
         );
         let selected_target = selected_target?;
 
-        if self.reality_server_names.is_empty() {
+        if self.reality_server_names.is_empty()
+            && self.reality_destination.is_none()
+            && self.reality_fallback_rules.is_empty()
+        {
             return None;
         }
 
@@ -612,11 +836,18 @@ impl OpenConnection {
         let buffered = self
             .take_accept_buffer()
             .unwrap_or_default();
-        self.start_tls_from_buffer(&buffered)
+        self.start_tls_from_buffer(&buffered, None)
     }
 
-    fn start_tls_from_buffer(&mut self, buffered: &[u8]) -> Result<(), rustls::Error> {
+    fn start_tls_from_buffer(
+        &mut self,
+        buffered: &[u8],
+        server_hello_template: Option<&[u8]>,
+    ) -> Result<(), rustls::Error> {
         let mut conn = ServerConnection::new(self.tls_config.clone())?;
+        if let Some(template) = server_hello_template {
+            conn.set_reality_server_hello_template(template)?;
+        }
         let mut incoming = buffered;
         conn.read_tls(&mut incoming)
             .map_err(|err| rustls::Error::General(err.to_string()))?;
@@ -639,6 +870,7 @@ impl OpenConnection {
             .register(&mut back, self.token, mio::Interest::READABLE)
             .unwrap();
         self.back = Some(back);
+        self.back_registered = true;
         self.state = ConnectionState::Passthrough;
         Ok(())
     }
@@ -916,18 +1148,35 @@ impl OpenConnection {
     fn register(&mut self, registry: &mio::Registry) {
         let event_set = self.front_event_set();
         let back_event_set = self.back_event_set();
-        registry
-            .register(&mut self.socket, self.token, event_set)
-            .unwrap();
+        if self.socket_registered {
+            registry
+                .reregister(&mut self.socket, self.token, event_set)
+                .unwrap();
+        } else {
+            registry
+                .register(&mut self.socket, self.token, event_set)
+                .unwrap();
+            self.socket_registered = true;
+        }
 
         if let Some(back) = &mut self.back {
-            registry
-                .register(back, self.token, back_event_set)
-                .unwrap();
+            if self.back_registered {
+                registry
+                    .reregister(back, self.token, back_event_set)
+                    .unwrap();
+            } else {
+                registry
+                    .register(back, self.token, back_event_set)
+                    .unwrap();
+                self.back_registered = true;
+            }
         }
     }
 
     fn reregister(&mut self, registry: &mio::Registry) {
+        if !self.socket_registered {
+            return;
+        }
         let event_set = self.front_event_set();
         let back_event_set = self.back_event_set();
         registry
@@ -935,19 +1184,32 @@ impl OpenConnection {
             .unwrap();
 
         if let Some(back) = self.back.as_mut() {
-            registry
-                .reregister(back, self.token, back_event_set)
-                .unwrap();
+            if self.back_registered {
+                registry
+                    .reregister(back, self.token, back_event_set)
+                    .unwrap();
+            } else {
+                registry
+                    .register(back, self.token, back_event_set)
+                    .unwrap();
+                self.back_registered = true;
+            }
         }
     }
 
     fn deregister(&mut self, registry: &mio::Registry) {
-        registry
-            .deregister(&mut self.socket)
-            .unwrap();
+        if self.socket_registered {
+            registry
+                .deregister(&mut self.socket)
+                .unwrap();
+            self.socket_registered = false;
+        }
 
         if let Some(back) = self.back.as_mut() {
-            registry.deregister(back).unwrap();
+            if self.back_registered {
+                registry.deregister(back).unwrap();
+                self.back_registered = false;
+            }
         }
     }
 
@@ -1076,6 +1338,7 @@ struct Args {
 impl Args {
     fn validate(&self, reality: Option<&RealityServerConfig>) -> Result<(), String> {
         let fallback_target = effective_reality_fallback_target(self, reality);
+        let reality_destination = effective_reality_destination_target(reality)?;
 
         if reality.is_none() {
             if fallback_target.is_some() || self.reality_fallback_address.is_some() {
@@ -1093,7 +1356,9 @@ impl Args {
             return Err("REALITY fallback address requires a fallback port".into());
         }
 
-        if fallback_target.is_some() && matches!(self.mode, ServerMode::Forward { .. }) {
+        if (fallback_target.is_some() || reality_destination.is_some())
+            && matches!(self.mode, ServerMode::Forward { .. })
+        {
             return Err("REALITY fallback is not supported with forward mode".into());
         }
 
@@ -1352,6 +1617,9 @@ fn resolve_reality_config(
             short_ids,
             private_key,
             version,
+            dest: file_config
+                .as_ref()
+                .and_then(|config| config.dest.clone()),
             server_names,
             fallback_address,
             fallback_port,
@@ -1382,6 +1650,50 @@ fn effective_reality_fallback_target(
         .unwrap_or_else(|| "localhost".to_string());
 
     Some(FallbackTarget { address, port })
+}
+
+fn effective_reality_destination_target(
+    reality: Option<&RealityServerConfig>,
+) -> Result<Option<FallbackTarget>, String> {
+    reality
+        .and_then(|config| config.dest.as_deref())
+        .map(parse_reality_destination)
+        .transpose()
+}
+
+fn parse_reality_destination(value: &str) -> Result<FallbackTarget, String> {
+    let (address, port) = if let Some(bracketed) = value.strip_prefix('[') {
+        let (address, suffix) = bracketed
+            .split_once(']')
+            .ok_or_else(|| "REALITY dest has an invalid bracketed address".to_string())?;
+        let port = suffix
+            .strip_prefix(':')
+            .ok_or_else(|| "REALITY dest must include a port".to_string())?;
+        (address, port)
+    } else {
+        let (address, port) = value
+            .rsplit_once(':')
+            .ok_or_else(|| "REALITY dest must be host:port".to_string())?;
+        if address.contains(':') {
+            return Err("IPv6 REALITY dest addresses must be bracketed".into());
+        }
+        (address, port)
+    };
+
+    if address.is_empty() {
+        return Err("REALITY dest host must not be empty".into());
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "REALITY dest port must be a valid u16".to_string())?;
+    if port == 0 {
+        return Err("REALITY dest port must be non-zero".into());
+    }
+
+    Ok(FallbackTarget {
+        address: address.to_string(),
+        port,
+    })
 }
 
 fn effective_reality_fallback_rules(reality: Option<&RealityServerConfig>) -> Vec<FallbackRule> {
@@ -1686,7 +1998,10 @@ fn main() {
     poll.registry()
         .register(&mut listener, LISTENER, mio::Interest::READABLE)
         .unwrap();
-    let fallback_target = effective_reality_fallback_target(&args, reality.as_ref());
+    let probe_waker = Arc::new(mio::Waker::new(poll.registry(), PROBE_WAKE).unwrap());
+    let reality_destination = effective_reality_destination_target(reality.as_ref()).unwrap();
+    let fallback_target = effective_reality_fallback_target(&args, reality.as_ref())
+        .or_else(|| reality_destination.clone());
     let fallback_rules = effective_reality_fallback_rules(reality.as_ref());
 
     let mut tlsserv = TlsServer::new(
@@ -1697,8 +2012,10 @@ fn main() {
             .as_ref()
             .map(|config| config.server_names.clone())
             .unwrap_or_default(),
+        reality_destination,
         fallback_target,
         fallback_rules,
+        probe_waker,
     );
 
     let mut events = mio::Events::with_capacity(256);
@@ -1719,6 +2036,7 @@ fn main() {
                         .accept(poll.registry())
                         .expect("error accepting socket");
                 }
+                PROBE_WAKE => tlsserv.complete_server_hello_probes(poll.registry()),
                 _ => tlsserv.conn_event(poll.registry(), event),
             }
         }
@@ -1728,7 +2046,7 @@ fn main() {
 enum AcceptProgress {
     NeedMore,
     Ready,
-    Fallback,
+    Probing,
     Closed,
 }
 
@@ -2041,6 +2359,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reality.server_names, vec!["test"]);
+        assert_eq!(reality.dest.as_deref(), Some("[::1]:9446"));
         assert_eq!(reality.fallback_address.as_deref(), Some("::1"));
         assert_eq!(reality.fallback_port, Some(9446));
         assert_eq!(reality.fallback_rules.len(), 1);
@@ -2147,6 +2466,7 @@ mod tests {
             short_ids: vec!["aabbcc".to_string()],
             private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
             version: "010203".to_string(),
+            dest: None,
             server_names: vec!["test".to_string()],
             fallback_address: Some("::1".to_string()),
             fallback_port: Some(9446),
@@ -2180,6 +2500,7 @@ mod tests {
             short_ids: vec!["aabbcc".to_string()],
             private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
             version: "010203".to_string(),
+            dest: None,
             server_names: vec!["test".to_string()],
             fallback_address: Some("::1".to_string()),
             fallback_port: Some(9446),
@@ -2197,5 +2518,57 @@ mod tests {
                 .unwrap_err(),
             "REALITY fallback rule #0 requires a non-zero fallback port"
         );
+    }
+
+    #[test]
+    fn parses_reality_dest_host_and_bracketed_ipv6() {
+        assert_eq!(
+            parse_reality_destination("decoy.example:443").unwrap(),
+            FallbackTarget {
+                address: "decoy.example".to_string(),
+                port: 443,
+            }
+        );
+        assert_eq!(
+            parse_reality_destination("[::1]:8443").unwrap(),
+            FallbackTarget {
+                address: "::1".to_string(),
+                port: 8443,
+            }
+        );
+        assert!(parse_reality_destination("::1:443").is_err());
+        assert!(parse_reality_destination("decoy.example:0").is_err());
+    }
+
+    #[test]
+    fn probe_server_hello_extracts_handshake_message_from_tls_record() {
+        let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client_hello = b"client hello bytes".to_vec();
+        let expected_server_hello = vec![2, 0, 0, 4, 1, 2, 3, 4];
+        let server_hello_for_peer = expected_server_hello.clone();
+        let client_hello_for_peer = client_hello.clone();
+        let target = FallbackTarget {
+            address: address.ip().to_string(),
+            port: address.port(),
+        };
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut received = vec![0; client_hello_for_peer.len()];
+            stream
+                .read_exact(&mut received)
+                .unwrap();
+            assert_eq!(received, client_hello_for_peer);
+            let mut record = vec![22, 3, 3, 0, server_hello_for_peer.len() as u8];
+            record.extend_from_slice(&server_hello_for_peer);
+            stream.write_all(&record).unwrap();
+        });
+
+        assert_eq!(
+            probe_server_hello(&target, &client_hello).unwrap(),
+            expected_server_hello
+        );
+        server.join().unwrap();
     }
 }

@@ -1018,6 +1018,7 @@ mod tests {
     use rustls::{Connection, RootCertStore, ServerConfig};
     use rustls_test::{ErrorFromPeer, bytes_for, do_handshake, do_handshake_until_error};
     use std::eprintln;
+    use std::io::Cursor;
 
     #[derive(Debug)]
     struct FixedTimeProvider(UnixTime);
@@ -1675,6 +1676,98 @@ mod tests {
             .unwrap();
         let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
         do_handshake(&mut client, &mut server);
+    }
+
+    #[test]
+    fn matching_reality_handshake_accepts_target_server_hello_template() {
+        let server_private_key = agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let server_public_key = server_private_key
+            .compute_public_key()
+            .unwrap();
+        let fixed_time = Arc::new(FixedTimeProvider(UnixTime::since_unix_epoch(
+            Duration::from_secs(0x01020304),
+        )));
+
+        let client_config = RealitySessionIdConfig::new(
+            [1, 2, 3],
+            [0xaa, 0xbb, 0xcc],
+            server_public_key.as_ref().to_vec(),
+        )
+        .with_time_provider(fixed_time.clone())
+        .build_client_config(test_root_store())
+        .unwrap();
+        let server_config = Arc::new(test_reality_server_config(
+            [1, 2, 3],
+            &[0xaa, 0xbb, 0xcc],
+            x25519_private_key_bytes(&server_private_key),
+            fixed_time.clone(),
+        ));
+
+        let client_config = Arc::new(client_config);
+        let mut probe_client = client_config
+            .connect(ServerName::try_from("example.com").unwrap())
+            .build()
+            .unwrap();
+        let mut client_hello = Vec::new();
+        while probe_client.wants_write() {
+            probe_client
+                .write_tls(&mut client_hello)
+                .unwrap();
+        }
+        let client_hello_record_len =
+            u16::from_be_bytes([client_hello[3], client_hello[4]]) as usize;
+        let client_hello_record = &client_hello[..5 + client_hello_record_len];
+
+        let mut target = ServerConnection::new(server_config.clone()).unwrap();
+        target
+            .read_tls(&mut Cursor::new(client_hello_record))
+            .unwrap();
+        target.process_new_packets().unwrap();
+        let mut target_flight = Vec::new();
+        target
+            .write_tls(&mut target_flight)
+            .unwrap();
+        assert_eq!(target_flight[0], 22);
+        let target_record_len = u16::from_be_bytes([target_flight[3], target_flight[4]]) as usize;
+        let target_server_hello = target_flight[5..5 + target_record_len].to_vec();
+
+        let mut client = client_config
+            .connect(ServerName::try_from("example.com").unwrap())
+            .build()
+            .unwrap();
+        let mut server = ServerConnection::new(server_config.clone()).unwrap();
+        server
+            .set_reality_server_hello_template(&target_server_hello)
+            .unwrap();
+        do_handshake(&mut client, &mut server);
+
+        let mut incompatible_template = target_server_hello;
+        incompatible_template[71..73].copy_from_slice(&0x0000u16.to_be_bytes());
+        let fallback_client_config = Arc::new(
+            RealitySessionIdConfig::new(
+                [1, 2, 3],
+                [0xaa, 0xbb, 0xcc],
+                server_public_key.as_ref().to_vec(),
+            )
+            .with_time_provider(fixed_time)
+            .build_client_config(test_root_store())
+            .unwrap(),
+        );
+        let mut client = fallback_client_config
+            .connect(ServerName::try_from("example.com").unwrap())
+            .build()
+            .unwrap();
+        let mut server = ServerConnection::new(server_config.clone()).unwrap();
+        server
+            .set_reality_server_hello_template(&incompatible_template)
+            .unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            do_handshake(&mut client, &mut server);
+        }));
+        assert!(
+            outcome.is_ok(),
+            "incompatible ServerHello template should fall back"
+        );
     }
 
     #[test]

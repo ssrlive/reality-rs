@@ -440,6 +440,7 @@ pub(crate) struct ExpectClientHello {
     pub(super) using_ems: bool,
     pub(super) done_retry: bool,
     pub(super) send_tickets: usize,
+    pub(super) reality_server_hello_template: Option<Vec<u8>>,
 }
 
 impl ExpectClientHello {
@@ -466,6 +467,7 @@ impl ExpectClientHello {
             using_ems: false,
             done_retry: false,
             send_tickets: 0,
+            reality_server_hello_template: None,
         }
     }
 

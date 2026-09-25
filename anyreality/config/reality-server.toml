@@ -3,6 +3,9 @@ shortId = "aabbcc"
 privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
 version = "010203"
 serverNames = ["test"]
+# Optional TLS target used to sample a compatible ServerHello.
+# If omitted, an allowlisted ClientHello SNI is sampled on port 443.
+# dest = "www.example.com:443"
 
 [anytls]
 password = "reality-smoke-password"

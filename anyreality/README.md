@@ -139,12 +139,24 @@ available in [config/reality-server.json](config/reality-server.json).
 The sample server config uses three top-level sections:
 
 - `reality`: REALITY handshake material (`shortId`, `privateKey`,
-  `serverNames`, `version`)
+  `serverNames`, `version`, and optional `dest`)
 - `anytls`: shared AnyTLS settings (`password`)
 - `server`: server-only runtime defaults such as `listen`
 
 The binary now reads runtime values from the config file. The CLI only takes
 `--config` and `--log`.
+
+Set `reality.dest` to a target TLS address such as `www.example.com:443` to
+sample its ServerHello for authenticated REALITY connections. When omitted, the
+server uses the ClientHello SNI with port 443 only if that name is in
+`reality.serverNames`; absent or unlisted SNI disables probing for that
+connection. An explicit `dest` takes precedence. The server sends the received
+ClientHello to the selected target before its local handshake and uses the
+target ServerHello only when it matches the locally negotiated TLS 1.3 suite
+and key share. Probe errors and incompatible templates fall back to Rustls'
+normal ServerHello; they do not prevent the REALITY connection. The certificate
+and later encrypted TLS records remain local and are not copied or length-matched
+to the target. This setting does not change raw-TLS fallback routing.
 
 ---
 

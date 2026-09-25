@@ -2,6 +2,7 @@
 shortIds = ["aabbcc"]
 privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
 version = "010203"
+dest = "[::1]:9446"
 serverNames = ["test"]
 fallbackAddress = "::1"
 fallbackPort = 9446

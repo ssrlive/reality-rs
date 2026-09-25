@@ -164,6 +164,9 @@ fn resolve_reality_config(args: &Args) -> Result<Option<RealityServerConfig>, Bo
             short_ids,
             private_key,
             version,
+            dest: file_config
+                .as_ref()
+                .and_then(|config| config.dest.clone()),
             server_names,
             fallback_address: file_config
                 .as_ref()
