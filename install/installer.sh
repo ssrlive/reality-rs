@@ -159,7 +159,7 @@ write_server_config() {
   local password="$3"
   cat > "$SERVER_CONFIG" <<EOF
 [reality]
-shortId = "$shortid"
+shortIds = ["$shortid"]
 privateKey = "$priv"
 version = "010203"
 serverNames = ["$the_site"]

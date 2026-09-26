@@ -238,7 +238,7 @@ Examples:
     with open(server_config_path, 'w', encoding='utf-8') as handle:
         handle.write(
             '[reality]\n'
-            'shortId = "aabbcc"\n'
+            'shortIds = ["aabbcc"]\n'
             'privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"\n'
             'version = "010203"\n'
             'serverNames = ["test", "example.com", "baidu.com", "www.baidu.com"]\n\n'

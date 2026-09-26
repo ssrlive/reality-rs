@@ -138,7 +138,7 @@ available in [config/reality-server.json](config/reality-server.json).
 
 The sample server config uses three top-level sections:
 
-- `reality`: REALITY handshake material (`shortId`, `privateKey`,
+- `reality`: REALITY handshake material (`shortIds`, `privateKey`,
   `serverNames`, `version`, and optional `dest`)
 - `anytls`: shared AnyTLS settings (`password`)
 - `server`: server-only runtime defaults such as `listen`
@@ -157,6 +157,8 @@ and key share. Probe errors and incompatible templates fall back to Rustls'
 normal ServerHello; they do not prevent the REALITY connection. The certificate
 and later encrypted TLS records remain local and are not copied or length-matched
 to the target. This setting does not change raw-TLS fallback routing.
+
+The server accepts multiple hexadecimal Short IDs in `reality.shortIds`.
 
 ---
 

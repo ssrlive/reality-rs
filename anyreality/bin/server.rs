@@ -95,7 +95,7 @@ struct ServerRealityConfigFile {
     #[serde(default)]
     private_key: Option<String>,
     #[serde(default)]
-    short_id: Option<String>,
+    short_ids: Option<Vec<String>>,
     #[serde(default)]
     version: Option<String>,
     #[serde(default)]
@@ -123,7 +123,7 @@ struct ServerConfigResolved {
     listen: String,
     password: String,
     private_key: String,
-    short_id: String,
+    short_ids: Vec<Vec<u8>>,
     version: String,
     server_names: Vec<String>,
     dest: Option<String>,
@@ -196,7 +196,17 @@ async fn main() -> Result<()> {
         PaddingFactory::new(DEFAULT_SCHEME).expect("valid default padding scheme"),
     ));
     let reality_private_key = Arc::new(parse_reality_private_key(&resolved.private_key)?);
-    let reality_short_id = Arc::new(parse_reality_short_id_fixed(&resolved.short_id)?);
+    let reality_short_ids = Arc::new(
+        resolved
+            .short_ids
+            .iter()
+            .map(|short_id| {
+                let mut fixed = [0u8; 8];
+                fixed[..short_id.len()].copy_from_slice(short_id);
+                fixed
+            })
+            .collect::<Vec<_>>(),
+    );
     let reality_version = parse_reality_version(&resolved.version);
     let reality_dest = resolved.dest.clone();
 
@@ -209,7 +219,7 @@ async fn main() -> Result<()> {
         let allowed_server_names = allowed_server_names.clone();
         let padding = padding.clone();
         let reality_private_key = reality_private_key.clone();
-        let reality_short_id = reality_short_id.clone();
+        let reality_short_ids = reality_short_ids.clone();
         let reality_dest = reality_dest.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_connection(
@@ -219,7 +229,7 @@ async fn main() -> Result<()> {
                 password_sha256,
                 padding,
                 reality_private_key,
-                reality_short_id,
+                reality_short_ids,
                 reality_version,
                 reality_dest,
             )
@@ -238,7 +248,7 @@ async fn handle_connection(
     password_sha256: [u8; 32],
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
     reality_private_key: Arc<Vec<u8>>,
-    reality_short_id: Arc<[u8; 8]>,
+    reality_short_ids: Arc<Vec<[u8; 8]>>,
     reality_version: [u8; 3],
     reality_dest: Option<String>,
 ) -> Result<()> {
@@ -252,10 +262,10 @@ async fn handle_connection(
     // connection can never pin an async worker thread; otherwise a handful of
     // scanners on this port would freeze every live carrier's SYNACK traffic.
     let detect_key = reality_private_key.clone();
-    let detect_short_id = reality_short_id.clone();
+    let detect_short_ids = reality_short_ids.clone();
     let (client_hello, std_stream) =
         tokio::task::spawn_blocking(move || -> Result<(Option<RealityClientHelloProbe>, std::net::TcpStream)> {
-            let client_hello = is_reality_client_hello(&std_stream, detect_key.as_slice(), detect_short_id.as_slice(), &reality_version)?;
+            let client_hello = is_reality_client_hello(&std_stream, detect_key.as_slice(), &detect_short_ids, &reality_version)?;
             Ok((client_hello, std_stream))
         })
         .await??;
@@ -486,10 +496,7 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
         bail!("anytls.password must not be empty");
     }
 
-    let short_id = reality
-        .short_id
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("reality.shortId must be set in config"))?;
+    let short_ids = parse_server_short_ids(reality)?;
     let private_key = reality
         .private_key
         .clone()
@@ -517,7 +524,7 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
         listen,
         password,
         private_key,
-        short_id,
+        short_ids,
         version,
         server_names,
         dest,
@@ -530,11 +537,12 @@ fn build_server_config(reality: &ServerConfigResolved) -> Result<ServerConfig> {
         .with_no_client_auth()
         .with_server_credential_resolver(Arc::new(RejectCredentialResolver))?;
 
-    let reality_config = provider::reality::RealityServerVerifierConfig::from_xray_fields(
+    let reality_config = provider::reality::RealityServerVerifierConfig::new(
         parse_reality_version(&reality.version),
-        &reality.short_id,
-        &reality.private_key,
-    )?;
+        &reality.short_ids[0],
+        parse_reality_private_key(&reality.private_key)?,
+    )
+    .with_short_ids(reality.short_ids.clone());
     reality_config.install_into(&mut config)?;
     let verifier = reality_config.build_verifier()?;
     config
@@ -550,7 +558,7 @@ fn build_server_config(reality: &ServerConfigResolved) -> Result<ServerConfig> {
 fn is_reality_client_hello(
     tcp_stream: &std::net::TcpStream,
     server_private_key: &[u8],
-    short_id: &[u8],
+    short_ids: &[[u8; 8]],
     version: &[u8; 3],
 ) -> Result<Option<RealityClientHelloProbe>> {
     tcp_stream
@@ -626,7 +634,7 @@ fn is_reality_client_hello(
         if &decrypted[..3] != version.as_slice() {
             return Ok(None);
         }
-        if &decrypted[8..16] != short_id {
+        if !short_ids.iter().any(|short_id| &decrypted[8..16] == short_id) {
             return Ok(None);
         }
 
@@ -1012,21 +1020,35 @@ fn parse_reality_private_key(private_key: &str) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
-fn parse_reality_short_id_fixed(short_id: &str) -> Result<[u8; 8]> {
-    let raw = decode_hex(short_id.trim())?;
-    if raw.len() > 8 {
-        bail!("REALITY short_id must be at most 8 bytes")
+fn parse_server_short_ids(reality: &ServerRealityConfigFile) -> Result<Vec<Vec<u8>>> {
+    let configured_short_ids = reality
+        .short_ids
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("reality.shortIds must be set in config"))?;
+
+    if configured_short_ids.is_empty() {
+        bail!("reality.shortIds must not be empty");
     }
 
-    let mut fixed = [0u8; 8];
-    fixed[..raw.len()].copy_from_slice(&raw);
-    Ok(fixed)
+    configured_short_ids
+        .iter()
+        .map(|short_id| {
+            let short_id = decode_hex(short_id.trim())?;
+            if short_id.len() > 8 {
+                bail!("each REALITY short_id must be at most 8 bytes");
+            }
+            Ok(short_id)
+        })
+        .collect()
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>> {
     let input = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value);
     if !input.len().is_multiple_of(2) {
         bail!("REALITY short_id hex string must contain an even number of digits")
+    }
+    if !input.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("REALITY short_id must contain only hexadecimal digits")
     }
 
     let mut bytes = Vec::with_capacity(input.len() / 2);
@@ -1056,7 +1078,10 @@ fn is_error_of_session_broken(error: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerConfigFile, collect_client_hello, parse_client_hello, probe_server_hello, select_server_hello_probe_destination};
+    use super::{
+        ServerConfigFile, ServerRealityConfigFile, collect_client_hello, parse_client_hello, parse_server_short_ids, probe_server_hello,
+        select_server_hello_probe_destination,
+    };
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -1107,6 +1132,39 @@ mod tests {
 
         let without_dest: ServerConfigFile = toml::from_str("[reality]\n").unwrap();
         assert_eq!(without_dest.reality.unwrap().dest, None);
+    }
+
+    #[test]
+    fn server_short_ids_accepts_toml_and_json_arrays() {
+        let array: ServerRealityConfigFile = toml::from_str("shortIds = [\"aabbcc\", \"1122\"]").unwrap();
+        assert_eq!(
+            parse_server_short_ids(&array).unwrap(),
+            vec![vec![0xaa, 0xbb, 0xcc], vec![0x11, 0x22]]
+        );
+
+        let json: ServerRealityConfigFile = serde_json::from_str(r#"{"shortIds":["aabbcc","1122"]}"#).unwrap();
+        assert_eq!(
+            parse_server_short_ids(&json).unwrap(),
+            vec![vec![0xaa, 0xbb, 0xcc], vec![0x11, 0x22]]
+        );
+    }
+
+    #[test]
+    fn server_short_ids_rejects_missing_or_invalid_config() {
+        let missing: ServerRealityConfigFile = toml::from_str("").unwrap();
+        assert!(parse_server_short_ids(&missing).is_err());
+
+        let legacy: ServerRealityConfigFile = toml::from_str("shortId = \"aabbcc\"").unwrap();
+        assert!(parse_server_short_ids(&legacy).is_err());
+
+        let empty: ServerRealityConfigFile = toml::from_str("shortIds = []").unwrap();
+        assert!(parse_server_short_ids(&empty).is_err());
+
+        let too_long: ServerRealityConfigFile = toml::from_str("shortIds = [\"001122334455667788\"]").unwrap();
+        assert!(parse_server_short_ids(&too_long).is_err());
+
+        let invalid_hex: ServerRealityConfigFile = toml::from_str("shortIds = [\"zz\"]").unwrap();
+        assert!(parse_server_short_ids(&invalid_hex).is_err());
     }
 
     #[test]
