@@ -195,6 +195,10 @@ async fn main() -> Result<()> {
                 Ok(None) => Ok(()),
                 Ok(Some(LocalProxyProtocol::Socks5)) => handle_socks(IncomingConnection::new(stream, auth), anytls_client).await,
                 Ok(Some(LocalProxyProtocol::Http)) => handle_http_connect(stream, anytls_client).await,
+                Err(error) if is_peer_disconnect(&error) => {
+                    log::debug!("Proxy peer {peer_addr} disconnected during protocol detection: {error}");
+                    Ok(())
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
@@ -349,21 +353,25 @@ async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> 
     }
     let target = Address::try_from(target).context("invalid HTTP CONNECT target")?;
 
-    let session = Arc::new(client.create_stream().await?);
+    let mut remote = anytls::StreamIo::new(client.create_stream().await?);
+    let stream = remote.stream();
+    let session_id = stream.session_id().unwrap_or_default();
+    let stream_id = stream.id();
     log::debug!(
-        "session={} stream={} stage=target_submit protocol=http-connect peer={:?} target={target}",
-        session.session_id().unwrap_or_default(),
-        session.id(),
+        "session={session_id} stream={stream_id} stage=target_submit protocol=http-connect peer={:?} target={target}",
         tcp_stream.peer_addr()
     );
-    if let Err(err) = session.write(&Vec::<u8>::from(target.clone())).await {
-        return Err(err.into());
-    }
+    remote.write_all(&Vec::<u8>::from(target.clone())).await?;
     if let Err(error) = tcp_stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await {
         return Err(error.into());
     }
-    let mut reader = AnytlsStreamReader::new(session.clone());
-    anyreality::relay_tcp(tcp_stream, session, &mut reader).await?;
+    match anytls::relay::copy_bidirectional(&mut tcp_stream, &mut remote).await {
+        Ok(_) => {}
+        Err(error) if error.is_peer_disconnect() => {
+            log::debug!("Proxy peer disconnected during HTTP CONNECT relay: {error}");
+        }
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -371,8 +379,8 @@ async fn handle_tcp_connect(connect_req: connect::Connect<connect::NeedReply>, t
     let bind_addr = Address::from(connect_req.local_addr()?);
 
     // Open the anytls stream before reporting success to the SOCKS client.
-    let session = match client.create_stream().await {
-        Ok(s) => Arc::new(s),
+    let stream = match client.create_stream().await {
+        Ok(stream) => stream,
         Err(err) => {
             if let Ok(mut failed) = connect_req.reply(Reply::GeneralFailure, Address::unspecified()).await {
                 let _ = failed.shutdown().await;
@@ -380,32 +388,45 @@ async fn handle_tcp_connect(connect_req: connect::Connect<connect::NeedReply>, t
             return Err(err.into());
         }
     };
+    let mut remote = anytls::StreamIo::new(stream);
+    let stream = remote.stream();
+    let session_id = stream.session_id().unwrap_or_default();
+    let stream_id = stream.id();
 
     // First user payload on this stream: target address in SOCKS5 SocksAddr
     // format. Becomes the data of the first cmdPSH frame.
-    log::debug!(
-        "session={} stream={} stage=target_submit protocol=socks5 target={target}",
-        session.session_id().unwrap_or_default(),
-        session.id()
-    );
+    log::debug!("session={session_id} stream={stream_id} stage=target_submit protocol=socks5 target={target}",);
     let addr_bytes: Vec<u8> = target.clone().into();
-    if let Err(err) = session.write(&addr_bytes).await {
+    if let Err(err) = remote.write_all(&addr_bytes).await {
         if let Ok(mut failed) = connect_req.reply(Reply::GeneralFailure, Address::unspecified()).await {
             let _ = failed.shutdown().await;
         }
         return Err(err.into());
     }
 
-    let ready = match connect_req.reply(Reply::Succeeded, bind_addr).await {
+    let mut ready = match connect_req.reply(Reply::Succeeded, bind_addr).await {
         Ok(ready) => ready,
         Err(error) => {
             return Err(error.into());
         }
     };
-    let mut reader = AnytlsStreamReader::new(session.clone());
-    anyreality::relay_tcp(ready, session, &mut reader).await?;
+    match anytls::relay::copy_bidirectional(&mut ready, &mut remote).await {
+        Ok(_) => {}
+        Err(error) if error.is_peer_disconnect() => {
+            log::debug!("Proxy peer disconnected during SOCKS5 relay to {target}: {error}");
+        }
+        Err(error) => return Err(error.into()),
+    }
     log::trace!("tcp tunnel to {target} closed");
     Ok(())
+}
+
+fn is_peer_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(anytls::relay::is_peer_disconnect)
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -515,7 +536,7 @@ async fn handle_udp_associate(associate_req: UdpAssociate<associate::NeedReply>,
     };
     let listen_addr = udp.local_addr()?;
 
-    let session = match client.create_stream().await {
+    let stream = match client.create_stream().await {
         Ok(s) => Arc::new(s),
         Err(err) => {
             let mut reply = associate_req.reply(Reply::GeneralFailure, Address::unspecified()).await?;
@@ -523,15 +544,13 @@ async fn handle_udp_associate(associate_req: UdpAssociate<associate::NeedReply>,
             return Err(err.into());
         }
     };
+    let session_id = stream.session_id().unwrap_or_default();
+    let stream_id = stream.id();
 
     // Mark this stream as a UoT stream:
     //   sentinel address (SocksAddr) + UotRequest{Datagram, unspecified}
-    log::debug!(
-        "session={} stream={} stage=target_submit protocol=uot",
-        session.session_id().unwrap_or_default(),
-        session.id()
-    );
-    if let Err(err) = setup_uot_request(&session).await {
+    log::debug!("session={session_id} stream={stream_id} stage=target_submit protocol=uot",);
+    if let Err(err) = setup_uot_request(&stream).await {
         let mut reply = associate_req.reply(Reply::GeneralFailure, Address::unspecified()).await?;
         reply.shutdown().await?;
         return Err(err);
@@ -540,8 +559,8 @@ async fn handle_udp_associate(associate_req: UdpAssociate<associate::NeedReply>,
     let listen_udp = Arc::new(AssociatedUdpSocket::from((udp, MAX_UDP_RELAY_PACKET_SIZE)));
     // Pin the UDP association to the first sender; ignore packets from other sources.
     let incoming_addr = Arc::new(tokio::sync::Mutex::new(Option::<SocketAddr>::None));
-    let session_writer = session.clone();
-    let mut session_reader = AnytlsStreamReader::new(session.clone());
+    let session_writer = stream.clone();
+    let mut session_reader = AnytlsStreamReader::new(stream.clone());
 
     let result: Result<()> = {
         let upload = async {

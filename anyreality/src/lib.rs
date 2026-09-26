@@ -94,48 +94,133 @@ where
     tokio::try_join!(upload, download).map(|_| ())
 }
 
-pub async fn relay_uot(
+pub async fn relay_uot<R>(
     udp: &tokio::net::UdpSocket,
     stream: &Arc<AnytlsStream>,
-    reader: &mut AnytlsStreamReader,
+    reader: &mut R,
     mode: anytls::UotMode,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    relay_uot_with_peer_identity(udp, stream, reader, mode).await.map_err(Into::into)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UotRelayEndpoint {
+    AnytlsPeer,
+    UdpDestination,
+}
+
+#[derive(Debug)]
+pub struct UotRelayError {
+    endpoint: UotRelayEndpoint,
+    error: std::io::Error,
+}
+
+impl UotRelayError {
+    pub fn is_peer_disconnect(&self) -> bool {
+        self.endpoint == UotRelayEndpoint::AnytlsPeer
+            && (self.error.kind() == std::io::ErrorKind::UnexpectedEof || anytls::relay::is_peer_disconnect(&self.error))
+    }
+}
+
+impl core::fmt::Display for UotRelayError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let endpoint = match self.endpoint {
+            UotRelayEndpoint::AnytlsPeer => "AnyTLS peer",
+            UotRelayEndpoint::UdpDestination => "UDP destination",
+        };
+        write!(formatter, "{endpoint} relay: {}", self.error)
+    }
+}
+
+impl core::error::Error for UotRelayError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl From<UotRelayError> for std::io::Error {
+    fn from(error: UotRelayError) -> Self {
+        Self::new(error.error.kind(), error)
+    }
+}
+
+pub async fn relay_uot_with_peer_identity<R>(
+    udp: &tokio::net::UdpSocket,
+    stream: &Arc<AnytlsStream>,
+    reader: &mut R,
+    mode: anytls::UotMode,
+) -> Result<(), UotRelayError>
+where
+    R: AsyncRead + Unpin + Send,
+{
     use anytls::{UotMode, uot_encode_packet, uot_get_packet_from_stream};
     use socks5_impl::protocol::Address;
     use std::io::{Error, ErrorKind::InvalidData};
     let outbound = async {
         loop {
-            let (destination, payload) = uot_get_packet_from_stream(mode, reader).await?;
+            let (destination, payload) = uot_get_packet_from_stream(mode, reader).await.map_err(|error| UotRelayError {
+                endpoint: UotRelayEndpoint::AnytlsPeer,
+                error,
+            })?;
             match mode {
                 UotMode::Datagram => {
-                    let destination = destination.ok_or_else(|| Error::new(InvalidData, "UoT datagram missing destination"))?;
-                    udp.send_to(&payload, destination.to_string()).await?;
+                    let destination = destination.ok_or_else(|| UotRelayError {
+                        endpoint: UotRelayEndpoint::AnytlsPeer,
+                        error: Error::new(InvalidData, "UoT datagram missing destination"),
+                    })?;
+                    udp.send_to(&payload, destination.to_string())
+                        .await
+                        .map_err(|error| UotRelayError {
+                            endpoint: UotRelayEndpoint::UdpDestination,
+                            error,
+                        })?;
                 }
                 UotMode::Connected => {
-                    udp.send(&payload).await?;
+                    udp.send(&payload).await.map_err(|error| UotRelayError {
+                        endpoint: UotRelayEndpoint::UdpDestination,
+                        error,
+                    })?;
                 }
             }
         }
         #[allow(unreachable_code)]
-        Ok::<(), Error>(())
+        Ok::<(), UotRelayError>(())
     };
     let inbound = async {
         let mut buffer = vec![0; 65_535];
         loop {
             let frame = match mode {
                 UotMode::Datagram => {
-                    let (count, source) = udp.recv_from(&mut buffer).await?;
-                    uot_encode_packet(mode, Some(&Address::from(source)), &buffer[..count])?
+                    let (count, source) = udp.recv_from(&mut buffer).await.map_err(|error| UotRelayError {
+                        endpoint: UotRelayEndpoint::UdpDestination,
+                        error,
+                    })?;
+                    uot_encode_packet(mode, Some(&Address::from(source)), &buffer[..count]).map_err(|error| UotRelayError {
+                        endpoint: UotRelayEndpoint::UdpDestination,
+                        error,
+                    })?
                 }
                 UotMode::Connected => {
-                    let count = udp.recv(&mut buffer).await?;
-                    uot_encode_packet(mode, None, &buffer[..count])?
+                    let count = udp.recv(&mut buffer).await.map_err(|error| UotRelayError {
+                        endpoint: UotRelayEndpoint::UdpDestination,
+                        error,
+                    })?;
+                    uot_encode_packet(mode, None, &buffer[..count]).map_err(|error| UotRelayError {
+                        endpoint: UotRelayEndpoint::UdpDestination,
+                        error,
+                    })?
                 }
             };
-            stream.write(&frame).await?;
+            stream.write(&frame).await.map_err(|error| UotRelayError {
+                endpoint: UotRelayEndpoint::AnytlsPeer,
+                error,
+            })?;
         }
         #[allow(unreachable_code)]
-        Ok::<(), Error>(())
+        Ok::<(), UotRelayError>(())
     };
     tokio::select! {
         result = outbound => result,
@@ -172,6 +257,41 @@ mod tests {
         let local = Arc::new(client.open_stream().await.unwrap());
         let remote = receiver.recv().await.unwrap();
         (client, server, local, remote)
+    }
+
+    #[test]
+    fn uot_disconnect_classification_preserves_udp_destination_errors() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                UotRelayError {
+                    endpoint: UotRelayEndpoint::AnytlsPeer,
+                    error: kind.into(),
+                }
+                .is_peer_disconnect()
+            );
+            assert!(
+                !UotRelayError {
+                    endpoint: UotRelayEndpoint::UdpDestination,
+                    error: kind.into(),
+                }
+                .is_peer_disconnect()
+            );
+        }
+
+        assert!(
+            !UotRelayError {
+                endpoint: UotRelayEndpoint::AnytlsPeer,
+                error: ErrorKind::InvalidData.into(),
+            }
+            .is_peer_disconnect()
+        );
     }
 
     #[tokio::test]

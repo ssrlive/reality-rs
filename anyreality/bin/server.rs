@@ -19,7 +19,7 @@
 //! upstream relay that is still draining cannot block later multiplexed
 //! streams on the same carrier.
 
-use anyreality::{AnytlsStreamReader, async_bridge};
+use anyreality::async_bridge;
 
 use aes_gcm::aead::AeadInOut;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -338,9 +338,8 @@ async fn handle_connection(
         match session.accept_stream().await {
             Ok(stream) => {
                 tokio::spawn(async move {
-                    let stream = Arc::new(stream);
                     let stream_id = stream.id();
-                    if let Err(error) = handle_stream(stream.clone()).await {
+                    if let Err(error) = handle_stream(stream).await {
                         log::warn!("session={session_id} stream={stream_id} stage=stream_failed reason={error:#}");
                     }
                 });
@@ -357,58 +356,64 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn handle_stream(stream: Arc<AnytlsStream>) -> Result<()> {
+async fn handle_stream(stream: AnytlsStream) -> Result<()> {
+    let mut io = anytls::StreamIo::new(stream);
+    let stream = io.stream();
+    let session_id = stream.session_id().unwrap_or_default();
+    let stream_id = stream.id();
     // Acknowledge the stream immediately so the client's SYNACK watchdog is
     // satisfied within one RTT. SYNACK must not be gated on reading the target
     // address or dialing upstream: multiplex reader head-of-line delays and
     // slow upstream connects would otherwise push the SYNACK past the client
     // deadline and abort an otherwise healthy stream.
-    stream.handshake_success().await?;
-    log::debug!(
-        "session={} stream={} stage=target_read_start",
-        stream.session_id().unwrap_or_default(),
-        stream.id()
-    );
-    let mut reader = AnytlsStreamReader::new(stream.clone());
-    let destination = match Address::retrieve_from_async_stream(&mut reader).await {
+    if let Err(error) = stream.handshake_success().await {
+        if is_error_of_session_broken(&error) {
+            log::debug!("session={session_id} stream={stream_id} peer disconnected before SYNACK: {error}",);
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    log::debug!("session={session_id} stream={} stage=target_read_start", stream.id());
+    let destination = match Address::retrieve_from_async_stream(&mut io).await {
         Ok(destination) => destination,
         Err(error) if is_error_of_session_broken(&error) => {
+            log::debug!("session={session_id} stream={stream_id} peer disconnected while sending target: {error}",);
             return Ok(());
         }
         Err(error) => return Err(error.into()),
     };
 
-    log::debug!(
-        "session={} stream={} stage=target_read_complete target={destination}",
-        stream.session_id().unwrap_or_default(),
-        stream.id()
-    );
+    log::debug!("session={session_id} stream={stream_id} stage=target_read_complete target={destination}",);
     if uot_is_sentinel_destination(&destination) {
-        let request = uot_get_request_from_stream(&mut reader).await?;
+        let request = match uot_get_request_from_stream(&mut io).await {
+            Ok(request) => request,
+            Err(error) if is_error_of_session_broken(&error) => {
+                log::debug!("session={session_id} stream={stream_id} peer disconnected while sending UoT request: {error}",);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         match request.mode {
-            UotMode::Connected => handle_uot_connected(stream, &mut reader, &request).await,
-            UotMode::Datagram => handle_uot_datagram(stream, &mut reader).await,
+            UotMode::Connected => handle_uot_connected(stream, &mut io, &request).await,
+            UotMode::Datagram => handle_uot_datagram(stream, &mut io).await,
         }
     } else {
-        handle_tcp_stream(stream, destination, &mut reader).await
+        handle_tcp_stream(&mut io, &stream, destination).await
     }
 }
 
-async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address, reader: &mut AnytlsStreamReader) -> Result<()> {
+async fn handle_tcp_stream(io: &mut anytls::StreamIo, stream: &Arc<AnytlsStream>, destination: Address) -> Result<()> {
+    let session_id = stream.session_id().unwrap_or_default();
+    let stream_id = stream.id();
+
     let dst = destination.to_string();
     let started = tokio::time::Instant::now();
-    log::debug!(
-        "session={} stream={} stage=upstream_connect_start target={dst}",
-        stream.session_id().unwrap_or_default(),
-        stream.id()
-    );
-    let outbound = match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TokioTcpStream::connect(&dst)).await {
+    log::debug!("session={session_id} stream={stream_id} stage=upstream_connect_start target={dst}",);
+    let mut outbound = match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TokioTcpStream::connect(&dst)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(err)) => {
             log::debug!(
-                "session={} stream={} stage=upstream_connect_failed elapsed_ms={} target={dst} reason={err}",
-                stream.session_id().unwrap_or_default(),
-                stream.id(),
+                "session={session_id} stream={stream_id} stage=upstream_connect_failed elapsed_ms={} target={dst} reason={err}",
                 started.elapsed().as_millis()
             );
             // SYNACK was already sent on accept; the upstream is simply dead,
@@ -422,9 +427,7 @@ async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address, read
                 format!("connect upstream {dst} timed out after {}s", UPSTREAM_CONNECT_TIMEOUT.as_secs()),
             );
             log::debug!(
-                "session={} stream={} stage=upstream_connect_timeout elapsed_ms={} reason={err}",
-                stream.session_id().unwrap_or_default(),
-                stream.id(),
+                "session={session_id} stream={stream_id} stage=upstream_connect_timeout elapsed_ms={} reason={err}",
                 started.elapsed().as_millis()
             );
             // SYNACK was already sent on accept; just close on timeout.
@@ -433,28 +436,45 @@ async fn handle_tcp_stream(stream: Arc<AnytlsStream>, destination: Address, read
         }
     };
     log::debug!(
-        "session={} stream={} stage=upstream_connect_complete elapsed_ms={}",
-        stream.session_id().unwrap_or_default(),
-        stream.id(),
+        "session={session_id} stream={stream_id} stage=upstream_connect_complete elapsed_ms={}",
         started.elapsed().as_millis()
     );
     outbound.set_nodelay(true).ok();
 
-    anyreality::relay_tcp(outbound, stream, reader).await?;
+    match anytls::relay::copy_bidirectional(io, &mut outbound).await {
+        Ok(_) => {}
+        Err(error) if error.is_peer_disconnect() => {
+            log::debug!("session={session_id} stream={stream_id} peer disconnected during TCP relay to {dst}: {error}",);
+        }
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
-async fn handle_uot_datagram(stream: Arc<AnytlsStream>, reader: &mut AnytlsStreamReader) -> Result<()> {
+async fn handle_uot_datagram(stream: Arc<AnytlsStream>, reader: &mut anytls::StreamIo) -> Result<()> {
+    let session_id = stream.session_id().unwrap_or_default();
+    let stream_id = stream.id();
+
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
-    let result = anyreality::relay_uot(&udp, &stream, reader, UotMode::Datagram).await;
+    let result = anyreality::relay_uot_with_peer_identity(&udp, &stream, reader, UotMode::Datagram).await;
 
     if result.is_err() {
         let _ = stream.shutdown_write().await;
     }
-    result.map_err(Into::into)
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_peer_disconnect() => {
+            log::debug!("session={session_id} stream={stream_id} peer disconnected during UoT relay: {error}",);
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
-async fn handle_uot_connected(stream: Arc<AnytlsStream>, reader: &mut AnytlsStreamReader, request: &UotRequest) -> Result<()> {
+async fn handle_uot_connected(stream: Arc<AnytlsStream>, reader: &mut anytls::StreamIo, request: &UotRequest) -> Result<()> {
+    let session_id = stream.session_id().unwrap_or_default();
+    let stream_id = stream.id();
+
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     let dst = request.destination.to_string();
     if let Err(err) = udp.connect(&dst).await {
@@ -462,12 +482,19 @@ async fn handle_uot_connected(stream: Arc<AnytlsStream>, reader: &mut AnytlsStre
         stream.shutdown_write().await?;
         return Err(err.into());
     }
-    let result = anyreality::relay_uot(&udp, &stream, reader, UotMode::Connected).await;
+    let result = anyreality::relay_uot_with_peer_identity(&udp, &stream, reader, UotMode::Connected).await;
 
     if result.is_err() {
         let _ = stream.shutdown_write().await;
     }
-    result.map_err(Into::into)
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_peer_disconnect() => {
+            log::debug!("session={session_id} stream={stream_id} peer disconnected during connected UoT relay to {dst}: {error}",);
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 // === helpers ===
@@ -1072,8 +1099,7 @@ fn parse_hex_nibble(value: u8) -> u8 {
 }
 
 fn is_error_of_session_broken(error: &std::io::Error) -> bool {
-    use std::io::ErrorKind::{BrokenPipe, UnexpectedEof};
-    matches!(error.kind(), UnexpectedEof | BrokenPipe)
+    error.kind() == std::io::ErrorKind::UnexpectedEof || anytls::relay::is_peer_disconnect(error)
 }
 
 #[cfg(test)]
