@@ -355,7 +355,7 @@ async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> 
 
     let mut remote = anytls::StreamIo::new(client.create_stream().await?);
     let stream = remote.stream();
-    let session_id = stream.session_id().unwrap_or_default();
+    let session_id = stream.session_id();
     let stream_id = stream.id();
     log::debug!(
         "session={session_id} stream={stream_id} stage=target_submit protocol=http-connect peer={:?} target={target}",
@@ -390,7 +390,7 @@ async fn handle_tcp_connect(connect_req: connect::Connect<connect::NeedReply>, t
     };
     let mut remote = anytls::StreamIo::new(stream);
     let stream = remote.stream();
-    let session_id = stream.session_id().unwrap_or_default();
+    let session_id = stream.session_id();
     let stream_id = stream.id();
 
     // First user payload on this stream: target address in SOCKS5 SocksAddr
@@ -544,7 +544,7 @@ async fn handle_udp_associate(associate_req: UdpAssociate<associate::NeedReply>,
             return Err(err.into());
         }
     };
-    let session_id = stream.session_id().unwrap_or_default();
+    let session_id = stream.session_id();
     let stream_id = stream.id();
 
     // Mark this stream as a UoT stream:

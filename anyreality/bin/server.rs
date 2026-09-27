@@ -46,7 +46,6 @@ use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
 use socks5_impl::protocol::{Address, AsyncStreamOperation};
 use std::io::{Read, Write};
-use std::net::{TcpStream as StdTcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -100,8 +99,6 @@ struct ServerRealityConfigFile {
     version: Option<String>,
     #[serde(default)]
     server_names: Option<Vec<String>>,
-    #[serde(default)]
-    dest: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
@@ -126,7 +123,6 @@ struct ServerConfigResolved {
     short_ids: Vec<Vec<u8>>,
     version: String,
     server_names: Vec<String>,
-    dest: Option<String>,
 }
 
 #[derive(Debug)]
@@ -208,8 +204,6 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>(),
     );
     let reality_version = parse_reality_version(&resolved.version);
-    let reality_dest = resolved.dest.clone();
-
     let listener = TcpListener::bind(&resolved.listen).await?;
     log::info!("REALITY+anytls server listening on {}", resolved.listen);
 
@@ -220,7 +214,6 @@ async fn main() -> Result<()> {
         let padding = padding.clone();
         let reality_private_key = reality_private_key.clone();
         let reality_short_ids = reality_short_ids.clone();
-        let reality_dest = reality_dest.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_connection(
                 stream,
@@ -231,7 +224,6 @@ async fn main() -> Result<()> {
                 reality_private_key,
                 reality_short_ids,
                 reality_version,
-                reality_dest,
             )
             .await
             {
@@ -250,7 +242,6 @@ async fn handle_connection(
     reality_private_key: Arc<Vec<u8>>,
     reality_short_ids: Arc<Vec<[u8; 8]>>,
     reality_version: [u8; 3],
-    reality_dest: Option<String>,
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
     let peer_addr = stream.peer_addr()?;
@@ -272,22 +263,21 @@ async fn handle_connection(
     let Some(client_hello) = client_hello else {
         return handle_raw_tls_fallback(std_stream, allowed_server_names).await;
     };
-    let probe_destination =
-        select_server_hello_probe_destination(reality_dest.as_deref(), client_hello.server_name.as_deref(), &allowed_server_names);
+    let probe_destination = select_server_hello_probe_destination(client_hello.server_name.as_deref(), &allowed_server_names);
 
     // 1) REALITY blocking handshake on a worker thread.
     let tls = tokio::task::spawn_blocking(move || -> Result<StreamOwned<ServerConnection, std::net::TcpStream>> {
         let mut sock = std_stream;
         sock.set_nonblocking(false)?;
         let mut conn = ServerConnection::new(reality_config)?;
-        if let Some(dest) = probe_destination {
-            match probe_server_hello(&dest, &client_hello.wire) {
+        if let Some(target) = probe_destination {
+            match probe_server_hello(&target, &client_hello.wire) {
                 Ok(template) => {
                     if let Err(error) = conn.set_reality_server_hello_template(&template) {
-                        log::debug!("REALITY ServerHello template rejected for {dest}: {error}");
+                        log::debug!("REALITY ServerHello template rejected for {target}: {error}");
                     }
                 }
-                Err(error) => log::debug!("REALITY ServerHello probe failed for {dest}: {error:#}"),
+                Err(error) => log::debug!("REALITY ServerHello probe failed for {target}: {error:#}"),
             }
         }
         while conn.is_handshaking() {
@@ -359,7 +349,7 @@ async fn handle_connection(
 async fn handle_stream(stream: AnytlsStream) -> Result<()> {
     let mut io = anytls::StreamIo::new(stream);
     let stream = io.stream();
-    let session_id = stream.session_id().unwrap_or_default();
+    let session_id = stream.session_id();
     let stream_id = stream.id();
     // Acknowledge the stream immediately so the client's SYNACK watchdog is
     // satisfied within one RTT. SYNACK must not be gated on reading the target
@@ -403,7 +393,7 @@ async fn handle_stream(stream: AnytlsStream) -> Result<()> {
 }
 
 async fn handle_tcp_stream(io: &mut anytls::StreamIo, stream: &Arc<AnytlsStream>, destination: Address) -> Result<()> {
-    let session_id = stream.session_id().unwrap_or_default();
+    let session_id = stream.session_id();
     let stream_id = stream.id();
 
     let dst = destination.to_string();
@@ -452,7 +442,7 @@ async fn handle_tcp_stream(io: &mut anytls::StreamIo, stream: &Arc<AnytlsStream>
 }
 
 async fn handle_uot_datagram(stream: Arc<AnytlsStream>, reader: &mut anytls::StreamIo) -> Result<()> {
-    let session_id = stream.session_id().unwrap_or_default();
+    let session_id = stream.session_id();
     let stream_id = stream.id();
 
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
@@ -472,7 +462,7 @@ async fn handle_uot_datagram(stream: Arc<AnytlsStream>, reader: &mut anytls::Str
 }
 
 async fn handle_uot_connected(stream: Arc<AnytlsStream>, reader: &mut anytls::StreamIo, request: &UotRequest) -> Result<()> {
-    let session_id = stream.session_id().unwrap_or_default();
+    let session_id = stream.session_id();
     let stream_id = stream.id();
 
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
@@ -540,13 +530,6 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
     if server_names.is_empty() {
         bail!("reality.serverNames must not be empty for fallback");
     }
-    let dest = reality
-        .dest
-        .as_deref()
-        .map(str::trim)
-        .filter(|dest| !dest.is_empty())
-        .map(str::to_owned);
-
     Ok(ServerConfigResolved {
         listen,
         password,
@@ -554,7 +537,6 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
         short_ids,
         version,
         server_names,
-        dest,
     })
 }
 
@@ -677,15 +659,7 @@ struct RealityClientHelloProbe {
     server_name: Option<String>,
 }
 
-fn select_server_hello_probe_destination(
-    configured_dest: Option<&str>,
-    server_name: Option<&str>,
-    allowed_server_names: &[String],
-) -> Option<String> {
-    if let Some(dest) = configured_dest {
-        return Some(dest.to_owned());
-    }
-
+fn select_server_hello_probe_destination(server_name: Option<&str>, allowed_server_names: &[String]) -> Option<String> {
     let server_name = server_name?;
     allowed_server_names
         .iter()
@@ -746,10 +720,8 @@ fn collect_client_hello(bytes: &[u8]) -> Result<Option<CollectedClientHello>> {
             && handshake.len() >= expected_len
         {
             handshake.truncate(expected_len);
-            return Ok(Some(CollectedClientHello {
-                handshake,
-                wire: bytes[..offset].to_vec(),
-            }));
+            let wire = bytes[..offset].to_vec();
+            return Ok(Some(CollectedClientHello { handshake, wire }));
         }
     }
 
@@ -757,9 +729,11 @@ fn collect_client_hello(bytes: &[u8]) -> Result<Option<CollectedClientHello>> {
 }
 
 fn probe_server_hello(destination: &str, client_hello: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind::InvalidData, ErrorKind::InvalidInput};
     let mut last_error = None;
+    use std::net::ToSocketAddrs;
     for address in destination.to_socket_addrs()? {
-        match StdTcpStream::connect_timeout(&address, SERVER_HELLO_PROBE_TIMEOUT) {
+        match std::net::TcpStream::connect_timeout(&address, SERVER_HELLO_PROBE_TIMEOUT) {
             Ok(mut stream) => {
                 stream.set_read_timeout(Some(SERVER_HELLO_PROBE_TIMEOUT))?;
                 stream.set_write_timeout(Some(SERVER_HELLO_PROBE_TIMEOUT))?;
@@ -768,35 +742,23 @@ fn probe_server_hello(destination: &str, client_hello: &[u8]) -> std::io::Result
                 let mut record_header = [0u8; 5];
                 stream.read_exact(&mut record_header)?;
                 if record_header[0] != 22 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "destination did not send a TLS handshake record",
-                    ));
+                    return Err(Error::new(InvalidData, "destination did not send a TLS handshake record"));
                 }
                 let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
                 if !(4..=18_432).contains(&record_len) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "destination sent an invalid TLS handshake record length",
-                    ));
+                    return Err(Error::new(InvalidData, "destination sent an invalid TLS handshake record length"));
                 }
                 let mut payload = vec![0u8; record_len];
                 stream.read_exact(&mut payload)?;
                 if payload[0] != 2 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "destination did not send ServerHello first",
-                    ));
+                    return Err(Error::new(InvalidData, "destination did not send ServerHello first"));
                 }
                 let handshake_len = ((payload[1] as usize) << 16) | ((payload[2] as usize) << 8) | payload[3] as usize;
                 let server_hello_len = 4usize
                     .checked_add(handshake_len)
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid ServerHello length"))?;
+                    .ok_or_else(|| Error::new(InvalidData, "invalid ServerHello length"))?;
                 if server_hello_len > payload.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "destination split ServerHello across TLS records",
-                    ));
+                    return Err(Error::new(InvalidData, "destination split ServerHello across TLS records"));
                 }
                 payload.truncate(server_hello_len);
                 return Ok(payload);
@@ -804,12 +766,7 @@ fn probe_server_hello(destination: &str, client_hello: &[u8]) -> std::io::Result
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("could not resolve ServerHello probe destination {destination}"),
-        )
-    }))
+    Err(last_error.unwrap_or_else(|| Error::new(InvalidInput, format!("can't resolve ServerHello probe destination {destination}"))))
 }
 
 fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello> {
@@ -1105,7 +1062,7 @@ fn is_error_of_session_broken(error: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerConfigFile, ServerRealityConfigFile, collect_client_hello, parse_client_hello, parse_server_short_ids, probe_server_hello,
+        ServerRealityConfigFile, collect_client_hello, parse_client_hello, parse_server_short_ids, probe_server_hello,
         select_server_hello_probe_destination,
     };
     use std::io::{Read, Write};
@@ -1149,18 +1106,6 @@ mod tests {
     }
 
     #[test]
-    fn reality_dest_is_optional_in_toml_and_json() {
-        let toml: ServerConfigFile = toml::from_str("[reality]\ndest = \"decoy.example:443\"\n").unwrap();
-        assert_eq!(toml.reality.unwrap().dest.as_deref(), Some("decoy.example:443"));
-
-        let json: ServerConfigFile = serde_json::from_str(r#"{"reality":{"dest":"decoy.example:443"}}"#).unwrap();
-        assert_eq!(json.reality.unwrap().dest.as_deref(), Some("decoy.example:443"));
-
-        let without_dest: ServerConfigFile = toml::from_str("[reality]\n").unwrap();
-        assert_eq!(without_dest.reality.unwrap().dest, None);
-    }
-
-    #[test]
     fn server_short_ids_accepts_toml_and_json_arrays() {
         let array: ServerRealityConfigFile = toml::from_str("shortIds = [\"aabbcc\", \"1122\"]").unwrap();
         assert_eq!(
@@ -1194,31 +1139,19 @@ mod tests {
     }
 
     #[test]
-    fn server_hello_probe_uses_allowlisted_sni_when_dest_is_absent() {
+    fn server_hello_probe_uses_allowlisted_sni() {
         let allowed = vec!["decoy.example".to_string()];
         assert_eq!(
-            select_server_hello_probe_destination(None, Some("decoy.example"), &allowed).as_deref(),
+            select_server_hello_probe_destination(Some("decoy.example"), &allowed).as_deref(),
             Some("decoy.example:443")
         );
     }
 
     #[test]
-    fn server_hello_probe_requires_allowed_sni_without_explicit_dest() {
+    fn server_hello_probe_requires_allowed_sni() {
         let allowed = vec!["decoy.example".to_string()];
-        assert_eq!(select_server_hello_probe_destination(None, None, &allowed), None);
-        assert_eq!(
-            select_server_hello_probe_destination(None, Some("attacker.example"), &allowed),
-            None
-        );
-    }
-
-    #[test]
-    fn explicit_server_hello_probe_dest_overrides_sni() {
-        let allowed = vec!["decoy.example".to_string()];
-        assert_eq!(
-            select_server_hello_probe_destination(Some("target.example:8443"), Some("decoy.example"), &allowed).as_deref(),
-            Some("target.example:8443")
-        );
+        assert_eq!(select_server_hello_probe_destination(None, &allowed), None);
+        assert_eq!(select_server_hello_probe_destination(Some("attacker.example"), &allowed), None);
     }
 
     #[test]

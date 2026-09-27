@@ -32,7 +32,7 @@
 
 * 客户端生成符合当前实现约定的 REALITY `session_id`。
 * 服务端在很早阶段读取 `ClientHello`，决定是继续 REALITY/TLS 路径，还是转发到 decoy 后端。
-* `tlsserver-mio` 可按 `reality.dest` 将原始 `ClientHello` 发给目标站，异步采样其 TLS 1.3 ServerHello；认证成功时保留目标 ServerHello 的原始编码、扩展顺序和 random，只替换 session_id 与本地 ECDH key_share。
+* `tlsserver-mio` 会将原始 `ClientHello` 发给规则选中的 fallback 后端，异步采样其 TLS 1.3 ServerHello；认证成功时保留目标 ServerHello 的原始编码、扩展顺序和 random，只替换 session_id 与本地 ECDH key_share。
 * decoy 转发可以按规则匹配，例如：
   * `serverNames`
   * `alpns`
@@ -177,7 +177,7 @@
 
 示例层不会仅凭 `session_id` 前缀判定客户端身份。命中路由后，Rustls verifier 会校验 TLS 版本、X25519 share、REALITY AES-GCM 头、时间戳和 short_id；失败时不向客户端发送 TLS alert，而是转到 fallback。
 
-目标采样步骤会把同一份 ClientHello 发给 `dest` 并读取第一个 TLS handshake record。采样在有界 worker pool 中运行，不阻塞 mio reactor；模板不可用或与协商参数不兼容时，认证握手仍可退回普通 Rustls ServerHello。
+目标采样步骤会把同一份 ClientHello 发给本次选择的 fallback 后端并读取第一个 TLS handshake record。采样在有界 worker pool 中运行，不阻塞 mio reactor；模板不可用或与协商参数不兼容时，认证握手仍可退回普通 Rustls ServerHello。
 
 ### 第 4 步：认证成功后使用目标 ServerHello 模板
 
@@ -279,7 +279,6 @@
 于是当前实现逐步演化出：
 
 * 默认 `fallbackAddress + fallbackPort`
-* 可选 `dest`（`host:port` 或 `[IPv6]:port`），用于目标站 ServerHello 采样；未配置单独 fallback 时也作为默认 fallback
 * 有序 `fallbackRules`
 * 规则 matcher 支持：
   * `serverNames`

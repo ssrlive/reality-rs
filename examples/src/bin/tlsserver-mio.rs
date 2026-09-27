@@ -80,7 +80,6 @@ struct TlsServer {
     tls_config: Arc<ServerConfig>,
     mode: ServerMode,
     reality_server_names: Vec<String>, // Added field for reality server names
-    reality_destination: Option<FallbackTarget>,
     reality_fallback_target: Option<FallbackTarget>,
     reality_fallback_rules: Vec<FallbackRule>,
     probe_sender: SyncSender<ServerHelloProbeJob>,
@@ -189,7 +188,6 @@ impl TlsServer {
         mode: ServerMode,
         cfg: Arc<ServerConfig>,
         reality_server_names: Vec<String>, // Added parameter for reality server names
-        reality_destination: Option<FallbackTarget>,
         reality_fallback_target: Option<FallbackTarget>,
         reality_fallback_rules: Vec<FallbackRule>,
         probe_waker: Arc<mio::Waker>,
@@ -198,10 +196,7 @@ impl TlsServer {
             mpsc::sync_channel::<ServerHelloProbeJob>(MAX_QUEUED_PROBES);
         let (completion_sender, probe_receiver) = mpsc::channel();
         let probe_jobs = Arc::new(Mutex::new(probe_jobs));
-        if reality_destination.is_some()
-            || reality_fallback_target.is_some()
-            || !reality_fallback_rules.is_empty()
-        {
+        if reality_fallback_target.is_some() || !reality_fallback_rules.is_empty() {
             for _ in 0..PROBE_WORKERS {
                 let job_receiver = probe_jobs.clone();
                 let completion_sender = completion_sender.clone();
@@ -233,7 +228,6 @@ impl TlsServer {
             tls_config: cfg,
             mode,
             reality_server_names, // Initialize reality server names
-            reality_destination,
             reality_fallback_target,
             reality_fallback_rules,
             probe_sender,
@@ -258,7 +252,6 @@ impl TlsServer {
                         mode,
                         self.tls_config.clone(),
                         self.reality_server_names.clone(), // Pass reality server names to connection
-                        self.reality_destination.clone(),
                         self.reality_fallback_target.clone(),
                         self.reality_fallback_rules.clone(),
                         self.probe_sender.clone(),
@@ -340,7 +333,6 @@ struct OpenConnection {
     mode: ServerMode,
     state: ConnectionState,
     tls_config: Arc<ServerConfig>,
-    reality_destination: Option<FallbackTarget>,
     reality_fallback_target: Option<FallbackTarget>,
     reality_fallback_rules: Vec<FallbackRule>,
     probe_sender: SyncSender<ServerHelloProbeJob>,
@@ -484,14 +476,12 @@ impl OpenConnection {
         mode: ServerMode,
         tls_config: Arc<ServerConfig>,
         reality_server_names: Vec<String>, // Added parameter for reality server names
-        reality_destination: Option<FallbackTarget>,
         reality_fallback_target: Option<FallbackTarget>,
         reality_fallback_rules: Vec<FallbackRule>,
         probe_sender: SyncSender<ServerHelloProbeJob>,
     ) -> Self {
-        let needs_acceptor = reality_fallback_target.is_some()
-            || reality_destination.is_some()
-            || !reality_fallback_rules.is_empty();
+        let needs_acceptor =
+            reality_fallback_target.is_some() || !reality_fallback_rules.is_empty();
         let state = if needs_acceptor {
             ConnectionState::Accepting {
                 acceptor: Acceptor::default(),
@@ -513,7 +503,6 @@ impl OpenConnection {
             mode,
             state,
             tls_config,
-            reality_destination,
             reality_fallback_target,
             reality_fallback_rules,
             probe_sender,
@@ -696,24 +685,20 @@ impl OpenConnection {
         buffered: Vec<u8>,
         fallback_target: FallbackTarget,
     ) -> bool {
-        let probe_target = self
-            .reality_destination
-            .clone()
-            .unwrap_or_else(|| fallback_target.clone());
         let job = ServerHelloProbeJob {
             token: self.token,
-            target: probe_target,
+            target: fallback_target.clone(),
             client_hello: buffered.clone(),
         };
         match self.probe_sender.try_send(job) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
-                error!("REALITY destination probe queue is full");
+                error!("REALITY fallback ServerHello probe queue is full");
                 self.closing = true;
                 return false;
             }
             Err(TrySendError::Disconnected(_)) => {
-                error!("REALITY destination probe workers are unavailable");
+                error!("REALITY fallback ServerHello probe workers are unavailable");
                 self.closing = true;
                 return false;
             }
@@ -737,7 +722,7 @@ impl OpenConnection {
         let template = match result {
             Ok(template) => Some(template),
             Err(err) => {
-                debug!("REALITY destination ServerHello probe failed: {err:?}");
+                debug!("REALITY fallback ServerHello probe failed: {err:?}");
                 None
             }
         };
@@ -804,10 +789,7 @@ impl OpenConnection {
         );
         let selected_target = selected_target?;
 
-        if self.reality_server_names.is_empty()
-            && self.reality_destination.is_none()
-            && self.reality_fallback_rules.is_empty()
-        {
+        if self.reality_server_names.is_empty() && self.reality_fallback_rules.is_empty() {
             return None;
         }
 
@@ -1338,8 +1320,6 @@ struct Args {
 impl Args {
     fn validate(&self, reality: Option<&RealityServerConfig>) -> Result<(), String> {
         let fallback_target = effective_reality_fallback_target(self, reality);
-        let reality_destination = effective_reality_destination_target(reality)?;
-
         if reality.is_none() {
             if fallback_target.is_some() || self.reality_fallback_address.is_some() {
                 return Err("REALITY fallback requires REALITY mode".into());
@@ -1356,9 +1336,7 @@ impl Args {
             return Err("REALITY fallback address requires a fallback port".into());
         }
 
-        if (fallback_target.is_some() || reality_destination.is_some())
-            && matches!(self.mode, ServerMode::Forward { .. })
-        {
+        if fallback_target.is_some() && matches!(self.mode, ServerMode::Forward { .. }) {
             return Err("REALITY fallback is not supported with forward mode".into());
         }
 
@@ -1617,9 +1595,6 @@ fn resolve_reality_config(
             short_ids,
             private_key,
             version,
-            dest: file_config
-                .as_ref()
-                .and_then(|config| config.dest.clone()),
             server_names,
             fallback_address,
             fallback_port,
@@ -1650,50 +1625,6 @@ fn effective_reality_fallback_target(
         .unwrap_or_else(|| "localhost".to_string());
 
     Some(FallbackTarget { address, port })
-}
-
-fn effective_reality_destination_target(
-    reality: Option<&RealityServerConfig>,
-) -> Result<Option<FallbackTarget>, String> {
-    reality
-        .and_then(|config| config.dest.as_deref())
-        .map(parse_reality_destination)
-        .transpose()
-}
-
-fn parse_reality_destination(value: &str) -> Result<FallbackTarget, String> {
-    let (address, port) = if let Some(bracketed) = value.strip_prefix('[') {
-        let (address, suffix) = bracketed
-            .split_once(']')
-            .ok_or_else(|| "REALITY dest has an invalid bracketed address".to_string())?;
-        let port = suffix
-            .strip_prefix(':')
-            .ok_or_else(|| "REALITY dest must include a port".to_string())?;
-        (address, port)
-    } else {
-        let (address, port) = value
-            .rsplit_once(':')
-            .ok_or_else(|| "REALITY dest must be host:port".to_string())?;
-        if address.contains(':') {
-            return Err("IPv6 REALITY dest addresses must be bracketed".into());
-        }
-        (address, port)
-    };
-
-    if address.is_empty() {
-        return Err("REALITY dest host must not be empty".into());
-    }
-    let port = port
-        .parse::<u16>()
-        .map_err(|_| "REALITY dest port must be a valid u16".to_string())?;
-    if port == 0 {
-        return Err("REALITY dest port must be non-zero".into());
-    }
-
-    Ok(FallbackTarget {
-        address: address.to_string(),
-        port,
-    })
 }
 
 fn effective_reality_fallback_rules(reality: Option<&RealityServerConfig>) -> Vec<FallbackRule> {
@@ -1999,9 +1930,7 @@ fn main() {
         .register(&mut listener, LISTENER, mio::Interest::READABLE)
         .unwrap();
     let probe_waker = Arc::new(mio::Waker::new(poll.registry(), PROBE_WAKE).unwrap());
-    let reality_destination = effective_reality_destination_target(reality.as_ref()).unwrap();
-    let fallback_target = effective_reality_fallback_target(&args, reality.as_ref())
-        .or_else(|| reality_destination.clone());
+    let fallback_target = effective_reality_fallback_target(&args, reality.as_ref());
     let fallback_rules = effective_reality_fallback_rules(reality.as_ref());
 
     let mut tlsserv = TlsServer::new(
@@ -2012,7 +1941,6 @@ fn main() {
             .as_ref()
             .map(|config| config.server_names.clone())
             .unwrap_or_default(),
-        reality_destination,
         fallback_target,
         fallback_rules,
         probe_waker,
@@ -2359,7 +2287,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reality.server_names, vec!["test"]);
-        assert_eq!(reality.dest.as_deref(), Some("[::1]:9446"));
         assert_eq!(reality.fallback_address.as_deref(), Some("::1"));
         assert_eq!(reality.fallback_port, Some(9446));
         assert_eq!(reality.fallback_rules.len(), 1);
@@ -2466,7 +2393,6 @@ mod tests {
             short_ids: vec!["aabbcc".to_string()],
             private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
             version: "010203".to_string(),
-            dest: None,
             server_names: vec!["test".to_string()],
             fallback_address: Some("::1".to_string()),
             fallback_port: Some(9446),
@@ -2500,7 +2426,6 @@ mod tests {
             short_ids: vec!["aabbcc".to_string()],
             private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
             version: "010203".to_string(),
-            dest: None,
             server_names: vec!["test".to_string()],
             fallback_address: Some("::1".to_string()),
             fallback_port: Some(9446),
@@ -2518,26 +2443,6 @@ mod tests {
                 .unwrap_err(),
             "REALITY fallback rule #0 requires a non-zero fallback port"
         );
-    }
-
-    #[test]
-    fn parses_reality_dest_host_and_bracketed_ipv6() {
-        assert_eq!(
-            parse_reality_destination("decoy.example:443").unwrap(),
-            FallbackTarget {
-                address: "decoy.example".to_string(),
-                port: 443,
-            }
-        );
-        assert_eq!(
-            parse_reality_destination("[::1]:8443").unwrap(),
-            FallbackTarget {
-                address: "::1".to_string(),
-                port: 8443,
-            }
-        );
-        assert!(parse_reality_destination("::1:443").is_err());
-        assert!(parse_reality_destination("decoy.example:0").is_err());
     }
 
     #[test]

@@ -44,8 +44,6 @@ pub(crate) struct RealityServerConfig {
     pub short_ids: Vec<String>,
     pub version: String,
     #[serde(default)]
-    pub dest: Option<String>,
-    #[serde(default)]
     pub server_names: Vec<String>,
     #[serde(default)]
     pub fallback_address: Option<String>,
