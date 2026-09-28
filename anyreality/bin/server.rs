@@ -56,6 +56,10 @@ use tokio::net::{TcpListener, TcpStream as TokioTcpStream, UdpSocket};
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_HELLO_MAX_WIRE_SIZE: usize = 128 * 1024;
 const SERVER_HELLO_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const REALITY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const ANYTLS_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_INBOUND_CARRIERS: usize = 128;
+const MAX_ACTIVE_STREAMS: usize = 512;
 const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 128;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_SESSION_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -205,16 +209,21 @@ async fn main() -> Result<()> {
     );
     let reality_version = parse_reality_version(&resolved.version);
     let listener = TcpListener::bind(&resolved.listen).await?;
+    let carrier_slots = Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CARRIERS));
+    let stream_slots = Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_STREAMS));
     log::info!("REALITY+anytls server listening on {}", resolved.listen);
 
     loop {
+        let carrier_permit = carrier_slots.clone().acquire_owned().await?;
         let (stream, peer_addr) = listener.accept().await?;
         let tls_config = tls_config.clone();
         let allowed_server_names = allowed_server_names.clone();
         let padding = padding.clone();
         let reality_private_key = reality_private_key.clone();
         let reality_short_ids = reality_short_ids.clone();
+        let stream_slots = stream_slots.clone();
         tokio::spawn(async move {
+            let _carrier_permit = carrier_permit;
             if let Err(error) = handle_connection(
                 stream,
                 tls_config,
@@ -224,6 +233,7 @@ async fn main() -> Result<()> {
                 reality_private_key,
                 reality_short_ids,
                 reality_version,
+                stream_slots,
             )
             .await
             {
@@ -242,6 +252,7 @@ async fn handle_connection(
     reality_private_key: Arc<Vec<u8>>,
     reality_short_ids: Arc<Vec<[u8; 8]>>,
     reality_version: [u8; 3],
+    stream_slots: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
     let peer_addr = stream.peer_addr()?;
@@ -269,6 +280,8 @@ async fn handle_connection(
     let tls = tokio::task::spawn_blocking(move || -> Result<StreamOwned<ServerConnection, std::net::TcpStream>> {
         let mut sock = std_stream;
         sock.set_nonblocking(false)?;
+        sock.set_read_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
+        sock.set_write_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
         let mut conn = ServerConnection::new(reality_config)?;
         if let Some(target) = probe_destination {
             match probe_server_hello(&target, &client_hello.wire) {
@@ -292,15 +305,20 @@ async fn handle_connection(
 
     // 3) Read anytls auth: 32 sha256(password) + u16be padding_len + padding.
     let mut auth = [0u8; 34];
-    bridge.read_exact(&mut auth).await.context("read anytls auth header")?;
+    let padding_buf = tokio::time::timeout(ANYTLS_AUTH_TIMEOUT, async {
+        bridge.read_exact(&mut auth).await?;
+        let padding_len = u16::from_be_bytes([auth[32], auth[33]]);
+        let mut padding_buf = vec![0u8; padding_len as usize];
+        if padding_len > 0 {
+            bridge.read_exact(&mut padding_buf).await?;
+        }
+        Ok::<_, std::io::Error>(padding_buf)
+    })
+    .await
+    .context("timed out waiting for anytls auth")??;
     if auth[..32] != password_sha256[..] {
         log::debug!("anytls auth failed for an inbound REALITY peer");
         return Ok(());
-    }
-    let padding_len = u16::from_be_bytes([auth[32], auth[33]]);
-    let mut padding_buf = vec![0u8; padding_len as usize];
-    if padding_len > 0 {
-        bridge.read_exact(&mut padding_buf).await.context("read anytls padding")?;
     }
     if padding_buf.len() >= 36
         && let Some(client_id) = std::str::from_utf8(&padding_buf[..36])
@@ -327,7 +345,15 @@ async fn handle_connection(
     loop {
         match session.accept_stream().await {
             Ok(stream) => {
+                let Ok(stream_permit) = stream_slots.clone().try_acquire_owned() else {
+                    log::debug!("session={session_id} stream={} rejected: active stream limit reached", stream.id());
+                    if stream.handshake_success().await.is_ok() {
+                        let _ = stream.shutdown_write().await;
+                    }
+                    continue;
+                };
                 tokio::spawn(async move {
+                    let _stream_permit = stream_permit;
                     let stream_id = stream.id();
                     if let Err(error) = handle_stream(stream).await {
                         log::warn!("session={session_id} stream={stream_id} stage=stream_failed reason={error:#}");

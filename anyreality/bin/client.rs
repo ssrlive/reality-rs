@@ -54,6 +54,8 @@ const DEFAULT_CLIENT_HELLO_PROFILE: &str = "default";
 const DEFAULT_HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_HTTP_HEADER_LIMIT: usize = 16 * 1024;
 const DEFAULT_PADDING_LEN: usize = 0;
+const MAX_PROXY_CONNECTIONS: usize = 256;
+const REALITY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -184,13 +186,16 @@ async fn main() -> Result<()> {
     );
 
     let listener = TcpListener::bind(listen).await?;
+    let connection_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_CONNECTIONS));
     let auth = Arc::new(NoAuth);
 
     loop {
+        let connection_permit = connection_slots.clone().acquire_owned().await?;
         let (stream, peer_addr) = listener.accept().await?;
         let anytls_client = anytls_client.clone();
         let auth = auth.clone();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             let result = match detect_local_proxy_protocol(&stream).await {
                 Ok(None) => Ok(()),
                 Ok(Some(LocalProxyProtocol::Socks5)) => handle_socks(IncomingConnection::new(stream, auth), anytls_client).await,
@@ -228,6 +233,8 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
     let server_name = ctx.server_name.clone();
     let tls = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
         std_tcp.set_nonblocking(false)?;
+        std_tcp.set_read_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
+        std_tcp.set_write_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
         let server_name =
             rustls::pki_types::ServerName::try_from(server_name).map_err(|err| std::io::Error::other(format!("invalid sni: {err}")))?;
         let mut conn = tls_config
