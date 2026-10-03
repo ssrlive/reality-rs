@@ -72,54 +72,54 @@ struct Args {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientConfigFile {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     reality: Option<ClientRealityConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     anytls: Option<ClientAnytlsConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     client: Option<ClientRuntimeConfig>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientRealityConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     public_key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     short_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     version: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     server_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     client_hello_profile: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientAnytlsConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     client_id: Option<uuid::Uuid>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     idle_check_secs: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     idle_timeout_secs: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     min_idle_sessions: Option<usize>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     max_streams_per_session: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientRuntimeConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     listen: Option<SocketAddr>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     server_addr: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     probe_proxy: Option<SocketAddr>,
 }
 
@@ -173,8 +173,8 @@ async fn main() -> Result<()> {
             Box::pin(async move { dial_carrier(ctx).await })
         }),
         padding,
-        Duration::from_secs(anytls.idle_timeout_secs.unwrap()),
-        anytls.max_streams_per_session.unwrap(),
+        Duration::from_secs(anytls.idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS)),
+        anytls.max_streams_per_session.unwrap_or(DEFAULT_MAX_STREAMS_PER_SESSION),
         Duration::ZERO,
     );
 

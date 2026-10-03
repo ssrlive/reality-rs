@@ -76,7 +76,7 @@ where
         loop {
             let count = local_read.read(&mut buffer).await?;
             if count == 0 {
-                return stream.shutdown_write().await;
+                return stream.shutdown_write_by_send_fin_to_remote().await;
             }
             stream.write(&buffer[..count]).await?;
         }
@@ -244,14 +244,14 @@ mod tests {
                 anytls::PaddingFactory::new(anytls::DEFAULT_SCHEME).unwrap(),
             ))
         };
-        let server = Session::new_server(2, Box::new(server_io), padding(), 8);
+        let server = Session::new_server(2, Box::new(server_io), padding(), 8, anytls::DEFAULT_MAX_SESSION_AGE);
         let server_accept = server.clone();
         tokio::spawn(async move {
             while let Ok(stream) = server_accept.accept_stream().await {
                 sender.send(Arc::new(stream)).unwrap();
             }
         });
-        let client = Session::new_client(1, Box::new(client_io), padding(), 8);
+        let client = Session::new_client(1, Box::new(client_io), padding(), 8, anytls::DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
         server.run().await.unwrap();
         let local = Arc::new(client.open_stream().await.unwrap());
@@ -329,7 +329,7 @@ mod tests {
                 let mut buffer = [0; 32];
                 let (count, _) = target.recv_from(&mut buffer).await.unwrap();
                 assert_eq!(&buffer[..count], b"fragmented");
-                local.shutdown_write().await.unwrap();
+                local.shutdown_write_by_send_fin_to_remote().await.unwrap();
                 task.await.unwrap().unwrap_err();
                 client.shutdown().await.unwrap();
                 server.shutdown().await.unwrap();
@@ -420,12 +420,12 @@ mod tests {
                     assert_eq!(&buffer[..count], b"request");
                     assert_eq!(remote.read(&mut buffer).await.unwrap(), 0);
                     remote.write(b"response").await.unwrap();
-                    remote.shutdown_write().await.unwrap();
+                    remote.shutdown_write_by_send_fin_to_remote().await.unwrap();
                     let mut response = Vec::new();
                     app.read_to_end(&mut response).await.unwrap();
                     assert_eq!(response, b"response");
                 } else {
-                    remote.shutdown_write().await.unwrap();
+                    remote.shutdown_write_by_send_fin_to_remote().await.unwrap();
                     assert_eq!(app.read(&mut buffer).await.unwrap(), 0);
                     app.write_all(b"still uploading").await.unwrap();
                     app.shutdown().await.unwrap();

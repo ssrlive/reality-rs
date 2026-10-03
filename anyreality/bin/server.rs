@@ -334,6 +334,7 @@ async fn handle_connection(
         Box::new(bridge),
         padding,
         DEFAULT_MAX_STREAMS_PER_SESSION,
+        anytls::DEFAULT_MAX_SESSION_AGE,
     );
     let session_id = session.id();
 
@@ -348,7 +349,7 @@ async fn handle_connection(
                 let Ok(stream_permit) = stream_slots.clone().try_acquire_owned() else {
                     log::debug!("session={session_id} stream={} rejected: active stream limit reached", stream.id());
                     if stream.handshake_success().await.is_ok() {
-                        let _ = stream.shutdown_write().await;
+                        let _ = stream.shutdown_write_by_send_fin_to_remote().await;
                     }
                     continue;
                 };
@@ -434,7 +435,7 @@ async fn handle_tcp_stream(io: &mut anytls::StreamIo, stream: &Arc<AnytlsStream>
             );
             // SYNACK was already sent on accept; the upstream is simply dead,
             // so close the stream instead of emitting a duplicate SYNACK.
-            stream.shutdown_write().await?;
+            stream.shutdown_write_by_send_fin_to_remote().await?;
             return Err(err.into());
         }
         Err(_) => {
@@ -447,7 +448,7 @@ async fn handle_tcp_stream(io: &mut anytls::StreamIo, stream: &Arc<AnytlsStream>
                 started.elapsed().as_millis()
             );
             // SYNACK was already sent on accept; just close on timeout.
-            stream.shutdown_write().await?;
+            stream.shutdown_write_by_send_fin_to_remote().await?;
             return Err(err.into());
         }
     };
@@ -475,7 +476,7 @@ async fn handle_uot_datagram(stream: Arc<AnytlsStream>, reader: &mut anytls::Str
     let result = anyreality::relay_uot_with_peer_identity(&udp, &stream, reader, UotMode::Datagram).await;
 
     if result.is_err() {
-        let _ = stream.shutdown_write().await;
+        let _ = stream.shutdown_write_by_send_fin_to_remote().await;
     }
     match result {
         Ok(()) => Ok(()),
@@ -495,13 +496,13 @@ async fn handle_uot_connected(stream: Arc<AnytlsStream>, reader: &mut anytls::St
     let dst = request.destination.to_string();
     if let Err(err) = udp.connect(&dst).await {
         // SYNACK was already sent on accept; close on connect failure.
-        stream.shutdown_write().await?;
+        stream.shutdown_write_by_send_fin_to_remote().await?;
         return Err(err.into());
     }
     let result = anyreality::relay_uot_with_peer_identity(&udp, &stream, reader, UotMode::Connected).await;
 
     if result.is_err() {
-        let _ = stream.shutdown_write().await;
+        let _ = stream.shutdown_write_by_send_fin_to_remote().await;
     }
     match result {
         Ok(()) => Ok(()),
