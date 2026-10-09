@@ -4,8 +4,8 @@
 
 读者对象分成两类：
 
-* 非专业读者：想知道 REALITY 大概在解决什么问题，现在这套代码到底能做什么。
-* 技术读者：想知道这套实现怎样接进 Rustls、数据怎么流、和 Xray 的 REALITY 到底差在哪。
+- 非专业读者：想知道 REALITY 大概在解决什么问题，现在这套代码到底能做什么。
+- 技术读者：想知道这套实现怎样接进 Rustls、数据怎么流、和 Xray 的 REALITY 到底差在哪。
 
 本文描述的是当前仓库中的实现状态，不是假设中的理想版本。
 
@@ -19,10 +19,10 @@
 
 可以把 REALITY 粗略理解成：
 
-* 连接表面上仍然长得像正常的 TLS 1.3 连接。
-* 客户端和服务端在 TLS 握手很早的时候，用一个双方约定的隐藏规则，判断“这是不是自己人”。
-* 如果是自己人，就继续走真正的代理链路。
-* 如果不像自己人，就把流量转去一个诱饵站点，或者按普通探测流量处理。
+- 连接表面上仍然长得像正常的 TLS 1.3 连接。
+- 客户端和服务端在 TLS 握手很早的时候，用一个双方约定的隐藏规则，判断“这是不是自己人”。
+- 如果是自己人，就继续走真正的代理链路。
+- 如果不像自己人，就把流量转去一个诱饵站点，或者按普通探测流量处理。
 
 它的目标不是“加密替代 TLS”，而是“在 TLS 外观里，把特定客户端识别出来，同时尽量不显眼”。
 
@@ -30,14 +30,14 @@
 
 目前仓库里的代码已经能做到：
 
-* 客户端生成符合当前实现约定的 REALITY `session_id`。
-* 服务端在很早阶段读取 `ClientHello`，决定是继续 REALITY/TLS 路径，还是转发到 decoy 后端。
-* `tlsserver-mio` 会将原始 `ClientHello` 发给规则选中的 fallback 后端，异步采样其 TLS 1.3 ServerHello；认证成功时保留目标 ServerHello 的原始编码、扩展顺序和 random，只替换 session_id 与本地 ECDH key_share。
-* decoy 转发可以按规则匹配，例如：
-  * `serverNames`
-  * `alpns`
-  * `namedGroups`
-* 配置可以通过 CLI 或 JSON/TOML 文件加载。
+- 客户端生成符合当前实现约定的 REALITY `session_id`。
+- 服务端在很早阶段读取 `ClientHello`，决定是继续 REALITY/TLS 路径，还是转发到 decoy 后端。
+- `tlsserver-mio` 会将原始 `ClientHello` 发给规则选中的 fallback 后端，异步采样其 TLS 1.3 ServerHello；认证成功时保留目标 ServerHello 的原始编码、扩展顺序和 random，只替换 session_id 与本地 ECDH key_share。
+- decoy 转发可以按规则匹配，例如：
+  - `serverNames`
+  - `alpns`
+  - `namedGroups`
+- 配置可以通过 CLI 或 JSON/TOML 文件加载。
 
 ### 还没做到什么
 
@@ -47,9 +47,24 @@
 
 当前实现更准确的定位是：
 
-* 一个已经可运行的 Rustls 集成原型。
-* 一个能说明协议接缝和工程边界的参考实现。
-* 一个适合继续工程化，而不是直接宣布生产就绪的版本。
+- 一个已经可运行的 Rustls 集成原型。
+- 一个能说明协议接缝和工程边界的参考实现。
+- 一个适合继续工程化，而不是直接宣布生产就绪的版本。
+
+### ClientHello profile 对照基线
+
+当前 `ClientHelloProfile::{Chrome, Firefox, Safari}` 是粗略的浏览器风格排序，不是按浏览器版本采集的指纹。第一批对照目标选取本地 uTLS checkout 中可核对的 spec；版本号代表 spec 来源，不代表已达到指纹一致：
+
+| 目标 spec        | uTLS 来源                                                      | 当前 REALITY Rustls 输出与主要差异                                                                                                                  |
+| ---------------- | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Chrome 155 macOS | `HelloChrome_155`；有真实 Chrome 155 macOS ClientHello capture | 只发 3 个 TLS 1.3 cipher；group 为 X25519 + GREASE，key share 只有 X25519；缺少 hybrid share、完整签名列表、ECH GREASE、ALPS、trust-anchor IDs 等。 |
+| Firefox 148      | `HelloFirefox_148` spec；当前没有对应原始浏览器 capture        | 当前 profile 仍只有 3 个 TLS 1.3 cipher和一个 X25519 key share；缺少目标 spec 中的扩展与 group，签名列表也只是子集。                                |
+| iOS 14           | `HelloIOS_14` JSON spec                                        | 当前没有独立 iOS profile；不能用 `Safari` profile 代替 iOS 指纹。                                                                                   |
+| Safari 26.3      | `HelloSafari_26_3` spec；当前没有对应原始浏览器 capture        | 当前 `Safari` 与 `Chrome` 共用 cipher、groups 和签名配置；没有复现 Safari spec 的旧 cipher 顺序与完整扩展集合。                                     |
+
+自动化 wire baseline 位于 AWS-LC REALITY provider 测试中：它固定当前三个 profile 的 cipher 顺序、扩展顺序、groups、key shares、签名算法和显式配置的 ALPN，并将 GREASE 数值归一化。该测试记录的是当前 Rustls 实际输出，不是 uTLS 对照通过测试；表中的差异是后续实现工作的已知缺口。
+
+参考来源：相邻 uTLS checkout 的 `u_common.go` / `u_parrots.go`；Chrome 155 capture 说明位于 `testdata/chrome155_clienthello.md`，iOS 14 spec 位于 `testdata/ClientHello-JSON-iOS14.json`。Firefox 148 与 Safari 26.3 当前只有 uTLS spec，加入真实浏览器抓包后才能提升为 capture-backed baseline。
 
 ## 我们一路讨论出来的几个关键问题
 
@@ -61,27 +76,27 @@
 
 也就是说：
 
-* 在本仓库当前实现里，服务端要提供证书和私钥。
-* 自签名证书可以用于测试，但客户端必须信任它，或者显式关闭校验。
-* 如果目标是公网实用，自签名证书通常不合适，除非你完全控制客户端信任链。
+- 在本仓库当前实现里，服务端要提供证书和私钥。
+- 自签名证书可以用于测试，但客户端必须信任它，或者显式关闭校验。
+- 如果目标是公网实用，自签名证书通常不合适，除非你完全控制客户端信任链。
 
 相关示例入口：
 
-* `simpleserver.rs` 仍然要求 `--cert` 和 `--key`
-* `tlsserver-mio.rs` 也仍然要求 `--certs` 和 `--key`
+- `simpleserver.rs` 仍然要求 `--cert` 和 `--key`
+- `tlsserver-mio.rs` 也仍然要求 `--certs` 和 `--key`
 
 ### 2. 我们为什么没有直接声称“已经和 Xray 一样”
 
 因为两件事不同：
 
-* “协议思想相近”
-* “线上行为完全等价”
+- “协议思想相近”
+- “线上行为完全等价”
 
 当前代码已经实现了 REALITY 风格的关键识别路径，但没有宣称做到以下所有事情：
 
-* 与 Xray 的所有探测识别策略逐字节等价。
-* 与 Xray 的所有配置语义完全一致。
-* 对公网探测、长时间运行、复杂回退行为都经过了系统级验证。
+- 与 Xray 的所有探测识别策略逐字节等价。
+- 与 Xray 的所有配置语义完全一致。
+- 对公网探测、长时间运行、复杂回退行为都经过了系统级验证。
 
 所以它是“能工作、可解释、可扩展”的实现，不是“已经完全兼容 Xray 全部生产语义”的实现。
 
@@ -91,8 +106,8 @@
 
 这套代码包含两层：
 
-* 协议层：客户端生成 REALITY 风格 `session_id`，服务端验证 `ClientHello` 和相关字段。
-* 分流层：服务端在握手前就决定，哪些连接继续走 REALITY/TLS，哪些连接改走 decoy backend。
+- 协议层：客户端生成 REALITY 风格 `session_id`，服务端验证 `ClientHello` 和相关字段。
+- 分流层：服务端在握手前就决定，哪些连接继续走 REALITY/TLS，哪些连接改走 decoy backend。
 
 后者在当前仓库里非常重要，因为“是否转去诱饵后端”正是实际部署时最关心的行为之一。
 
@@ -104,10 +119,10 @@
 
 客户端侧的关键扩展点在：
 
-* `rustls/src/client/reality.rs`
-* `rustls/src/client/config.rs`
-* `rustls/src/client/hs.rs`
-* `rustls-aws-lc-rs/src/reality.rs`
+- `rustls/src/client/reality.rs`
+- `rustls/src/client/config.rs`
+- `rustls/src/client/hs.rs`
+- `rustls-aws-lc-rs/src/reality.rs`
 
 当前路径大致是：
 
@@ -115,24 +130,24 @@
 2. REALITY 路径把这个钩子包装成 `RealityClientHelloCallback`。
 3. 它调用 `RealitySessionIdGenerator` 生成 32 字节 `session_id`。
 4. 生成器可以是：
-   * `PlaintextRealitySessionIdGenerator`
-   * `SealingRealitySessionIdGenerator`
+   - `PlaintextRealitySessionIdGenerator`
+   - `SealingRealitySessionIdGenerator`
 5. aws-lc-rs 侧提供了更贴近当前实现目标的安装辅助，例如：
-   * `RealitySessionIdConfig`
-   * `install_reality_session_id_generator_from_xray_fields()`
+   - `RealitySessionIdConfig`
+   - `install_reality_session_id_generator_from_xray_fields()`
 
 当前实现里，`session_id` 头部布局包含我们讨论过的这些信息：
 
-* 3 字节 version
-* 1 字节保留位，当前要求为 0
-* 4 字节时间戳
-* short_id 所在的 8 字节槽位
+- 3 字节 version
+- 1 字节保留位，当前要求为 0
+- 4 字节时间戳
+- short_id 所在的 8 字节槽位
 
 对于 sealing 版本，客户端还会结合：
 
-* `ClientHello` 原始快照
-* 当前密钥交换状态
-* 服务端静态公钥
+- `ClientHello` 原始快照
+- 当前密钥交换状态
+- 服务端静态公钥
 
 派生出用于封装 `session_id` 的密钥材料。
 
@@ -140,19 +155,19 @@
 
 服务端示例主路径在：
 
-* `examples/src/bin/tlsserver-mio.rs`
+- `examples/src/bin/tlsserver-mio.rs`
 
 这里没有一上来就直接把流量完全交给 TLS 握手，而是先用：
 
-* `rustls::server::Acceptor`
+- `rustls::server::Acceptor`
 
 去预读 `ClientHello`。这样可以在完整握手前就做分流决策。
 
 对应关键路径：
 
-* `do_accept_read()`
-* `try_finish_accept()`
-* `fallback_target_for_client_hello()`
+- `do_accept_read()`
+- `try_finish_accept()`
+- `fallback_target_for_client_hello()`
 
 ### 第 3 步：服务端决定“继续握手”还是“转发到 decoy”
 
@@ -164,14 +179,14 @@
 
 当前 matcher 支持：
 
-* `serverNames`
-* `alpns`
-* `namedGroups`
+- `serverNames`
+- `alpns`
+- `namedGroups`
 
 对应关键逻辑在：
 
-* `FallbackMatcher`
-* `select_fallback_target()`
+- `FallbackMatcher`
+- `select_fallback_target()`
 
 #### 第二层：REALITY 密码学验证
 
@@ -191,16 +206,16 @@
 
 如果连接被判定应该回退，它不会再继续当前 TLS 路径，而是：
 
-* 建立到 decoy backend 的原始 TCP 连接
-* 把预读缓冲的数据先写给 decoy
-* 前后双向转发后续字节
+- 建立到 decoy backend 的原始 TCP 连接
+- 把预读缓冲的数据先写给 decoy
+- 前后双向转发后续字节
 
 关键函数包括：
 
-* `start_fallback()`
-* `try_front_read_passthrough()`
-* `try_back_read_passthrough()`
-* `flush_passthrough_writes()`
+- `start_fallback()`
+- `try_front_read_passthrough()`
+- `try_back_read_passthrough()`
+- `flush_passthrough_writes()`
 
 这就是“从数据进来，到服务端决定解密还是旁路，再把数据写回客户端”的核心链路。
 
@@ -210,10 +225,10 @@
 
 关键落点：
 
-* `rustls/src/server/config.rs`
-* `rustls/src/server/hs.rs`
-* `rustls/src/server/reality.rs`
-* `rustls-aws-lc-rs/src/reality.rs`
+- `rustls/src/server/config.rs`
+- `rustls/src/server/hs.rs`
+- `rustls/src/server/reality.rs`
+- `rustls-aws-lc-rs/src/reality.rs`
 
 当前结构是：
 
@@ -222,12 +237,12 @@
 3. verifier 收到的是一个 `RealityClientHello` 视图。
 4. aws-lc-rs 侧的 `RealityServerVerifierConfig` 会构建实际 verifier。
 5. verifier 使用：
-   * 客户端 `key_share`
-   * 服务端静态私钥
-   * `raw_client_hello`
-   * `session_id`
-   * 时间戳和 short_id 规则
-   来验证当前 hello 是否满足我们定义的 REALITY 约束。
+   - 客户端 `key_share`
+   - 服务端静态私钥
+   - `raw_client_hello`
+   - `session_id`
+   - 时间戳和 short_id 规则
+     来验证当前 hello 是否满足我们定义的 REALITY 约束。
 
 所以当前实现并不是只有 example 层的“猜测式路由”，它已经把 Rustls 核心握手路径也接上了一个 REALITY 风格的 `ClientHelloVerifier`。
 
@@ -237,30 +252,30 @@
 
 在当前仓库里，可以这样理解：
 
-* `shortId`
-  * 客户端：`--reality-short-id`
-  * 服务端：`--reality-short-id`
-  * 配置：`reality.shortId`
-* `publicKey`
-  * 客户端：`--reality-public-key`
-  * 配置：`reality.publicKey`
-  * 含义：客户端持有服务端静态公钥，用来生成 REALITY `session_id`
-* `privateKey`
-  * 服务端：`--reality-private-key`
-  * 配置：`reality.privateKey`
-  * 含义：服务端持有对应静态私钥，用来验证 REALITY hello
-* `serverName`
-  * 客户端：`--server-name`
-  * 服务端：`--reality-server-name`
-  * 配置：`reality.serverName` 或 `reality.serverNames`
-  * 含义：既是 TLS SNI 相关字段，也是当前 allowlist 决策的一部分
-* `version`
-  * 客户端和服务端都要求显式给出
-  * 当前实现固定解释为 3 字节、6 个十六进制字符
+- `shortId`
+  - 客户端：`--reality-short-id`
+  - 服务端：`--reality-short-id`
+  - 配置：`reality.shortId`
+- `publicKey`
+  - 客户端：`--reality-public-key`
+  - 配置：`reality.publicKey`
+  - 含义：客户端持有服务端静态公钥，用来生成 REALITY `session_id`
+- `privateKey`
+  - 服务端：`--reality-private-key`
+  - 配置：`reality.privateKey`
+  - 含义：服务端持有对应静态私钥，用来验证 REALITY hello
+- `serverName`
+  - 客户端：`--server-name`
+  - 服务端：`--reality-server-name`
+  - 配置：`reality.serverName` 或 `reality.serverNames`
+  - 含义：既是 TLS SNI 相关字段，也是当前 allowlist 决策的一部分
+- `version`
+  - 客户端和服务端都要求显式给出
+  - 当前实现固定解释为 3 字节、6 个十六进制字符
 
 如果你只想看当前仓库的映射表，可以直接看：
 
-* `examples/README.md`
+- `examples/README.md`
 
 ## 为什么我们最后把 fallback 规则做成可配置 matcher
 
@@ -268,25 +283,25 @@
 
 一开始最容易想到的是：
 
-* 不合法的流量统统转去一个固定 decoy 端口。
+- 不合法的流量统统转去一个固定 decoy 端口。
 
 但实际使用很快会碰到问题：
 
-* 不同探测流量可能想转不同 decoy
-* 只看 SNI 太粗
-* 仅凭“allowlist 命中”并不能说明它真是 REALITY 客户端
+- 不同探测流量可能想转不同 decoy
+- 只看 SNI 太粗
+- 仅凭“allowlist 命中”并不能说明它真是 REALITY 客户端
 
 于是当前实现逐步演化出：
 
-* 默认 `fallbackAddress + fallbackPort`
-* 有序 `fallbackRules`
-* 规则 matcher 支持：
-  * `serverNames`
-  * `alpns`
-  * `namedGroups`
-* 规则校验：
-  * 至少要有一个 matcher
-  * 端口不能为 0
+- 默认 `fallbackAddress + fallbackPort`
+- 有序 `fallbackRules`
+- 规则 matcher 支持：
+  - `serverNames`
+  - `alpns`
+  - `namedGroups`
+- 规则校验：
+  - 至少要有一个 matcher
+  - 端口不能为 0
 
 这部分的意义不是“协议本身必须如此”，而是“真实部署里，光有协议校验不够，入口分流策略必须可控”。
 
@@ -296,27 +311,27 @@
 
 当前状态可以定义为：
 
-* 可运行原型
-* 可联调
-* 可解释
-* 可继续工程化
+- 可运行原型
+- 可联调
+- 可解释
+- 可继续工程化
 
 但还不应该直接当成“已经生产就绪”。
 
 主要差距包括：
 
-* 代码主体仍然在 examples 层
-* 验证以 focused tests 和有限 live checks 为主
-* 还没有系统性的并发、长期运行、异常流量、互操作覆盖
-* 目前只复用目标 ServerHello，不仿真目标站后续加密记录长度、padding、分片或 NewSessionTicket 外观
-* 目标 ServerHello 必须在单个 TLS record 内完整到达；目标使用 HelloRetryRequest 或跨 record 分片时，本次采样不会生成模板
-* 还没有完备的观测、统计、回滚、热更新和运维控制
-* 并未宣称达到 Xray 全量语义兼容
+- 代码主体仍然在 examples 层
+- 验证以 focused tests 和有限 live checks 为主
+- 还没有系统性的并发、长期运行、异常流量、互操作覆盖
+- 目前只复用目标 ServerHello，不仿真目标站后续加密记录长度、padding、分片或 NewSessionTicket 外观
+- 目标 ServerHello 必须在单个 TLS record 内完整到达；目标使用 HelloRetryRequest 或跨 record 分片时，本次采样不会生成模板
+- 还没有完备的观测、统计、回滚、热更新和运维控制
+- 并未宣称达到 Xray 全量语义兼容
 
 所以更准确的描述是：
 
-* 它已经不是纸上谈兵
-* 但也还不是“直接上公网核心流量”的状态
+- 它已经不是纸上谈兵
+- 但也还不是“直接上公网核心流量”的状态
 
 ## 适合怎么使用当前这套代码
 
@@ -324,16 +339,16 @@
 
 ### 适合
 
-* 本地验证
-* 内网联调
-* 受控灰度环境
-* 继续做正式服务端工程化的基础代码
+- 本地验证
+- 内网联调
+- 受控灰度环境
+- 继续做正式服务端工程化的基础代码
 
 ### 不适合直接默认认为没问题
 
-* 无观测、无回滚方案的公网生产入口
-* 需要声称“完全等价于 Xray REALITY”的场景
-* 需要跨大量客户端生态做强兼容承诺的场景
+- 无观测、无回滚方案的公网生产入口
+- 需要声称“完全等价于 Xray REALITY”的场景
+- 需要跨大量客户端生态做强兼容承诺的场景
 
 ## 给技术专家的实现索引
 
@@ -341,43 +356,43 @@
 
 ### 客户端
 
-* `rustls/src/client/config.rs`
-  * `ClientHelloCallback`
-  * `DangerousClientConfig::set_reality_session_id_generator()`
-* `rustls/src/client/hs.rs`
-  * 在发出 `ClientHello` 前调用 callback
-* `rustls/src/client/reality.rs`
-  * `RealitySessionIdGenerator`
-  * `PlaintextRealitySessionIdGenerator`
-  * `SealingRealitySessionIdGenerator`
-* `rustls-aws-lc-rs/src/reality.rs`
-  * `RealitySessionIdConfig`
-  * `build_reality_client_config_from_xray_fields()`
-  * `install_reality_session_id_generator_from_xray_fields()`
+- `rustls/src/client/config.rs`
+  - `ClientHelloCallback`
+  - `DangerousClientConfig::set_reality_session_id_generator()`
+- `rustls/src/client/hs.rs`
+  - 在发出 `ClientHello` 前调用 callback
+- `rustls/src/client/reality.rs`
+  - `RealitySessionIdGenerator`
+  - `PlaintextRealitySessionIdGenerator`
+  - `SealingRealitySessionIdGenerator`
+- `rustls-aws-lc-rs/src/reality.rs`
+  - `RealitySessionIdConfig`
+  - `build_reality_client_config_from_xray_fields()`
+  - `install_reality_session_id_generator_from_xray_fields()`
 
 ### 服务端核心握手扩展
 
-* `rustls/src/server/config.rs`
-  * `ClientHelloVerifier`
-  * `DangerousServerConfig::set_reality_client_hello_verifier()`
-* `rustls/src/server/hs.rs`
-  * 在服务端处理 `ClientHello` 时调用 verifier
-* `rustls/src/server/reality.rs`
-  * `RealityClientHello`
-* `rustls-aws-lc-rs/src/reality.rs`
-  * `RealityServerVerifierConfig`
+- `rustls/src/server/config.rs`
+  - `ClientHelloVerifier`
+  - `DangerousServerConfig::set_reality_client_hello_verifier()`
+- `rustls/src/server/hs.rs`
+  - 在服务端处理 `ClientHello` 时调用 verifier
+- `rustls/src/server/reality.rs`
+  - `RealityClientHello`
+- `rustls-aws-lc-rs/src/reality.rs`
+  - `RealityServerVerifierConfig`
 
 ### 示例层分流入口
 
-* `examples/src/bin/tlsclient-mio.rs`
-  * 客户端 config 加载和 REALITY 参数接入
-* `examples/src/bin/simpleserver.rs`
-  * 最小服务端示例
-* `examples/src/bin/tlsserver-mio.rs`
-  * `resolve_reality_config()`
-  * `fallback_target_for_client_hello()`
-  * `select_fallback_target()`
-  * `session_id_matches_reality()`
+- `examples/src/bin/tlsclient-mio.rs`
+  - 客户端 config 加载和 REALITY 参数接入
+- `examples/src/bin/simpleserver.rs`
+  - 最小服务端示例
+- `examples/src/bin/tlsserver-mio.rs`
+  - `resolve_reality_config()`
+  - `fallback_target_for_client_hello()`
+  - `select_fallback_target()`
+  - `session_id_matches_reality()`
 
 ## 最后一句话
 

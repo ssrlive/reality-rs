@@ -1050,6 +1050,7 @@ mod tests {
     use core::time::Duration;
     use pki_types::pem::PemObject;
     use pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+    use rustls::client::ClientHelloProfile;
     use rustls::client::danger::{
         HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
         SignatureVerificationInput,
@@ -1127,6 +1128,12 @@ mod tests {
         session_id: [u8; 32],
         raw_client_hello: Vec<u8>,
         key_share: Vec<u8>,
+        cipher_suites: Vec<u16>,
+        extension_types: Vec<u16>,
+        supported_groups: Vec<u16>,
+        key_share_groups: Vec<u16>,
+        signature_algorithms: Vec<u16>,
+        alpn_protocols: Vec<Vec<u8>>,
     }
 
     fn parse_client_hello(bytes: &[u8]) -> ParsedClientHello {
@@ -1159,7 +1166,12 @@ mod tests {
         offset += session_id_len;
 
         let cipher_suites_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
-        offset += 2 + cipher_suites_len;
+        offset += 2;
+        let cipher_suites = body[offset..offset + cipher_suites_len]
+            .chunks_exact(2)
+            .map(|suite| u16::from_be_bytes([suite[0], suite[1]]))
+            .collect();
+        offset += cipher_suites_len;
 
         let compression_methods_len = body[offset] as usize;
         offset += 1 + compression_methods_len;
@@ -1169,23 +1181,72 @@ mod tests {
         let extensions_end = offset + extensions_len;
 
         let mut key_share = None;
+        let mut extension_types = Vec::new();
+        let mut supported_groups = Vec::new();
+        let mut key_share_groups = Vec::new();
+        let mut signature_algorithms = Vec::new();
+        let mut alpn_protocols = Vec::new();
         while offset < extensions_end {
             let extension_type = u16::from_be_bytes([body[offset], body[offset + 1]]);
             let extension_len = u16::from_be_bytes([body[offset + 2], body[offset + 3]]) as usize;
             offset += 4;
             let extension = &body[offset..offset + extension_len];
             offset += extension_len;
+            extension_types.push(extension_type);
 
-            if extension_type != 0x0033 {
-                continue;
+            match extension_type {
+                0x000a => {
+                    let list_len = u16::from_be_bytes([extension[0], extension[1]]) as usize;
+                    supported_groups.extend(
+                        extension[2..2 + list_len]
+                            .chunks_exact(2)
+                            .map(|group| u16::from_be_bytes([group[0], group[1]])),
+                    );
+                }
+                0x000d => {
+                    let list_len = u16::from_be_bytes([extension[0], extension[1]]) as usize;
+                    signature_algorithms.extend(
+                        extension[2..2 + list_len]
+                            .chunks_exact(2)
+                            .map(|scheme| u16::from_be_bytes([scheme[0], scheme[1]])),
+                    );
+                }
+                0x0010 => {
+                    let list_len = u16::from_be_bytes([extension[0], extension[1]]) as usize;
+                    let mut alpn_offset = 2;
+                    while alpn_offset < 2 + list_len {
+                        let protocol_len = extension[alpn_offset] as usize;
+                        alpn_offset += 1;
+                        alpn_protocols
+                            .push(extension[alpn_offset..alpn_offset + protocol_len].to_vec());
+                        alpn_offset += protocol_len;
+                    }
+                }
+                0x0033 => {
+                    let client_shares_len =
+                        u16::from_be_bytes([extension[0], extension[1]]) as usize;
+                    assert_eq!(client_shares_len + 2, extension.len());
+                    let mut share_offset = 2;
+                    while share_offset < extension.len() {
+                        let share_group = u16::from_be_bytes([
+                            extension[share_offset],
+                            extension[share_offset + 1],
+                        ]);
+                        let share_len = u16::from_be_bytes([
+                            extension[share_offset + 2],
+                            extension[share_offset + 3],
+                        ]) as usize;
+                        key_share_groups.push(share_group);
+                        if key_share.is_none() {
+                            key_share = Some(
+                                extension[share_offset + 4..share_offset + 4 + share_len].to_vec(),
+                            );
+                        }
+                        share_offset += 4 + share_len;
+                    }
+                }
+                _ => {}
             }
-
-            let client_shares_len = u16::from_be_bytes([extension[0], extension[1]]) as usize;
-            assert_eq!(client_shares_len + 2, extension.len());
-            let share_group = u16::from_be_bytes([extension[2], extension[3]]);
-            assert_eq!(share_group, 0x001d);
-            let share_len = u16::from_be_bytes([extension[4], extension[5]]) as usize;
-            key_share = Some(extension[6..6 + share_len].to_vec());
         }
 
         let mut raw_client_hello = handshake.to_vec();
@@ -1197,6 +1258,88 @@ mod tests {
             session_id,
             raw_client_hello,
             key_share: key_share.expect("missing key_share extension"),
+            cipher_suites,
+            extension_types,
+            supported_groups,
+            key_share_groups,
+            signature_algorithms,
+            alpn_protocols,
+        }
+    }
+
+    fn normalize_grease(values: &[u16]) -> Vec<u16> {
+        values
+            .iter()
+            .map(|value| {
+                let byte = (value >> 8) as u8;
+                if value.to_be_bytes() == [byte, byte] && byte & 0x0f == 0x0a {
+                    0xffff
+                } else {
+                    *value
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reality_client_hello_profile_wire_baseline() {
+        for profile in [
+            ClientHelloProfile::Chrome,
+            ClientHelloProfile::Firefox,
+            ClientHelloProfile::Safari,
+        ] {
+            let mut config =
+                ClientConfig::builder(Arc::new(default_x25519_tls13_reality_provider()))
+                    .with_root_certificates(RootCertStore::empty())
+                    .with_no_client_auth()
+                    .unwrap();
+            config.client_hello_profile = profile;
+            config.alpn_protocols = vec![b"h2".as_slice().into(), b"http/1.1".as_slice().into()];
+
+            let hello = parse_client_hello(&first_client_hello_bytes(config));
+            let expected_ciphers = match profile {
+                ClientHelloProfile::Chrome | ClientHelloProfile::Safari => {
+                    [0xffff, 0x1301, 0x1302, 0x1303]
+                }
+                ClientHelloProfile::Firefox => [0xffff, 0x1301, 0x1303, 0x1302],
+                _ => unreachable!(),
+            };
+            assert_eq!(normalize_grease(&hello.cipher_suites), expected_ciphers);
+
+            let mut normalized_extensions = normalize_grease(&hello.extension_types);
+            normalized_extensions.retain(|extension| *extension != 0x001b);
+            if profile == ClientHelloProfile::Chrome {
+                assert_eq!(
+                    normalized_extensions,
+                    [
+                        0x0000, 0xffff, 0x0017, 0x000a, 0x000b, 0x000d, 0x0010, 0x002b, 0x002d,
+                        0x0033
+                    ]
+                );
+            } else {
+                assert!(normalized_extensions.contains(&0x0017));
+                assert_eq!(
+                    normalized_extensions
+                        .into_iter()
+                        .filter(|extension| *extension != 0x0017)
+                        .collect::<Vec<_>>(),
+                    [
+                        0x0000, 0xffff, 0x000a, 0x000b, 0x000d, 0x0010, 0x002b, 0x002d, 0x0033
+                    ]
+                );
+            }
+
+            assert_eq!(normalize_grease(&hello.supported_groups), [0x001d, 0xffff]);
+            assert_eq!(hello.key_share_groups, [0x001d]);
+            let expected_signatures = match profile {
+                ClientHelloProfile::Firefox => [0x0403, 0x0503, 0x0804, 0x0805, 0x0807],
+                ClientHelloProfile::Chrome | ClientHelloProfile::Safari => {
+                    [0x0403, 0x0804, 0x0503, 0x0805, 0x0807]
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(hello.signature_algorithms, expected_signatures);
+            assert_eq!(hello.alpn_protocols, [b"h2".to_vec(), b"http/1.1".to_vec()]);
         }
     }
 

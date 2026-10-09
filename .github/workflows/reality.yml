@@ -56,6 +56,8 @@ jobs:
 
       - run: cargo clippy -- -D warnings
 
+      - run: cargo test
+
       - name: Run REALITY smoke test
         shell: bash
         run: python3 ./admin/reality_smoke.py --build-with-cargo
