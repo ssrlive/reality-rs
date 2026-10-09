@@ -21,11 +21,11 @@
 
 use anyreality::{AnytlsStreamReader, async_bridge};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use anytls::{
-    AsyncReadWrite, Client, DEFAULT_SCHEME, PaddingFactory, Stream as AnytlsStream, UotMode, UotRequest, uot_encode_packet,
-    uot_get_packet_from_stream, uot_sentinel_destination,
+    AsyncReadWrite, Client, DEFAULT_SCHEME, PaddingFactory, ProxyParameters, Stream as AnytlsStream, StreamIo, UotMode, UotRequest,
 };
+use anytls::{uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination};
 use clap::Parser;
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -34,13 +34,16 @@ use rustls::client::{ClientHelloProfile, Resumption};
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
-use socks5_impl::protocol::{Address, Reply};
-use socks5_impl::server::auth::NoAuth;
+use socks_hub_core::{BoxedStream, HttpConnector, UserKey, run_http_service};
+use socks5_impl::protocol::{Address, AsyncStreamOperation, ProxyType, Reply};
+use socks5_impl::server::auth::{AuthAdaptor, NoAuth, UserKeyAuth};
 use socks5_impl::server::connection::{ClientConnection as SocksClientConnection, IncomingConnection, associate, connect};
 use socks5_impl::server::{AssociatedUdpSocket, UdpAssociate};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader as TokioBufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
@@ -51,8 +54,6 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MIN_IDLE_SESSIONS: usize = 5;
 const DEFAULT_MAX_STREAMS_PER_SESSION: usize = 8;
 const DEFAULT_CLIENT_HELLO_PROFILE: &str = "default";
-const DEFAULT_HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_HTTP_HEADER_LIMIT: usize = 16 * 1024;
 const DEFAULT_PADDING_LEN: usize = 0;
 const MAX_PROXY_CONNECTIONS: usize = 256;
 const REALITY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -112,20 +113,28 @@ struct ClientAnytlsConfig {
     max_streams_per_session: Option<usize>,
 }
 
+/// The runtime configuration for the client, including listen address, server address, and optional probe proxy.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientRuntimeConfig {
+    /// The local address and parameters to listen on for incoming connections.
+    /// The value looks like `mixed://127.0.0.1:8080`, where the scheme can be `socks5`, `http`, or `mixed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    listen: Option<SocketAddr>,
+    listen: Option<ProxyParameters>,
+
+    /// The address of the server to connect to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    server_addr: Option<String>,
+    server_addr: Option<SocketAddr>,
+
+    /// The address of the optional probe proxy to use for connecting to the server.
+    /// If specified, the client will connect to the server through this proxy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     probe_proxy: Option<SocketAddr>,
 }
 
 #[derive(Clone)]
 struct DialCtx {
-    server_addr: String,
+    server_addr: SocketAddr,
     probe_proxy: Option<SocketAddr>,
     tls_config: Arc<rustls::ClientConfig>,
     server_name: String,
@@ -145,8 +154,11 @@ async fn main() -> Result<()> {
     let anytls = resolved.anytls.as_ref().expect("validated anytls config");
     let client = resolved.client.as_ref().expect("validated client config");
     let tls_config = Arc::new(build_rustls_client_config(reality)?);
-    let listen = client.listen.expect("validated client listen address");
-    let server_addr = client.server_addr.clone().expect("validated client server address");
+    let listen = client.listen.as_ref().expect("validated client listen address");
+    let listen_mode = local_proxy_mode(listen)?;
+    let listen_addr = listen.addr.as_ref().expect("validated client listen address");
+    let http_credentials = listen.credentials.clone();
+    let server_addr = client.server_addr.expect("validated client server address");
     let server_name = reality.server_name.clone().expect("validated reality server name");
     let padding = Arc::new(tokio::sync::RwLock::new(
         PaddingFactory::new(DEFAULT_SCHEME).expect("valid default padding scheme"),
@@ -155,7 +167,7 @@ async fn main() -> Result<()> {
     let password_sha256 = Sha256::digest(anytls.password.as_deref().expect("validated anytls password").as_bytes()).into();
 
     let dial_ctx = Arc::new(DialCtx {
-        server_addr: server_addr.clone(),
+        server_addr,
         probe_proxy: client.probe_proxy,
         tls_config,
         server_name: server_name.clone(),
@@ -177,34 +189,48 @@ async fn main() -> Result<()> {
         anytls.max_streams_per_session.unwrap_or(DEFAULT_MAX_STREAMS_PER_SESSION),
         Duration::ZERO,
     );
+    let http_connector_client = anytls_client.clone();
+    let http_connector: HttpConnector = Arc::new(move |destination: Address| {
+        let client = http_connector_client.clone();
+        Box::pin(async move {
+            let stream = client.create_stream().await?;
+            let mut adapter = HttpAnyTlsStream::new(StreamIo::new(stream));
+            destination.write_to_async_stream(&mut adapter).await?;
+            Ok(Box::new(adapter) as BoxedStream)
+        })
+    });
 
-    log::info!(
-        "REALITY+anytls client: mixed SOCKS5/HTTP {} -> {} (sni={})",
-        listen,
-        server_addr,
-        server_name
-    );
+    log::info!("REALITY+anytls client: {listen_mode:?} listener on {listen_addr} -> {server_addr} (sni={server_name})");
 
-    let listener = TcpListener::bind(listen).await?;
+    let listener = TcpListener::bind(listen_addr.to_string()).await?;
     let connection_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_CONNECTIONS));
-    let auth = Arc::new(NoAuth);
+    let auth: AuthAdaptor = match listen.credentials.clone() {
+        Some(credentials) => Arc::new(UserKeyAuth::from(credentials)),
+        None => Arc::new(NoAuth),
+    };
 
     loop {
         let connection_permit = connection_slots.clone().acquire_owned().await?;
         let (stream, peer_addr) = listener.accept().await?;
         let anytls_client = anytls_client.clone();
+        let http_connector = http_connector.clone();
         let auth = auth.clone();
+        let http_credentials = http_credentials.clone().unwrap_or_default();
         tokio::spawn(async move {
             let _connection_permit = connection_permit;
-            let result = match detect_local_proxy_protocol(&stream).await {
-                Ok(None) => Ok(()),
-                Ok(Some(LocalProxyProtocol::Socks5)) => handle_socks(IncomingConnection::new(stream, auth), anytls_client).await,
-                Ok(Some(LocalProxyProtocol::Http)) => handle_http_connect(stream, anytls_client).await,
-                Err(error) if is_peer_disconnect(&error) => {
-                    log::debug!("Proxy peer {peer_addr} disconnected during protocol detection: {error}");
-                    Ok(())
-                }
-                Err(error) => Err(error),
+            let result = match listen_mode {
+                LocalProxyMode::Socks5 => handle_socks(IncomingConnection::new(stream, auth), anytls_client).await,
+                LocalProxyMode::Http => handle_http_service(stream, http_connector, http_credentials).await,
+                LocalProxyMode::Mixed => match detect_local_proxy_protocol(&stream).await {
+                    Ok(None) => Ok(()),
+                    Ok(Some(LocalProxyProtocol::Socks5)) => handle_socks(IncomingConnection::new(stream, auth), anytls_client).await,
+                    Ok(Some(LocalProxyProtocol::Http)) => handle_http_service(stream, http_connector, http_credentials).await,
+                    Err(error) if is_peer_disconnect(&error) => {
+                        log::debug!("Proxy peer {peer_addr} disconnected during protocol detection: {error}");
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                },
             };
             if let Err(error) = result {
                 log::warn!("Proxy peer {peer_addr} failed: {error:#}");
@@ -220,7 +246,7 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
     // 1) Plain TCP connect, optionally via an HTTP CONNECT probe proxy.
     let tokio_tcp = if let Some(proxy_addr) = ctx.probe_proxy {
         log::info!("Connecting to REALITY server via probe proxy at {proxy_addr}");
-        connect_via_probe_proxy(proxy_addr, &ctx.server_addr).await?
+        connect_via_probe_proxy(proxy_addr, ctx.server_addr).await?
     } else {
         TcpStream::connect(&ctx.server_addr).await?
     };
@@ -283,7 +309,7 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
     Ok(Box::new(bridge) as Box<dyn AsyncReadWrite>)
 }
 
-async fn connect_via_probe_proxy(proxy_addr: SocketAddr, target: &str) -> std::io::Result<TcpStream> {
+async fn connect_via_probe_proxy(proxy_addr: SocketAddr, target: SocketAddr) -> std::io::Result<TcpStream> {
     let mut stream = TcpStream::connect(proxy_addr).await?;
     stream.set_nodelay(true)?;
 
@@ -324,62 +350,51 @@ async fn handle_socks(incoming: IncomingConnection, client: Arc<Client>) -> Resu
     }
 }
 
-async fn handle_http_connect(mut tcp_stream: TcpStream, client: Arc<Client>) -> Result<()> {
-    let mut request = Vec::new();
-    let read_headers = async {
-        loop {
-            let mut byte = [0u8; 1];
-            let count = tcp_stream.read(&mut byte).await?;
-            if count == 0 {
-                bail!("HTTP proxy client closed before sending headers");
-            }
-            request.push(byte[0]);
-            if request.len() > DEFAULT_HTTP_HEADER_LIMIT {
-                bail!("HTTP proxy request headers are too large");
-            }
-            if request.ends_with(b"\r\n\r\n") || request.ends_with(b"\n\n") {
-                break;
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    tokio::time::timeout(DEFAULT_HTTP_HEADER_TIMEOUT, read_headers)
-        .await
-        .with_context(|| http_header_timeout_context(&request))??;
-
-    let text = std::str::from_utf8(&request).context("HTTP proxy request is not UTF-8")?;
-    let request_line = text.lines().next().ok_or_else(|| anyhow!("HTTP proxy request is empty"))?;
-    let mut fields = request_line.split_whitespace();
-    let method = fields.next().unwrap_or_default();
-    let target = fields.next().unwrap_or_default();
-    if !method.eq_ignore_ascii_case("CONNECT") {
-        tcp_stream
-            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
-            .await?;
-        return Ok(());
-    }
-    let target = Address::try_from(target).context("invalid HTTP CONNECT target")?;
-
-    let mut remote = anytls::StreamIo::new(client.create_stream().await?);
-    let stream = remote.stream();
-    let session_id = stream.session_id();
-    let stream_id = stream.id();
-    log::debug!(
-        "session={session_id} stream={stream_id} stage=target_submit protocol=http-connect peer={:?} target={target}",
-        tcp_stream.peer_addr()
-    );
-    remote.write_all(&Vec::<u8>::from(target.clone())).await?;
-    if let Err(error) = tcp_stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await {
-        return Err(error.into());
-    }
-    match anytls::relay::copy_bidirectional(&mut tcp_stream, &mut remote).await {
-        Ok(_) => {}
-        Err(error) if error.is_peer_disconnect() => {
-            log::debug!("Proxy peer disconnected during HTTP CONNECT relay: {error}");
-        }
-        Err(error) => return Err(error.into()),
-    }
+async fn handle_http_service(stream: TcpStream, connector: HttpConnector, credentials: UserKey) -> Result<()> {
+    run_http_service(stream, connector, credentials).await?;
     Ok(())
+}
+
+struct HttpAnyTlsStream {
+    inner: Mutex<StreamIo>,
+}
+
+impl HttpAnyTlsStream {
+    fn new(inner: StreamIo) -> Self {
+        Self { inner: Mutex::new(inner) }
+    }
+}
+
+impl AsyncRead for HttpAnyTlsStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let Ok(inner) = self.inner.get_mut() else {
+            return Poll::Ready(Err(std::io::Error::other("HTTP stream lock poisoned")));
+        };
+        Pin::new(inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for HttpAnyTlsStream {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let Ok(inner) = self.inner.get_mut() else {
+            return Poll::Ready(Err(std::io::Error::other("HTTP stream lock poisoned")));
+        };
+        Pin::new(inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        let Ok(inner) = self.inner.get_mut() else {
+            return Poll::Ready(Err(std::io::Error::other("HTTP stream lock poisoned")));
+        };
+        Pin::new(inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        let Ok(inner) = self.inner.get_mut() else {
+            return Poll::Ready(Err(std::io::Error::other("HTTP stream lock poisoned")));
+        };
+        Pin::new(inner).poll_shutdown(cx)
+    }
 }
 
 async fn handle_tcp_connect(connect_req: connect::Connect<connect::NeedReply>, target: Address, client: &Arc<Client>) -> Result<()> {
@@ -395,7 +410,7 @@ async fn handle_tcp_connect(connect_req: connect::Connect<connect::NeedReply>, t
             return Err(err.into());
         }
     };
-    let mut remote = anytls::StreamIo::new(stream);
+    let mut remote = StreamIo::new(stream);
     let stream = remote.stream();
     let session_id = stream.session_id();
     let stream_id = stream.id();
@@ -442,6 +457,26 @@ enum LocalProxyProtocol {
     Http,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalProxyMode {
+    Socks5,
+    Http,
+    Mixed,
+}
+
+fn local_proxy_mode(parameters: &ProxyParameters) -> Result<LocalProxyMode> {
+    if parameters.addr.is_none() {
+        bail!("client.listen must include a bind address");
+    }
+    match parameters.proxy_type {
+        ProxyType::Socks5 => Ok(LocalProxyMode::Socks5),
+        ProxyType::Http => Ok(LocalProxyMode::Http),
+        ProxyType::Mixed => Ok(LocalProxyMode::Mixed),
+        ProxyType::None => bail!("client.listen scheme 'none' cannot be used for a listener"),
+        ProxyType::Socks4 => bail!("client.listen scheme 'socks4' is not supported"),
+    }
+}
+
 async fn detect_local_proxy_protocol(stream: &TcpStream) -> Result<Option<LocalProxyProtocol>> {
     let mut first_byte = [0u8; 1];
     if stream.peek(&mut first_byte).await? == 0 {
@@ -456,28 +491,38 @@ async fn detect_local_proxy_protocol(stream: &TcpStream) -> Result<Option<LocalP
     }
 }
 
-fn http_header_timeout_context(request: &[u8]) -> String {
-    let prefix = if request.starts_with(b"\x16\x03") {
-        "tls-handshake"
-    } else if request.starts_with(b"CONNECT ") {
-        "http-connect"
-    } else if request.first().is_some_and(u8::is_ascii_alphabetic) {
-        "ascii-method-or-other"
-    } else if request.is_empty() {
-        "empty"
-    } else {
-        "binary-or-other"
-    };
-    format!(
-        "HTTP proxy header timeout (received_bytes={}, prefix={prefix}, request_line_complete={})",
-        request.len(),
-        request.contains(&b'\n')
-    )
-}
-
 #[cfg(test)]
-mod http_diagnostic_tests {
+mod client_listener_tests {
     use super::*;
+
+    #[test]
+    fn listen_proxy_parameters_select_supported_protocols() {
+        for (value, expected) in [
+            ("socks5://127.0.0.1:1080", LocalProxyMode::Socks5),
+            ("socks5://user:password@127.0.0.1:1080", LocalProxyMode::Socks5),
+            ("http://127.0.0.1:8080", LocalProxyMode::Http),
+            ("mixed://127.0.0.1:1080", LocalProxyMode::Mixed),
+        ] {
+            let parameters = value.parse::<ProxyParameters>().unwrap();
+            assert_eq!(local_proxy_mode(&parameters).unwrap(), expected);
+        }
+
+        let json: ClientRuntimeConfig = serde_json::from_str(r#"{"listen":"mixed://127.0.0.1:1080"}"#).unwrap();
+        let toml: ClientRuntimeConfig = toml::from_str("listen = \"mixed://127.0.0.1:1080\"").unwrap();
+        assert_eq!(local_proxy_mode(json.listen.as_ref().unwrap()).unwrap(), LocalProxyMode::Mixed);
+        assert_eq!(local_proxy_mode(toml.listen.as_ref().unwrap()).unwrap(), LocalProxyMode::Mixed);
+    }
+
+    #[test]
+    fn listen_proxy_parameters_reject_unsupported_options() {
+        for (value, expected_error) in [
+            ("none", "must include a bind address"),
+            ("socks4://127.0.0.1:1080", "scheme 'socks4' is not supported"),
+        ] {
+            let parameters = value.parse::<ProxyParameters>().unwrap();
+            assert!(local_proxy_mode(&parameters).unwrap_err().to_string().contains(expected_error));
+        }
+    }
 
     #[tokio::test]
     async fn local_protocol_detection_preserves_supported_prefixes_and_rejects_binary() {
@@ -504,7 +549,6 @@ mod http_diagnostic_tests {
                 assert_eq!(byte[0], prefix);
             } else {
                 let message = result.unwrap_err().to_string();
-                assert!(!message.contains("header timeout"));
                 match prefix {
                     0x04 => assert!(message.starts_with("SOCKS4 is not supported")),
                     0x16 => assert!(message.starts_with("TLS handshake prefix")),
@@ -512,22 +556,6 @@ mod http_diagnostic_tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn header_timeout_diagnostics_do_not_expose_request_contents() {
-        let request = b"CONNECT private.example:443 HTTP/1.1\r\nProxy-Authorization: secret";
-        let message = http_header_timeout_context(request);
-        assert!(message.contains(&format!("received_bytes={}", request.len())));
-        assert!(message.contains("prefix=http-connect"));
-        assert!(message.contains("request_line_complete=true"));
-        assert!(!message.contains("private.example"));
-        assert!(!message.contains("secret"));
-        assert!(http_header_timeout_context(b"\x16\x03\x01").contains("prefix=tls-handshake"));
-        assert!(http_header_timeout_context(b"GET ").contains("prefix=ascii-method-or-other"));
-        assert!(http_header_timeout_context(b"\x04").contains("prefix=binary-or-other"));
-        assert!(http_header_timeout_context(b"").contains("prefix=empty"));
-        assert!(http_header_timeout_context(b"CONNECT ").contains("request_line_complete=false"));
     }
 }
 
@@ -636,6 +664,19 @@ fn resolve_client_config(config_path: &Path) -> Result<ClientConfigFile> {
         .anytls
         .as_ref()
         .ok_or_else(|| anyhow!("client config requires an [anytls] section"))?;
+    if let Some(client) = file_config.client.as_mut() {
+        client.listen.get_or_insert_with(|| {
+            format!("mixed://{DEFAULT_LISTEN_ADDR}")
+                .parse()
+                .expect("valid default listen parameters")
+        });
+    }
+    let listen = file_config
+        .client
+        .as_ref()
+        .and_then(|client| client.listen.as_ref())
+        .ok_or_else(|| anyhow!("client.listen must be set"))?;
+    local_proxy_mode(listen)?;
     let client = file_config
         .client
         .as_ref()
@@ -679,9 +720,6 @@ fn resolve_client_config(config_path: &Path) -> Result<ClientConfigFile> {
         Some(value) => bail!("unsupported reality.clientHelloProfile: {value}"),
     };
 
-    if let Some(client) = file_config.client.as_mut() {
-        client.listen.get_or_insert_with(|| DEFAULT_LISTEN_ADDR.parse().unwrap());
-    }
     if let Some(anytls) = file_config.anytls.as_mut() {
         anytls.idle_check_secs.get_or_insert(DEFAULT_IDLE_CHECK_SECS);
         anytls.idle_timeout_secs.get_or_insert(DEFAULT_IDLE_TIMEOUT_SECS);

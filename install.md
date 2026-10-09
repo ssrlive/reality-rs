@@ -50,7 +50,7 @@ idleTimeoutSecs = 30
 minIdleSessions = 5
 
 [client]
-listen = "127.0.0.1:2080"
+listen = "mixed://127.0.0.1:2080"
 serverAddr = "123.45.67.89:443"
 
 Install complete. Server config: /etc/anyreality/config.toml; client config printed above.

@@ -14,5 +14,5 @@ idleTimeoutSecs = 30
 minIdleSessions = 5
 
 [client]
-listen = "127.0.0.1:1081"
+listen = "mixed://127.0.0.1:1081"
 serverAddr = "127.0.0.1:9445"

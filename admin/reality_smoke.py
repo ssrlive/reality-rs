@@ -247,7 +247,7 @@ Examples:
             'idleTimeoutSecs = 30\n'
             'minIdleSessions = 5\n\n'
             '[client]\n'
-            f'listen = "{client_listen}"\n'
+            f'listen = "mixed://{client_listen}"\n'
             f'serverAddr = "{server_listen}"\n'
         )
 

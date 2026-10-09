@@ -190,7 +190,7 @@ password = "$password"
 maxStreamsPerSession = 4
 
 [client]
-listen = "127.0.0.1:2080"
+listen = "mixed://127.0.0.1:2080"
 serverAddr = "${hostaddr}:${the_port}"
 EOF
   echo -e "${Green}Wrote client config: ${CLIENT_CONFIG}${ColorOff}"
