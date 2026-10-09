@@ -53,16 +53,21 @@ jobs:
         uses: seanmiddleditch/gha-setup-ninja@v6
 
       - run: cargo fmt --all -- --check
+        if: ${{ !cancelled() }}
 
       - run: cargo clippy -- -D warnings
+        if: ${{ !cancelled() }}
 
       - run: cargo test
+        if: ${{ !cancelled() }}
 
       - name: Run REALITY smoke test
+        if: ${{ !cancelled() }}
         shell: bash
         run: python3 ./admin/reality_smoke.py --build-with-cargo
 
       - name: Run REALITY UDP smoke test
+        if: ${{ !cancelled() }}
         shell: bash
         run: python3 ./admin/reality_smoke_udp.py
 

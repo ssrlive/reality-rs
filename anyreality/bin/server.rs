@@ -45,6 +45,7 @@ use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
 use socks5_impl::protocol::{Address, AsyncStreamOperation};
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -115,12 +116,12 @@ struct ServerAnytlsConfigFile {
 #[serde(rename_all = "camelCase")]
 struct ServerRuntimeConfigFile {
     #[serde(default)]
-    listen: Option<String>,
+    listen: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug)]
 struct ServerConfigResolved {
-    listen: String,
+    listen: SocketAddr,
     password: String,
     private_key: String,
     short_ids: Vec<Vec<u8>>,
@@ -528,7 +529,7 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("server config requires a [server] section"))?;
 
-    let listen = server.listen.clone().unwrap_or_else(|| "[::]:443".to_string());
+    let listen = server.listen.unwrap_or_else(|| "[::]:443".parse::<SocketAddr>().unwrap());
     let password = anytls
         .password
         .clone()
@@ -748,10 +749,12 @@ async fn handle_raw_tls_fallback(tcp_client: std::net::TcpStream, allowed_server
 
 fn load_server_config_file(path: &Path) -> Result<ServerConfigFile> {
     let contents = std::fs::read_to_string(path)?;
-    match path.extension().and_then(|ext| ext.to_str()).unwrap_or_default() {
-        "json" => Ok(serde_json::from_str(&contents)?),
-        "toml" => Ok(toml::from_str(&contents)?),
-        _ => bail!("unsupported REALITY config format: {}", path.display()),
+    if let Ok(config) = serde_json::from_str(&contents) {
+        Ok(config)
+    } else if let Ok(config) = toml::from_str(&contents) {
+        Ok(config)
+    } else {
+        bail!("unsupported REALITY config format: {}", path.display());
     }
 }
 
