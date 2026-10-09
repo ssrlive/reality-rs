@@ -2,7 +2,7 @@
 shortIds = ["aabbcc"]
 privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"
 version = "010203"
-serverNames = ["test"]
+serverNames = ["example.com"]
 
 [anytls]
 password = "reality-smoke-password"

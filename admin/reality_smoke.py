@@ -2,11 +2,13 @@
 """TCP smoke test for anyreality with SOCKS5 CONNECT and SNI fallback coverage."""
 
 import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 CURL_CONNECT_TIMEOUT_SECONDS = 5
@@ -89,7 +91,8 @@ def show_log_pair(log_path, error_path):
 
 def show_logs(entries):
     for entry in entries:
-        show_log_pair(entry['log_path'], entry['error_path'])
+        if 'log_path' in entry:
+            show_log_pair(entry['log_path'], entry['error_path'])
 
 
 def start_process(repo_root, command, log_name):
@@ -106,19 +109,7 @@ def start_process(repo_root, command, log_name):
     }
 
 
-def start_http_target_process(repo_root, listen_endpoint, log_name):
-    host, port = split_endpoint(listen_endpoint)
-    script_path = os.path.join(repo_root, 'target', 'tmp', f'{log_name}.py')
-    log_path, error_path = prepare_log_paths(repo_root, log_name)
-    script = """import http.server
-import socketserver
-import sys
-
-host = sys.argv[1]
-port = int(sys.argv[2])
-
-
-class Handler(http.server.BaseHTTPRequestHandler):
+class SmokeHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = b'reality tunnel ok'
         self.send_response(200)
@@ -131,46 +122,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return
 
 
-class Server(socketserver.TCPServer):
+class SmokeHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
 
-with Server((host, port), Handler) as httpd:
-    httpd.serve_forever()
-"""
-    with open(script_path, 'w', encoding='utf-8') as handle:
-        handle.write(script)
-    stdout = open(log_path, 'w', encoding='utf-8')
-    stderr = open(error_path, 'w', encoding='utf-8')
-    process = subprocess.Popen(
-        [sys.executable, script_path, host, str(port)],
-        cwd=repo_root,
-        stdout=stdout,
-        stderr=stderr,
-    )
-    return {
-        'process': process,
-        'script_path': script_path,
-        'log_path': log_path,
-        'error_path': error_path,
-        'stdout': stdout,
-        'stderr': stderr,
-    }
+def start_http_target_server(listen_endpoint):
+    host, port = split_endpoint(listen_endpoint)
+    server = SmokeHTTPServer((host, port), SmokeHTTPHandler)
+    thread = threading.Thread(target=server.serve_forever, name='reality-smoke-http', daemon=True)
+    thread.start()
+    return {'server': server, 'thread': thread}
 
 
 def assert_process_running(entry, label):
-    if entry['process'].poll() is not None:
+    if 'server' in entry and not entry['thread'].is_alive():
+        raise RuntimeError(f'{label} stopped unexpectedly')
+    if 'process' in entry and entry['process'].poll() is not None:
         show_log_pair(entry['log_path'], entry['error_path'])
         raise RuntimeError(f"{label} exited early with code {entry['process'].returncode}")
 
 
 def cleanup_entries(entries):
     for entry in entries:
-        process = entry['process']
-        if process.poll() is None:
+        if 'server' in entry:
+            entry['server'].shutdown()
+            entry['server'].server_close()
+            entry['thread'].join(timeout=5)
+            continue
+        process = entry.get('process')
+        if process is not None and process.poll() is None:
             process.terminate()
     for entry in entries:
-        process = entry['process']
+        process = entry.get('process')
+        if process is None:
+            continue
         if process.poll() is None:
             try:
                 process.wait(timeout=5)
@@ -241,7 +227,7 @@ Examples:
             'shortIds = ["aabbcc"]\n'
             'privateKey = "SMGC8zRkH_w4ZggVwiEJOdkeY1jWMZLCet5Qf2i-SmM"\n'
             'version = "010203"\n'
-            'serverNames = ["test", "example.com", "baidu.com", "www.baidu.com"]\n\n'
+            'serverNames = ["example.com", "baidu.com", "www.baidu.com"]\n\n'
             '[anytls]\n'
             'password = "reality-smoke-password"\n\n'
             '[server]\n'
@@ -253,7 +239,7 @@ Examples:
             '[reality]\n'
             'shortId = "aabbcc"\n'
             'publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"\n'
-            'serverName = "test"\n'
+            'serverName = "example.com"\n'
             'version = "010203"\n\n'
             '[anytls]\n'
             'password = "reality-smoke-password"\n'
@@ -267,14 +253,10 @@ Examples:
 
     entries = []
     cleanup_message = False
-    http_target_script_path = None
-
     try:
         print(f'Starting local HTTP target on {target_uri}')
-        http_target = start_http_target_process(repo_root, target_listen, 'reality-target')
-        http_target_script_path = http_target['script_path']
+        http_target = start_http_target_server(target_listen)
         entries.append(http_target)
-        time.sleep(0.25)
         assert_process_running(http_target, 'HTTP target')
         if not wait_tcp(*split_endpoint(target_listen), timeout=5.0):
             raise RuntimeError('Timed out waiting for HTTP target')
@@ -375,7 +357,7 @@ Examples:
         raise
     finally:
         cleanup_entries(entries)
-        for path in (server_config_path, client_config_path, http_target_script_path):
+        for path in (server_config_path, client_config_path):
             if path and os.path.isfile(path):
                 try:
                     os.remove(path)

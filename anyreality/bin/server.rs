@@ -21,8 +21,6 @@
 
 use anyreality::async_bridge;
 
-use aes_gcm::aead::AeadInOut;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use anyhow::{Context, Result, bail};
 use anytls::{
     DEFAULT_SCHEME, PaddingFactory, Session, Stream as AnytlsStream, UotMode, UotRequest, uot_get_request_from_stream,
@@ -35,12 +33,13 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_S
 use clap::Parser;
 use core::hash::Hasher;
 use core::time::Duration;
-use hkdf::Hkdf;
 use rustls::Connection;
 use rustls::ServerConfig;
 use rustls::ServerConnection;
 use rustls::crypto::SelectedCredential;
-use rustls::server::{ClientHello, ClientHelloVerifier, RealityClientHello, ServerCredentialResolver};
+use rustls::server::{
+    ClientHello, ClientHelloVerifier, RealityClientHello, RealityClientHelloProbe, RealityServerHelloAction, ServerCredentialResolver,
+};
 use rustls_aws_lc_rs as provider;
 use rustls_util::{StreamOwned, complete_io};
 use sha2::{Digest, Sha256};
@@ -164,6 +163,10 @@ impl ClientHelloVerifier for ExampleRealityVerifier {
         self.inner.reality_auth_key(client_hello)
     }
 
+    fn verify_client_hello_probe(&self, probe: &RealityClientHelloProbe) -> core::result::Result<bool, rustls::Error> {
+        self.inner.verify_client_hello_probe(probe)
+    }
+
     fn hash_config(&self, h: &mut dyn Hasher) {
         h.write_usize(self.server_names.len());
         for name in &self.server_names {
@@ -189,25 +192,13 @@ async fn main() -> Result<()> {
 
     let config_path = args.config.as_ref().ok_or_else(|| anyhow::anyhow!("--config is required"))?;
     let resolved = resolve_server_config(config_path)?;
-    let tls_config = Arc::new(build_server_config(&resolved)?);
+    let (tls_config, reality_probe_verifier) = build_server_config(&resolved)?;
+    let tls_config = Arc::new(tls_config);
     let allowed_server_names = Arc::new(resolved.server_names.clone());
     let password_sha256: [u8; 32] = Sha256::digest(resolved.password.as_bytes()).into();
     let padding = Arc::new(tokio::sync::RwLock::new(
         PaddingFactory::new(DEFAULT_SCHEME).expect("valid default padding scheme"),
     ));
-    let reality_private_key = Arc::new(parse_reality_private_key(&resolved.private_key)?);
-    let reality_short_ids = Arc::new(
-        resolved
-            .short_ids
-            .iter()
-            .map(|short_id| {
-                let mut fixed = [0u8; 8];
-                fixed[..short_id.len()].copy_from_slice(short_id);
-                fixed
-            })
-            .collect::<Vec<_>>(),
-    );
-    let reality_version = parse_reality_version(&resolved.version);
     let listener = TcpListener::bind(&resolved.listen).await?;
     let carrier_slots = Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CARRIERS));
     let stream_slots = Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_STREAMS));
@@ -219,8 +210,7 @@ async fn main() -> Result<()> {
         let tls_config = tls_config.clone();
         let allowed_server_names = allowed_server_names.clone();
         let padding = padding.clone();
-        let reality_private_key = reality_private_key.clone();
-        let reality_short_ids = reality_short_ids.clone();
+        let reality_probe_verifier = reality_probe_verifier.clone();
         let stream_slots = stream_slots.clone();
         tokio::spawn(async move {
             let _carrier_permit = carrier_permit;
@@ -228,11 +218,9 @@ async fn main() -> Result<()> {
                 stream,
                 tls_config,
                 allowed_server_names,
+                reality_probe_verifier,
                 password_sha256,
                 padding,
-                reality_private_key,
-                reality_short_ids,
-                reality_version,
                 stream_slots,
             )
             .await
@@ -247,11 +235,9 @@ async fn handle_connection(
     stream: TokioTcpStream,
     reality_config: Arc<ServerConfig>,
     allowed_server_names: Arc<Vec<String>>,
+    reality_probe_verifier: Arc<dyn ClientHelloVerifier>,
     password_sha256: [u8; 32],
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
-    reality_private_key: Arc<Vec<u8>>,
-    reality_short_ids: Arc<Vec<[u8; 8]>>,
-    reality_version: [u8; 3],
     stream_slots: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
@@ -263,18 +249,37 @@ async fn handle_connection(
     // CLIENT_HELLO_TIMEOUT. Run it on the blocking pool so a slow or probing
     // connection can never pin an async worker thread; otherwise a handful of
     // scanners on this port would freeze every live carrier's SYNACK traffic.
-    let detect_key = reality_private_key.clone();
-    let detect_short_ids = reality_short_ids.clone();
+    let detect_verifier = reality_probe_verifier.clone();
     let (client_hello, std_stream) =
         tokio::task::spawn_blocking(move || -> Result<(Option<RealityClientHelloProbe>, std::net::TcpStream)> {
-            let client_hello = is_reality_client_hello(&std_stream, detect_key.as_slice(), &detect_short_ids, &reality_version)?;
+            let client_hello = is_reality_client_hello(&std_stream, detect_verifier.as_ref())?;
             Ok((client_hello, std_stream))
         })
         .await??;
     let Some(client_hello) = client_hello else {
         return handle_raw_tls_fallback(std_stream, allowed_server_names).await;
     };
-    let probe_destination = select_server_hello_probe_destination(client_hello.server_name.as_deref(), &allowed_server_names);
+    let allowed_names_for_probe = allowed_server_names.clone();
+    let server_hello_action = tokio::task::spawn_blocking(move || {
+        client_hello.fetch_server_hello_or_fallback(&allowed_names_for_probe, |server_name, client_hello| {
+            let destination = format!("{server_name}:443");
+            probe_server_hello(&destination, client_hello).map_err(|error| rustls::Error::General(error.to_string()))
+        })
+    })
+    .await?;
+    let server_hello_template = match server_hello_action {
+        RealityServerHelloAction::UseTemplate(template) => template,
+        RealityServerHelloAction::Fallback { server_name, probe_error } => {
+            if let Some(error) = probe_error {
+                log::debug!(
+                    "REALITY ServerHello probe failed for {:?}: {error}; falling back to target",
+                    server_name
+                );
+            }
+            return handle_raw_tls_fallback(std_stream, allowed_server_names).await;
+        }
+        _ => return handle_raw_tls_fallback(std_stream, allowed_server_names).await,
+    };
 
     // 1) REALITY blocking handshake on a worker thread.
     let tls = tokio::task::spawn_blocking(move || -> Result<StreamOwned<ServerConnection, std::net::TcpStream>> {
@@ -283,16 +288,8 @@ async fn handle_connection(
         sock.set_read_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
         sock.set_write_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
         let mut conn = ServerConnection::new(reality_config)?;
-        if let Some(target) = probe_destination {
-            match probe_server_hello(&target, &client_hello.wire) {
-                Ok(template) => {
-                    if let Err(error) = conn.set_reality_server_hello_template(&template) {
-                        log::debug!("REALITY ServerHello template rejected for {target}: {error}");
-                    }
-                }
-                Err(error) => log::debug!("REALITY ServerHello probe failed for {target}: {error:#}"),
-            }
-        }
+        conn.set_reality_server_hello_template(&server_hello_template)
+            .context("install SNI target ServerHello template")?;
         while conn.is_handshaking() {
             complete_io(&mut sock, &mut conn).context("complete REALITY handshake")?;
         }
@@ -567,7 +564,7 @@ fn resolve_server_config(config_path: &Path) -> Result<ServerConfigResolved> {
     })
 }
 
-fn build_server_config(reality: &ServerConfigResolved) -> Result<ServerConfig> {
+fn build_server_config(reality: &ServerConfigResolved) -> Result<(ServerConfig, Arc<dyn ClientHelloVerifier>)> {
     let provider = provider::reality::default_x25519_tls13_reality_provider();
     let mut config = ServerConfig::builder(Arc::new(provider))
         .with_no_client_auth()
@@ -584,18 +581,16 @@ fn build_server_config(reality: &ServerConfigResolved) -> Result<ServerConfig> {
     config
         .dangerous()
         .set_reality_client_hello_verifier(Some(Arc::new(ExampleRealityVerifier {
-            inner: verifier,
+            inner: verifier.clone(),
             server_names: reality.server_names.clone(),
         })));
 
-    Ok(config)
+    Ok((config, verifier))
 }
 
 fn is_reality_client_hello(
     tcp_stream: &std::net::TcpStream,
-    server_private_key: &[u8],
-    short_ids: &[[u8; 8]],
-    version: &[u8; 3],
+    verifier: &dyn ClientHelloVerifier,
 ) -> Result<Option<RealityClientHelloProbe>> {
     tcp_stream
         .set_nonblocking(false)
@@ -626,7 +621,7 @@ fn is_reality_client_hello(
             return Ok(None);
         }
 
-        let Some(client_hello) = collect_client_hello(&buf[..available])? else {
+        let Some(client_hello) = RealityClientHelloProbe::from_tls_records(&buf[..available])? else {
             if buf.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
                 bail!("ClientHello exceeds maximum size")
             }
@@ -635,124 +630,12 @@ fn is_reality_client_hello(
             continue;
         };
 
-        let Ok(parsed) = parse_client_hello(&client_hello.handshake) else {
-            return Ok(None);
-        };
-        if parsed.session_id.len() != 32 {
-            return Ok(None);
+        if verifier.verify_client_hello_probe(&client_hello)? {
+            return Ok(Some(client_hello));
         }
-
-        let private_key =
-            agreement::PrivateKey::from_private_key(&agreement::X25519, server_private_key).context("parse REALITY private key bytes")?;
-        if parsed.key_share.is_empty() {
-            return Ok(None);
-        }
-        let peer_public = agreement::UnparsedPublicKey::new(&agreement::X25519, &parsed.key_share);
-        let reality_key = agreement::agree(&private_key, peer_public, aws_lc_rs::error::Unspecified, |secret| {
-            Ok::<Vec<u8>, aws_lc_rs::error::Unspecified>(Vec::from(secret))
-        })
-        .map_err(|_| anyhow::anyhow!("failed to compute REALITY shared secret"))?;
-
-        let hk = Hkdf::<Sha256>::new(Some(&parsed.random[..20]), &reality_key);
-        let mut sealing_key = [0u8; 32];
-        hk.expand(b"REALITY", &mut sealing_key).context("derive REALITY sealing key")?;
-
-        let cipher = Aes256Gcm::new(&sealing_key.into());
-        let mut decrypted = parsed.session_id.clone();
-        let nonce = Nonce::try_from(&parsed.random[20..32])?;
-        if cipher.decrypt_in_place(&nonce, &parsed.raw_client_hello, &mut decrypted).is_err() {
-            return Ok(None);
-        }
-
-        if decrypted.len() != 16 || decrypted[3] != 0 {
-            return Ok(None);
-        }
-        if &decrypted[..3] != version.as_slice() {
-            return Ok(None);
-        }
-        if !short_ids.iter().any(|short_id| &decrypted[8..16] == short_id) {
-            return Ok(None);
-        }
-
-        return Ok(Some(RealityClientHelloProbe {
-            wire: client_hello.wire,
-            server_name: parsed.server_name,
-        }));
+        log::debug!("REALITY ClientHello preflight rejected; passing the connection through to its SNI target");
+        return Ok(None);
     }
-}
-
-struct RealityClientHelloProbe {
-    wire: Vec<u8>,
-    server_name: Option<String>,
-}
-
-fn select_server_hello_probe_destination(server_name: Option<&str>, allowed_server_names: &[String]) -> Option<String> {
-    let server_name = server_name?;
-    allowed_server_names
-        .iter()
-        .any(|allowed| allowed == server_name)
-        .then(|| format!("{server_name}:443"))
-}
-
-struct ParsedClientHello {
-    random: [u8; 32],
-    session_id: Vec<u8>,
-    raw_client_hello: Vec<u8>,
-    key_share: Vec<u8>,
-    server_name: Option<String>,
-}
-
-struct CollectedClientHello {
-    handshake: Vec<u8>,
-    wire: Vec<u8>,
-}
-
-fn collect_client_hello(bytes: &[u8]) -> Result<Option<CollectedClientHello>> {
-    let mut offset = 0;
-    let mut handshake = Vec::new();
-    let mut expected_len = None;
-
-    while offset < bytes.len() {
-        if bytes.len() - offset < 5 {
-            return Ok(None);
-        }
-        let header = &bytes[offset..offset + 5];
-        offset += 5;
-        if header[0] != 22 {
-            bail!("not a handshake record")
-        }
-        let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-        if bytes.len() - offset < record_len {
-            return Ok(None);
-        }
-        let payload = &bytes[offset..offset + record_len];
-        offset += record_len;
-        handshake.extend_from_slice(payload);
-
-        if expected_len.is_none() && handshake.len() >= 4 {
-            if handshake[0] != 1 {
-                bail!("not a ClientHello")
-            }
-            let client_hello_len = ((handshake[1] as usize) << 16) | ((handshake[2] as usize) << 8) | handshake[3] as usize;
-            let total_len = client_hello_len
-                .checked_add(4)
-                .ok_or_else(|| anyhow::anyhow!("ClientHello length overflow"))?;
-            if total_len > CLIENT_HELLO_MAX_WIRE_SIZE {
-                bail!("ClientHello exceeds maximum size")
-            }
-            expected_len = Some(total_len);
-        }
-
-        if let Some(expected_len) = expected_len
-            && handshake.len() >= expected_len
-        {
-            handshake.truncate(expected_len);
-            let wire = bytes[..offset].to_vec();
-            return Ok(Some(CollectedClientHello { handshake, wire }));
-        }
-    }
-
-    Ok(None)
 }
 
 fn probe_server_hello(destination: &str, client_hello: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -768,157 +651,21 @@ fn probe_server_hello(destination: &str, client_hello: &[u8]) -> std::io::Result
 
                 let mut record_header = [0u8; 5];
                 stream.read_exact(&mut record_header)?;
-                if record_header[0] != 22 {
-                    return Err(Error::new(InvalidData, "destination did not send a TLS handshake record"));
-                }
                 let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
                 if !(4..=18_432).contains(&record_len) {
                     return Err(Error::new(InvalidData, "destination sent an invalid TLS handshake record length"));
                 }
                 let mut payload = vec![0u8; record_len];
                 stream.read_exact(&mut payload)?;
-                if payload[0] != 2 {
-                    return Err(Error::new(InvalidData, "destination did not send ServerHello first"));
-                }
-                let handshake_len = ((payload[1] as usize) << 16) | ((payload[2] as usize) << 8) | payload[3] as usize;
-                let server_hello_len = 4usize
-                    .checked_add(handshake_len)
-                    .ok_or_else(|| Error::new(InvalidData, "invalid ServerHello length"))?;
-                if server_hello_len > payload.len() {
-                    return Err(Error::new(InvalidData, "destination split ServerHello across TLS records"));
-                }
-                payload.truncate(server_hello_len);
-                return Ok(payload);
+                let mut record = Vec::with_capacity(record_header.len() + payload.len());
+                record.extend_from_slice(&record_header);
+                record.extend_from_slice(&payload);
+                return Ok(record);
             }
             Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.unwrap_or_else(|| Error::new(InvalidInput, format!("can't resolve ServerHello probe destination {destination}"))))
-}
-
-fn parse_client_hello(bytes: &[u8]) -> Result<ParsedClientHello> {
-    if bytes.len() < 4 || bytes[0] != 1 {
-        bail!("not a ClientHello")
-    }
-
-    let handshake_len = ((bytes[1] as usize) << 16) | ((bytes[2] as usize) << 8) | (bytes[3] as usize);
-    if handshake_len < 34 || handshake_len + 4 > bytes.len() {
-        bail!("truncated ClientHello")
-    }
-
-    let body = &bytes[4..4 + handshake_len];
-    let mut offset = 2;
-    let mut random = [0u8; 32];
-    let random_end = offset + 32;
-    random.copy_from_slice(
-        body.get(offset..random_end)
-            .ok_or_else(|| anyhow::anyhow!("truncated ClientHello random"))?,
-    );
-    offset = random_end;
-
-    let session_id_len = *body.get(offset).ok_or_else(|| anyhow::anyhow!("missing session ID length"))? as usize;
-    offset += 1;
-
-    let session_id_offset = offset;
-    let session_id_end = offset + session_id_len;
-    let session_id = body
-        .get(offset..session_id_end)
-        .ok_or_else(|| anyhow::anyhow!("truncated session ID"))?
-        .to_vec();
-    offset = session_id_end;
-
-    let cipher_suites_len = read_u16(body, &mut offset, "cipher suites length")?;
-    take_bytes(body, &mut offset, cipher_suites_len, "cipher suites")?;
-    let compression_len = *body
-        .get(offset)
-        .ok_or_else(|| anyhow::anyhow!("missing compression methods length"))? as usize;
-    offset += 1 + compression_len;
-    if offset > body.len() {
-        bail!("truncated ClientHello after compression")
-    }
-
-    let extensions_len = read_u16(body, &mut offset, "extensions length")?;
-    let extensions = take_bytes(body, &mut offset, extensions_len, "extensions")?;
-
-    let mut extension_offset = 0;
-    let mut server_name = None;
-    let mut key_share = None;
-    while extension_offset < extensions.len() {
-        let ext_type = read_u16(extensions, &mut extension_offset, "extension type")?;
-        let ext_len = read_u16(extensions, &mut extension_offset, "extension length")?;
-        let extension = take_bytes(extensions, &mut extension_offset, ext_len, "extension")?;
-        if ext_type == 0x0000 {
-            server_name = parse_server_name(extension)?;
-        }
-        if ext_type == 0x0033 {
-            key_share = parse_x25519_key_share(extension)?;
-        }
-    }
-
-    let key_share = key_share.unwrap_or_default();
-    let mut raw_client_hello = bytes.to_vec();
-    let raw_session_id_end = 4 + session_id_offset + session_id_len;
-    raw_client_hello
-        .get_mut(4 + session_id_offset..raw_session_id_end)
-        .ok_or_else(|| anyhow::anyhow!("invalid session ID offset"))?
-        .fill(0);
-
-    Ok(ParsedClientHello {
-        random,
-        session_id,
-        raw_client_hello,
-        key_share,
-        server_name,
-    })
-}
-
-fn read_u16(bytes: &[u8], offset: &mut usize, field: &str) -> Result<usize> {
-    let value = take_bytes(bytes, offset, 2, field)?;
-    Ok(u16::from_be_bytes([value[0], value[1]]) as usize)
-}
-
-fn take_bytes<'a>(bytes: &'a [u8], offset: &mut usize, length: usize, field: &str) -> Result<&'a [u8]> {
-    let end = offset.checked_add(length).ok_or_else(|| anyhow::anyhow!("ClientHello overflow"))?;
-    let value = bytes
-        .get(*offset..end)
-        .ok_or_else(|| anyhow::anyhow!("truncated ClientHello {field}"))?;
-    *offset = end;
-    Ok(value)
-}
-
-fn parse_server_name(extension: &[u8]) -> Result<Option<String>> {
-    let mut offset = 0;
-    let names_len = read_u16(extension, &mut offset, "server name list length")?;
-    let names = take_bytes(extension, &mut offset, names_len, "server name list")?;
-    let mut name_offset = 0;
-    while name_offset < names.len() {
-        let name_type = *names
-            .get(name_offset)
-            .ok_or_else(|| anyhow::anyhow!("truncated server name type"))?;
-        name_offset += 1;
-        let name_len = read_u16(names, &mut name_offset, "server name length")?;
-        let name = take_bytes(names, &mut name_offset, name_len, "server name")?;
-        if name_type == 0 {
-            return Ok(Some(std::str::from_utf8(name)?.to_ascii_lowercase()));
-        }
-    }
-    Ok(None)
-}
-
-fn parse_x25519_key_share(extension: &[u8]) -> Result<Option<Vec<u8>>> {
-    let mut offset = 0;
-    let shares_len = read_u16(extension, &mut offset, "key share list length")?;
-    let shares = take_bytes(extension, &mut offset, shares_len, "key share list")?;
-    let mut share_offset = 0;
-    while share_offset < shares.len() {
-        let group = read_u16(shares, &mut share_offset, "key share group")?;
-        let share_len = read_u16(shares, &mut share_offset, "key share length")?;
-        let share = take_bytes(shares, &mut share_offset, share_len, "key share")?;
-        if group == 0x001d {
-            return Ok(Some(share.to_vec()));
-        }
-    }
-    Ok(None)
 }
 
 fn generate_reality_keypair() -> Result<()> {
@@ -954,7 +701,7 @@ fn generate_reality_keypair() -> Result<()> {
 async fn handle_raw_tls_fallback(tcp_client: std::net::TcpStream, allowed_server_names: Arc<Vec<String>>) -> Result<()> {
     // The SNI sniff also does blocking reads for up to CLIENT_HELLO_TIMEOUT;
     // keep it on the blocking pool so it never occupies an async worker thread.
-    let (server_name, tcp_client) = tokio::task::spawn_blocking(move || -> Result<(String, std::net::TcpStream)> {
+    let (client_hello, tcp_client) = tokio::task::spawn_blocking(move || -> Result<(RealityClientHelloProbe, std::net::TcpStream)> {
         tcp_client.set_read_timeout(Some(Duration::from_secs(1)))?;
         let mut buffer = vec![0u8; 2048];
         let deadline = Instant::now() + CLIENT_HELLO_TIMEOUT;
@@ -969,7 +716,7 @@ async fn handle_raw_tls_fallback(tcp_client: std::net::TcpStream, allowed_server
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut || error.kind() == std::io::ErrorKind::WouldBlock => 0,
                 Err(error) => return Err(error.into()),
             };
-            let Some(client_hello) = collect_client_hello(&buffer[..available])? else {
+            let Some(client_hello) = RealityClientHelloProbe::from_tls_records(&buffer[..available])? else {
                 if buffer.len() == CLIENT_HELLO_MAX_WIRE_SIZE {
                     bail!("ClientHello exceeds maximum size");
                 }
@@ -977,17 +724,19 @@ async fn handle_raw_tls_fallback(tcp_client: std::net::TcpStream, allowed_server
                 thread::sleep(Duration::from_millis(1));
                 continue;
             };
-            break client_hello.handshake;
+            break client_hello;
         };
-        let parsed = parse_client_hello(&handshake)?;
-        let server_name = parsed.server_name.ok_or_else(|| anyhow::anyhow!("fallback requires SNI"))?;
-        Ok((server_name, tcp_client))
+        Ok((handshake, tcp_client))
     })
     .await??;
 
-    if !allowed_server_names.iter().any(|allowed| allowed == &server_name) {
-        bail!("fallback rejected unexpected SNI: {server_name}");
-    }
+    let server_name = client_hello
+        .server_name_if_allowed(&allowed_server_names)
+        .ok_or_else(|| match client_hello.server_name() {
+            Some(server_name) => anyhow::anyhow!("fallback rejected unexpected SNI: {server_name}"),
+            None => anyhow::anyhow!("fallback requires SNI"),
+        })?;
+    let server_name = server_name.to_string();
 
     tcp_client.set_nonblocking(true)?;
     let client = TokioTcpStream::from_std(tcp_client)?;
@@ -1088,49 +837,9 @@ fn is_error_of_session_broken(error: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ServerRealityConfigFile, collect_client_hello, parse_client_hello, parse_server_short_ids, probe_server_hello,
-        select_server_hello_probe_destination,
-    };
+    use super::{ServerRealityConfigFile, parse_server_short_ids, probe_server_hello};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-
-    #[test]
-    fn malformed_client_hello_returns_error_without_panicking() {
-        let inputs = [
-            vec![22, 3, 3, 0, 4, 1, 0, 0, 0],
-            vec![22, 3, 3, 0, 39, 1, 0, 0, 35, 3, 3],
-            vec![22, 3, 3, 0, 42, 1, 0, 0, 38, 3, 3, 0, 0, 0, 0],
-        ];
-
-        for input in inputs {
-            let result = std::panic::catch_unwind(|| parse_client_hello(&input));
-            assert!(result.is_ok(), "parser panicked for malformed input");
-            assert!(result.unwrap().is_err());
-        }
-    }
-
-    #[test]
-    fn fragmented_client_hello_is_collected_and_parsed() {
-        let mut handshake = vec![1, 0, 0, 75, 3, 3];
-        handshake.extend([0u8; 32]);
-        handshake.push(32);
-        handshake.extend([0u8; 32]);
-        handshake.extend([0, 2, 0x13, 0x01, 1, 0, 0, 0]);
-
-        let split = 2;
-        let mut records = vec![22, 3, 3, 0, split as u8];
-        records.extend_from_slice(&handshake[..split]);
-        records.extend([22, 3, 3, 0, (handshake.len() - split) as u8]);
-        records.extend_from_slice(&handshake[split..]);
-
-        let collected = collect_client_hello(&records)
-            .unwrap()
-            .expect("fragmented ClientHello should be complete");
-        assert_eq!(collected.handshake, handshake);
-        assert_eq!(collected.wire, records);
-        assert!(parse_client_hello(&collected.handshake).is_ok());
-    }
 
     #[test]
     fn server_short_ids_accepts_toml_and_json_arrays() {
@@ -1166,29 +875,13 @@ mod tests {
     }
 
     #[test]
-    fn server_hello_probe_uses_allowlisted_sni() {
-        let allowed = vec!["decoy.example".to_string()];
-        assert_eq!(
-            select_server_hello_probe_destination(Some("decoy.example"), &allowed).as_deref(),
-            Some("decoy.example:443")
-        );
-    }
-
-    #[test]
-    fn server_hello_probe_requires_allowed_sni() {
-        let allowed = vec!["decoy.example".to_string()];
-        assert_eq!(select_server_hello_probe_destination(None, &allowed), None);
-        assert_eq!(select_server_hello_probe_destination(Some("attacker.example"), &allowed), None);
-    }
-
-    #[test]
     fn server_hello_probe_preserves_client_hello_wire_bytes() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let client_hello = vec![22, 3, 3, 0, 4, 1, 0, 0, 0];
         let expected_client_hello = client_hello.clone();
-        let expected_server_hello = vec![2, 0, 0, 4, 0, 0, 0, 0];
         let server_hello_record = [22, 3, 3, 0, 8, 2, 0, 0, 4, 0, 0, 0, 0];
+        let expected_server_hello = server_hello_record.to_vec();
 
         let target = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();

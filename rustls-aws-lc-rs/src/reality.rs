@@ -28,7 +28,8 @@ use rustls::crypto::{
 use rustls::crypto::{SelectedCredential, SignatureScheme};
 use rustls::error::{ApiMisuse, Error};
 use rustls::server::{
-    ClientHello, ClientHelloVerifier, RealityClientHello, ServerConfig, ServerCredentialResolver,
+    ClientHello, ClientHelloVerifier, RealityClientHello, RealityClientHelloProbe, ServerConfig,
+    ServerCredentialResolver,
 };
 use rustls::time_provider::{DefaultTimeProvider, TimeProvider};
 use rustls::{ClientConfig, RootCertStore};
@@ -612,6 +613,10 @@ impl RealityServerVerifierConfig {
 
     /// Builds a REALITY client hello verifier from this configuration.
     pub fn build_verifier(&self) -> Result<Arc<dyn ClientHelloVerifier>, Error> {
+        Ok(Arc::new(self.build_aws_lc_verifier()?))
+    }
+
+    fn build_aws_lc_verifier(&self) -> Result<AwsLcRsRealityClientHelloVerifier, Error> {
         self.validate()?;
 
         let mut fixed_short_ids = Vec::with_capacity(self.short_ids.len());
@@ -622,14 +627,14 @@ impl RealityServerVerifierConfig {
             fixed_short_ids.push(fixed_short_id);
             short_id_lens.push(short_id.len());
         }
-        Ok(Arc::new(AwsLcRsRealityClientHelloVerifier {
+        Ok(AwsLcRsRealityClientHelloVerifier {
             version: self.version,
             short_ids: fixed_short_ids,
             short_id_lens,
             server_private_key: self.server_private_key.clone(),
             time_provider: self.time_provider.clone(),
             max_time_skew: self.max_time_skew,
-        }))
+        })
     }
 
     /// Installs this REALITY configuration onto a server config.
@@ -666,7 +671,41 @@ impl AwsLcRsRealityClientHelloVerifier {
             .ok_or_else(|| {
                 Error::General("REALITY server verifier requires an X25519 key_share".into())
             })?;
-        let session_id = <[u8; 32]>::try_from(client_hello.session_id()).map_err(|_| {
+        self.verify_header_fields(
+            client_hello.client_random(),
+            client_hello.session_id(),
+            raw_client_hello,
+            client_key_share,
+        )
+    }
+
+    fn verify_probe(&self, probe: &RealityClientHelloProbe) -> Result<(), Error> {
+        if probe.session_id().len() != 32 {
+            return Err(Error::General(
+                "REALITY server verifier requires a 32-byte session_id".into(),
+            ));
+        }
+        if probe.x25519_key_share().is_empty() {
+            return Err(Error::General(
+                "REALITY server verifier requires an X25519 key_share".into(),
+            ));
+        }
+        self.verify_header_fields(
+            probe.random(),
+            probe.session_id(),
+            probe.raw_client_hello(),
+            probe.x25519_key_share(),
+        )
+    }
+
+    fn verify_header_fields(
+        &self,
+        client_random: &[u8; 32],
+        session_id: &[u8],
+        raw_client_hello: &[u8],
+        client_key_share: &[u8],
+    ) -> Result<(), Error> {
+        let session_id = <[u8; 32]>::try_from(session_id).map_err(|_| {
             Error::General("REALITY server verifier requires a 32-byte session_id".into())
         })?;
 
@@ -679,10 +718,10 @@ impl AwsLcRsRealityClientHelloVerifier {
         )
         .map_err(super::unspecified_err)?;
 
-        let sealing_key = derive_reality_auth_key(&reality_key, client_hello.client_random())?;
+        let sealing_key = derive_reality_auth_key(&reality_key, client_random)?;
 
         let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&client_hello.client_random()[20..32]);
+        nonce.copy_from_slice(&client_random[20..32]);
 
         let mut decrypted = session_id.to_vec();
         let plaintext = LessSafeKey::new(
@@ -758,6 +797,10 @@ impl AwsLcRsRealityClientHelloVerifier {
 impl ClientHelloVerifier for AwsLcRsRealityClientHelloVerifier {
     fn verify_client_hello(&self, client_hello: &RealityClientHello<'_>) -> Result<(), Error> {
         self.verify_header(client_hello)
+    }
+
+    fn verify_client_hello_probe(&self, probe: &RealityClientHelloProbe) -> Result<bool, Error> {
+        Ok(self.verify_probe(probe).is_ok())
     }
 
     fn reality_auth_key(
@@ -1676,6 +1719,53 @@ mod tests {
             .unwrap();
         let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
         do_handshake(&mut client, &mut server);
+    }
+
+    #[test]
+    fn reality_client_hello_preflight_matches_handshake_authentication() {
+        let server_private_key = agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let server_public_key = server_private_key
+            .compute_public_key()
+            .unwrap();
+        let fixed_time = Arc::new(FixedTimeProvider(UnixTime::since_unix_epoch(
+            Duration::from_secs(0x01020304),
+        )));
+        let client_config = RealitySessionIdConfig::new(
+            [1, 2, 3],
+            [0xaa, 0xbb, 0xcc],
+            server_public_key.as_ref().to_vec(),
+        )
+        .with_time_provider(fixed_time.clone())
+        .build_client_config(test_root_store())
+        .unwrap();
+        let server_config = RealityServerVerifierConfig::new(
+            [1, 2, 3],
+            [0xaa, 0xbb, 0xcc],
+            x25519_private_key_bytes(&server_private_key),
+        )
+        .with_time_provider(fixed_time);
+        let verifier = server_config.build_verifier().unwrap();
+        let client_hello = first_client_hello_bytes(client_config);
+        let probe = RealityClientHelloProbe::from_tls_records(&client_hello)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            verifier
+                .verify_client_hello_probe(&probe)
+                .unwrap()
+        );
+
+        let mut tampered_client_hello = client_hello;
+        tampered_client_hello[44] ^= 1;
+        let tampered_probe = RealityClientHelloProbe::from_tls_records(&tampered_client_hello)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !verifier
+                .verify_client_hello_probe(&tampered_probe)
+                .unwrap()
+        );
     }
 
     #[test]

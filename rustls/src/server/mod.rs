@@ -45,7 +45,7 @@ use tls13::Tls13ServerSessionValue;
 pub use config::danger;
 
 mod reality;
-pub use reality::RealityClientHello;
+pub use reality::{RealityClientHello, RealityClientHelloProbe, RealityServerHelloAction};
 
 #[cfg(test)]
 mod test;

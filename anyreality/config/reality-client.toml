@@ -2,7 +2,7 @@
 shortId = "aabbcc"
 publicKey = "h72QTtr2UAYmGeblfKYIUsN3q4kOJQZPxq556g6eIhg"
 version = "010203"
-serverName = "test"
+serverName = "example.com"
 # clientHelloProfile = "chrome" # chrome, firefox, safari, or default
 
 [anytls]

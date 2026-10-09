@@ -9,7 +9,7 @@ use pki_types::PrivateKeyDer;
 use pki_types::{DnsName, FipsStatus, UnixTime};
 
 use super::hs::ClientHelloInput;
-use super::reality::RealityClientHello;
+use super::reality::{RealityClientHello, RealityClientHelloProbe};
 use super::{ServerSessionKey, handy};
 use crate::builder::{ConfigBuilder, WantsVerifier};
 #[cfg(doc)]
@@ -315,6 +315,15 @@ impl ServerConfig {
 pub trait ClientHelloVerifier: Debug + Send + Sync + Any {
     /// Reject the handshake by returning an error.
     fn verify_client_hello(&self, client_hello: &RealityClientHello<'_>) -> Result<(), Error>;
+
+    /// Checks REALITY authentication before a `ServerConnection` is created.
+    ///
+    /// This lets a server select the protocol's REALITY or fallback path after
+    /// reading the ClientHello. Implementations that do not support preflight
+    /// verification return `Ok(false)`.
+    fn verify_client_hello_probe(&self, _probe: &RealityClientHelloProbe) -> Result<bool, Error> {
+        Ok(false)
+    }
 
     /// Return the AuthKey for a successfully verified REALITY ClientHello.
     ///
