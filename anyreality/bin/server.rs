@@ -285,7 +285,7 @@ async fn handle_connection(
 
     // 1) REALITY blocking handshake on a worker thread.
     let tls = tokio::task::spawn_blocking(move || -> Result<StreamOwned<ServerConnection, std::net::TcpStream>> {
-        let mut sock = std_stream;
+        let sock = std_stream;
         sock.set_nonblocking(false)?;
         sock.set_read_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
         sock.set_write_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
@@ -294,10 +294,18 @@ async fn handle_connection(
             conn.set_reality_server_hello_template(&template)
                 .context("install SNI target ServerHello template")?;
         }
-        while conn.is_handshaking() {
-            complete_io(&mut sock, &mut conn).context("complete REALITY handshake")?;
+        let mut tls = StreamOwned::new(conn, sock, Vec::new());
+        while tls.conn.is_handshaking() {
+            complete_io(
+                &mut tls.sock,
+                &mut tls.input,
+                &mut tls.received_plaintext,
+                &mut tls.output,
+                &mut tls.conn,
+            )
+            .context("complete REALITY handshake")?;
         }
-        Ok(StreamOwned::new(conn, sock))
+        Ok(tls)
     })
     .await??;
 

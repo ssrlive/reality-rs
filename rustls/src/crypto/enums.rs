@@ -23,19 +23,19 @@ enum_builder! {
         TLS_DHE_PSK_WITH_AES_256_GCM_SHA384 => 0x00ab,
 
         /// The `TLS_AES_128_GCM_SHA256` cipher suite.  Recommended=Y.  Defined in
-        /// <https://www.iana.org/go/rfc8446>
+        /// <https://www.iana.org/go/rfc9846>
         TLS13_AES_128_GCM_SHA256 => 0x1301,
 
         /// The `TLS_AES_256_GCM_SHA384` cipher suite.  Recommended=Y.  Defined in
-        /// <https://www.iana.org/go/rfc8446>
+        /// <https://www.iana.org/go/rfc9846>
         TLS13_AES_256_GCM_SHA384 => 0x1302,
 
         /// The `TLS_CHACHA20_POLY1305_SHA256` cipher suite.  Recommended=Y.  Defined in
-        /// <https://www.iana.org/go/rfc8446>
+        /// <https://www.iana.org/go/rfc9846>
         TLS13_CHACHA20_POLY1305_SHA256 => 0x1303,
 
         /// The `TLS_AES_128_CCM_SHA256` cipher suite.  Recommended=Y.  Defined in
-        /// <https://www.iana.org/go/rfc8446>
+        /// <https://www.iana.org/go/rfc9846>
         TLS13_AES_128_CCM_SHA256 => 0x1304,
 
         /// The `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` cipher suite.  Recommended=Y.  Defined in
@@ -219,7 +219,7 @@ enum_builder! {
         TLS_EMPTY_RENEGOTIATION_INFO_SCSV => 0x00ff,
 
         /// The `TLS_AES_128_CCM_8_SHA256` cipher suite.  Recommended=N.  Defined in
-        /// <https://www.iana.org/go/rfc8446>
+        /// <https://www.iana.org/go/rfc9846>
         TLS13_AES_128_CCM_8_SHA256 => 0x1305,
 
         /// The `TLS_FALLBACK_SCSV` cipher suite.  Recommended=N.  Defined in
@@ -389,7 +389,7 @@ enum_builder! {
 }
 
 impl SignatureScheme {
-    pub(crate) fn algorithm(&self) -> SignatureAlgorithm {
+    pub(crate) fn algorithm(&self) -> Option<SignatureAlgorithm> {
         match *self {
             Self::RSA_PKCS1_SHA1
             | Self::RSA_PKCS1_SHA256
@@ -397,14 +397,14 @@ impl SignatureScheme {
             | Self::RSA_PKCS1_SHA512
             | Self::RSA_PSS_SHA256
             | Self::RSA_PSS_SHA384
-            | Self::RSA_PSS_SHA512 => SignatureAlgorithm::RSA,
+            | Self::RSA_PSS_SHA512 => Some(SignatureAlgorithm::RSA),
             Self::ECDSA_SHA1_Legacy
             | Self::ECDSA_NISTP256_SHA256
             | Self::ECDSA_NISTP384_SHA384
-            | Self::ECDSA_NISTP521_SHA512 => SignatureAlgorithm::ECDSA,
-            Self::ED25519 => SignatureAlgorithm::ED25519,
-            Self::ED448 => SignatureAlgorithm::ED448,
-            _ => SignatureAlgorithm(0),
+            | Self::ECDSA_NISTP521_SHA512 => Some(SignatureAlgorithm::ECDSA),
+            Self::ED25519 => Some(SignatureAlgorithm::ED25519),
+            Self::ED448 => Some(SignatureAlgorithm::ED448),
+            _ => None,
         }
     }
 
@@ -414,7 +414,7 @@ impl SignatureScheme {
     /// This prevents (eg) RSA_PKCS1_SHA256 being offered or accepted, even if our
     /// verifier supports it for other protocol versions.
     ///
-    /// See RFC8446 s4.2.3: <https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.3>
+    /// See RFC 9846 s4.3.3: <https://datatracker.ietf.org/doc/html/rfc9846#section-4.3.3>
     ///
     /// This is a denylist so that newly-allocated `SignatureScheme`s values are
     /// allowed in TLS1.3 by default.
@@ -424,7 +424,7 @@ impl SignatureScheme {
         // This covers both disallowing SHA1 items in `SignatureScheme`, and
         // old hash functions.  See the section beginning "Legacy algorithms:"
         // and item starting "In TLS 1.2, the extension contained hash/signature
-        // pairs" in RFC8446 section 4.2.3.
+        // pairs" in RFC 9846 section 4.3.3.
         match HashAlgorithm::from(hash) {
             HashAlgorithm::NONE
             | HashAlgorithm::MD5
@@ -434,7 +434,7 @@ impl SignatureScheme {
         };
 
         // RSA-PKCS1 is also disallowed for TLS1.3, see the section beginning
-        // "RSASSA-PKCS1-v1_5 algorithms:" in RFC8446 section 4.2.3.
+        // "RSASSA-PKCS1-v1_5 algorithms:" in RFC 9846 section 4.3.3.
         //
         // (nb. SignatureAlgorithm::RSA is RSA-PKCS1, and does not cover RSA-PSS
         // or RSAE-PSS.)

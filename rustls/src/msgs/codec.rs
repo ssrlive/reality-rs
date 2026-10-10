@@ -214,12 +214,12 @@ impl TlsListElement for SubjectPublicKeyInfoDer<'_> {
 ///
 /// All uses _MUST_ exhaust the iterator, as errors may be delayed
 /// until the last element.
-pub(crate) struct TlsListIter<'a, T: Codec<'a> + TlsListElement + Debug> {
+pub(crate) struct TlsListIter<'a, T: Codec<'a> + TlsListElement> {
     sub: Reader<'a>,
     _t: PhantomData<T>,
 }
 
-impl<'a, T: Codec<'a> + TlsListElement + Debug> TlsListIter<'a, T> {
+impl<'a, T: Codec<'a> + TlsListElement> TlsListIter<'a, T> {
     pub(crate) fn new(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
         let len = T::SIZE_LEN.read(r)?;
         let sub = r.sub(len)?;
@@ -230,7 +230,7 @@ impl<'a, T: Codec<'a> + TlsListElement + Debug> TlsListIter<'a, T> {
     }
 }
 
-impl<'a, T: Codec<'a> + TlsListElement + Debug> Iterator for TlsListIter<'a, T> {
+impl<'a, T: Codec<'a> + TlsListElement> Iterator for TlsListIter<'a, T> {
     type Item = Result<T, InvalidMessage>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -274,7 +274,7 @@ impl<'a> LengthPrefixedBuffer<'a> {
     /// Inserts a dummy length into `buf`, and remembers where it went.
     ///
     /// After this, the body of the length-delimited structure should be appended to `LengthPrefixedBuffer::buf`.
-    /// The length header is corrected in `LengthPrefixedBuffer::drop`.
+    /// The length header is corrected in [`LengthPrefixedBuffer::drop`].
     pub(crate) fn new(size_len: ListLength, buf: &'a mut Vec<u8>) -> Self {
         let len_offset = buf.len();
         buf.extend(match size_len {
@@ -406,20 +406,20 @@ impl Codec<'_> for () {
     fn encode(&self, _: &mut Vec<u8>) {}
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
-        r.expect_empty("Empty")
+        r.all("Empty", |_| Ok(()))
     }
 }
 
 /// Trait for implementing encoding and decoding functionality
 /// on something.
-pub(crate) trait Codec<'a>: Debug + Sized {
+pub(crate) trait Codec<'a>: Sized {
     /// Function for encoding itself by appending itself to
     /// the provided vec of bytes.
     fn encode(&self, bytes: &mut Vec<u8>);
 
     /// Function for decoding itself from the provided reader
-    /// will return Some if the decoding was successful or
-    /// None if it was not.
+    /// will return `Ok` if the decoding was successful or
+    /// `Err(InvalidMessage)` if it was not.
     fn read(_: &mut Reader<'a>) -> Result<Self, InvalidMessage>;
 
     /// Convenience function for encoding the implementation
@@ -433,14 +433,10 @@ pub(crate) trait Codec<'a>: Debug + Sized {
     /// Function for wrapping a call to the read function in
     /// a Reader for the slice of bytes provided
     ///
-    /// Returns `Err(InvalidMessage::ExcessData(_))` if
-    /// `Self::read` does not read the entirety of `bytes`.
+    /// Returns `Err(InvalidMessage::TrailingData(_))` if
+    /// [`Self::read()`] does not read the entirety of `bytes`.
     fn read_bytes(bytes: &'a [u8]) -> Result<Self, InvalidMessage> {
-        let mut reader = Reader::new(bytes);
-        Self::read(&mut reader).and_then(|r| {
-            reader.expect_empty("read_bytes")?;
-            Ok(r)
-        })
+        Reader::new(bytes).all("read_bytes", Self::read)
     }
 }
 
@@ -456,14 +452,27 @@ pub(crate) struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    /// Creates a new Reader of the provided `bytes` slice.
+    /// Creates a new Reader of the provided `buffer` slice.
     pub(crate) fn new(buffer: &'a [u8]) -> Self {
         Self { buffer }
     }
 
+    /// Reads all of `buffer` into a type of `T`, checking for trailing data.
+    pub(crate) fn all<T, E: From<InvalidMessage>, F: FnOnce(&mut Self) -> Result<T, E>>(
+        &mut self,
+        type_name: &'static str,
+        f: F,
+    ) -> Result<T, E> {
+        let value = f(self)?;
+        match self.any_left() {
+            true => Err(InvalidMessage::TrailingData(type_name).into()),
+            false => Ok(value),
+        }
+    }
+
     /// Attempts to create a new Reader on a sub section of this
     /// readers bytes by taking a slice of the provided `length`
-    /// will return None if there is not enough bytes
+    /// will return `Err(InvalidMessage::MessageTooShort)` if there is not enough bytes
     pub(crate) fn sub(&mut self, length: usize) -> Result<Self, InvalidMessage> {
         match self.take(length) {
             Some(bytes) => Ok(Reader::new(bytes)),
@@ -473,7 +482,7 @@ impl<'a> Reader<'a> {
 
     /// Borrow an array of `N` bytes from the buffer.
     ///
-    /// If there are not enough bytes remaining to take the length `None` is returned instead
+    /// If there are not enough bytes remaining `Err(InvalidMessage::MissingData)` is returned instead
     pub(crate) fn take_array<const N: usize>(
         &mut self,
         ty: &'static str,
@@ -501,13 +510,6 @@ impl<'a> Reader<'a> {
     /// Moves the cursor to the end of the buffer length.
     pub(crate) fn rest(&mut self) -> &'a [u8] {
         mem::take(&mut self.buffer)
-    }
-
-    pub(crate) fn expect_empty(&self, name: &'static str) -> Result<(), InvalidMessage> {
-        match self.any_left() {
-            true => Err(InvalidMessage::TrailingData(name)),
-            false => Ok(()),
-        }
     }
 
     /// Whether the reader has any content left.

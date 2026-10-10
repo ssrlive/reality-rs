@@ -16,8 +16,8 @@ use std::io::{Read, Write, stdout};
 use std::net::TcpStream;
 use std::sync::Arc;
 
-use rustls::{ClientConfig, RootCertStore};
-use rustls_util::{KeyLogFile, Stream};
+use rustls::{ClientConfig, RootCertStore, VecInput};
+use rustls_util::Stream;
 
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -50,18 +50,30 @@ fn main() {
 
     let mut config = build_client_config(&args, root_store);
 
-    // Allow using SSLKEYLOGFILE.
-    config.key_log = Arc::new(KeyLogFile::new());
+    // Allow using SSLKEYLOGFILE in debug builds.
+    #[cfg(debug_assertions)]
+    {
+        config.key_log = Arc::new(rustls_util::KeyLogFile::new());
+    }
 
     let server_name = rustls::pki_types::ServerName::try_from(args.host.as_str())
         .unwrap()
         .to_owned();
+    let mut output = Vec::new();
     let mut conn = Arc::new(config)
         .connect(server_name)
-        .build()
+        .build(&mut output)
         .unwrap();
     let mut sock = TcpStream::connect((args.host.as_str(), args.port)).unwrap();
-    let mut tls = Stream::new(&mut conn, &mut sock);
+    let mut input = VecInput::default();
+    let mut received_plaintext = Vec::new();
+    let mut tls = Stream::new(
+        &mut input,
+        &mut received_plaintext,
+        &mut output,
+        &mut conn,
+        &mut sock,
+    );
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept-Encoding: identity\r\n\r\n",
         args.path, args.host

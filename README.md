@@ -58,10 +58,10 @@ Rustls is used in production at many organizations and projects. We aim to maint
 reasonable API surface stability but the API may evolve as we make changes to accommodate
 new features or performance improvements.
 
-We have a [roadmap](ROADMAP.md) for our future plans. We also have [benchmarks](BENCHMARKING.md) to
+We have a [roadmap](https://github.com/rustls/rustls/blob/main/ROADMAP.md) for our future plans. We also have [benchmarks](https://github.com/rustls/rustls/blob/main/BENCHMARKING.md) to
 prevent performance regressions and to let you evaluate rustls on your target hardware.
 
-If you'd like to help out, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+If you'd like to help out, please see [CONTRIBUTING.md](https://github.com/rustls/rustls/blob/main/CONTRIBUTING.md).
 
 [![Build Status](https://github.com/rustls/rustls/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/rustls/rustls/actions/workflows/build.yml?query=branch%3Amain)
 [![Coverage Status (codecov.io)](https://codecov.io/gh/rustls/rustls/branch/main/graph/badge.svg)](https://codecov.io/gh/rustls/rustls/)
@@ -194,50 +194,41 @@ diving in to the more complex MIO examples.
 
 ## Client example program
 
-The MIO client example program is named `tlsclient-mio`.
+The MIO client example program is named `tls-client-mio`.
 
 Some sample runs:
 
 ```
-$ cargo run --bin tlsclient-mio -- --http mozilla-modern.badssl.com
+$ cargo run --bin tls-client-mio -- --http jbp.io
 HTTP/1.1 200 OK
-Server: nginx/1.6.2 (Ubuntu)
-Date: Wed, 01 Jun 2016 18:44:00 GMT
-Content-Type: text/html
-Content-Length: 644
+Date: Tue, 23 Jun 2026 16:13:40 GMT
+Content-Type: text/html; charset=utf-8
+Connection: close
 (...)
 ```
 
-or
-
-```
-$ cargo run --bin tlsclient-mio -- --http expired.badssl.com
-TLS error: InvalidCertificate(Expired)
-Connection closed
-```
-
-Run `cargo run --bin tlsclient-mio -- --help` for more options.
+Run `cargo run --bin tls-client-mio -- --help` for more options.
 
 ## Server example program
 
-The MIO server example program is named `tlsserver-mio`.
+The MIO server example program is named `tls-server-mio`.
 
 Here's a sample run; we start a TLS echo server, then connect to it with
-`openssl` and `tlsclient-mio`:
+`openssl` and `tls-client-mio`:
 
 ```
-$ cargo run --bin tlsserver-mio -- --certs test-ca/rsa-2048/end.fullchain --key test-ca/rsa-2048/end.key -p 8443 echo &
+$ cargo run --bin tls-server-mio -- --certs test-ca/rsa-2048/end.fullchain --key test-ca/rsa-2048/end.key -p 8443 echo &
 $ echo hello world | openssl s_client -ign_eof -quiet -connect localhost:8443
 depth=2 CN = ponytown RSA CA
 verify error:num=19:self signed certificate in certificate chain
 hello world
 ^C
-$ echo hello world | cargo run --bin tlsclient-mio -- --cafile test-ca/rsa-2048/ca.cert --port 8443 localhost
+$ echo hello world | cargo run --bin tls-client-mio -- --cafile test-ca/rsa-2048/ca.cert --port 8443 localhost
 hello world
 ^C
 ```
 
-Run `cargo run --bin tlsserver-mio -- --help` for more options.
+Run `cargo run --bin tls-server-mio -- --help` for more options.
 
 # License
 

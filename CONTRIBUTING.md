@@ -20,6 +20,32 @@ information.
 
 [SECURITY.md]: SECURITY.md
 
+## AI policy
+
+Using AI (LLMs) as tools for coding is welcome. A high bar is held for all contributions to this
+project. Moreover, the project maintainers remain responsible for any code that is published as
+part of a release. Contributors are expected to be responsible for any code they publish.
+
+AI should not be used to generate comments when communicating with maintainers. Comments are
+expected to be written by humans. Comments that are believed to be written by AI may be hidden
+without notice.
+
+If you are opening an issue, you should be able to describe the problem in your own words.
+
+If you are opening a pull request, you are expected to be able to explain the proposed changes in
+your own words. This includes the pull request body and responses to questions. Make sure you have
+reviewed the PR yourself before submitting it for review to the maintainers. Do not copy responses
+from the AI when replying to questions from maintainers.
+
+If you wish to include context from an interaction with AI in your comments, it must be in a
+quote block (using `>`) and disclosed as such. It must be accompanied by human commentary
+explaining the relevance and implications of the context. Do not share long snippets.
+
+AI is useful when communicating as a non-native English speaker. If you are using AI to edit your
+comments for this purpose, please take the time to ensure it reflects your own voice and ideas.
+When using AI for translation, we recommend writing in your native language and including the AI
+translation in a quote block.
+
 ## Code changes
 
 Some ideas and guidelines for contributions:
@@ -28,12 +54,21 @@ Some ideas and guidelines for contributions:
   This means everyone can see what is in progress prior to a PR.
 - Feel free to submit a PR even if the work is not totally finished,
   for feedback or to hand-over.
-- Prefer not to reference github issue or PR numbers in commits.
 - Try to keep code formatting commits separate from functional commits.
 - See [`.github/workflows/build.yml`](.github/workflows/build.yml) for
   how to run the various test suites, and how to make coverage measurements.
 - I run `cargo outdated` prior to major releases; but PRs to update specific
   dependencies are welcome.
+
+## Crate features
+
+Enabling a Cargo feature must not change rustls' default behavior. Cargo unifies enabled features
+across the entire dependency graph, so a library using rustls cannot control whether another
+library or the application enabled a feature.
+
+A feature may expose additional APIs for opt-in functionality, but that functionality must be
+enabled through those APIs by the application. For example, a feature must not automatically
+enable key logging or select a set of trust anchors.
 
 ## Commit history
 
@@ -45,6 +80,20 @@ that do one thing. In particular:
 * Isolate updates to `Cargo.lock` in their own commits
 
 Our default workflow is to rebase clean commit history from a PR to `main`.
+
+## Commit messages
+
+We aim to wrap all commit message text (title/subject and body) so it is no more
+than 72 characters long.
+
+We do not use the "conventional commit" style. Don't prefix commits with
+"chore:", "fix:", and so forth.
+
+Commit messages should be relatively short, and aim to capture context that
+isn't self-evident from the code.
+
+Prefer **not** to reference github issue or PR numbers in commits, as doing so
+creates excessive linkages and notifications.
 
 ## Security bugs
 
@@ -350,6 +399,18 @@ expect every user will need. The canonical example of such types are
 is rare and most new types should be exported only from the module in which they
 are defined.
 
+### Comments
+
+Crate items should have descriptive doccomments on them. These are required for
+any publicly exposed items.
+
+All comments (doccomment or not) should be wrapped to 100 columns.
+
+In addition to the conventions above, all doccomments should conform to
+[Appendix A of Rust RFC 1574][1574-A].
+
+[1574-A]: https://rust-lang.github.io/rfcs/1574-more-api-documentation-conventions.html#appendix-a-full-conventions-text
+
 ### Misc
 
 #### Numeric literals
@@ -451,8 +512,8 @@ enough to have an impact on the size of a final program.
 ### Small mandatory API
 
 We should try to keep the API for achieving the most common goals
-as simple as possible.  Good models for this are `simpleclient` and
-`simpleserver`.  The purpose of this is to allow people interacting
+as simple as possible.  Good models for this are `simple-client` and
+`simple-server`.  The purpose of this is to allow people interacting
 with the library for the first time to make progress.
 
 ### Safe and sensible defaults

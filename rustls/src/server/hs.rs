@@ -1,4 +1,4 @@
-use alloc::borrow::ToOwned;
+use alloc::borrow::{Cow, ToOwned};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::borrow::Borrow;
@@ -8,10 +8,11 @@ use pki_types::DnsName;
 
 use super::config::{CipherSuiteSelector, VersionSuiteSelector};
 use super::reality::RealityClientHello;
-use super::{ClientHello, CommonServerSessionValue, ServerConfig, tls12, tls13};
+use super::{ClientHello, CommonServerSessionValue, ServerConfig};
 use crate::SupportedCipherSuite;
 use crate::common_state::{Event, Output, OutputEvent, Protocol};
-use crate::conn::{ConnectionRandoms, Input};
+use crate::conn::{ConnectionRandoms, Input, State, VerifySidePeerIdentity};
+use crate::crypto::cipher::Payload;
 use crate::crypto::hash::Hash;
 use crate::crypto::kx::{KeyExchangeAlgorithm, NamedGroup, SupportedKxGroup};
 use crate::crypto::{CipherSuite, CryptoProvider, SelectedCredential, SignatureScheme};
@@ -19,18 +20,19 @@ use crate::enums::{ApplicationProtocol, CertificateType, HandshakeType, Protocol
 use crate::error::{ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
 use crate::kernel::KernelState;
-use crate::log::{debug, trace};
 use crate::msgs::{
-    ClientHelloPayload, Compression, HandshakeAlignedProof, HandshakePayload, Message,
-    MessagePayload, Random, ServerExtensions, ServerExtensionsInput, ServerNamePayload, SessionId,
-    SingleProtocolName, TransportParameters,
+    ClientHelloPayload, Compression, EncryptedExtensions, HandshakeAlignedProof,
+    HandshakeMessagePayload, HandshakePayload, Message, MessagePayload, Random, ServerExtensions,
+    ServerExtensionsInput, ServerNamePayload, SessionId, SingleProtocolName, TransportParameters,
 };
 use crate::sealed::Sealed;
+use crate::server::ServerSide;
 use crate::suites::{PartiallyExtractedSecrets, Suite};
 use crate::sync::Arc;
 use crate::tls12::Tls12CipherSuite;
 use crate::tls13::Tls13CipherSuite;
 use crate::tls13::key_schedule::KeyScheduleTrafficSend;
+use crate::tracing::{debug, trace};
 
 pub(crate) enum ServerState {
     /// Reading an entire ClientHello
@@ -44,8 +46,12 @@ pub(crate) enum ServerState {
 
     /// Processing the received ClientHello.
     ClientHello(Box<ExpectClientHello>),
-    Tls12(tls12::Tls12State),
-    Tls13(tls13::Tls13State),
+
+    /// Verifying the client's present certificate chain.
+    VerifyClientIdentity(Box<dyn VerifySidePeerIdentity<ServerSide>>),
+
+    Tls12(Box<dyn State<ServerSide>>),
+    Tls13(Box<dyn State<ServerSide>>),
 }
 
 impl ServerState {
@@ -63,8 +69,8 @@ impl crate::conn::StateMachine for ServerState {
     fn handle<'m>(self, input: Input<'m>, output: &mut dyn Output<'m>) -> Result<Self, Error> {
         match self {
             Self::ReadClientHello(r) => r.handle(input, output),
-            Self::ChooseConfig(_) => {
-                Err(Error::Unreachable("ChooseConfig cannot process a message"))
+            Self::ChooseConfig(_) | Self::VerifyClientIdentity(_) => {
+                Err(Error::Unreachable("state cannot process a message"))
             }
             Self::ClientHello(e) => e.handle(input, output),
             Self::Tls12(sm) => sm.handle(input, output),
@@ -73,18 +79,38 @@ impl crate::conn::StateMachine for ServerState {
     }
 
     fn wants_input(&self) -> bool {
-        !matches!(self, Self::ChooseConfig(_))
+        !matches!(self, Self::ChooseConfig(_) | Self::VerifyClientIdentity(_))
     }
 
-    fn handle_decrypt_error(&mut self) {}
+    fn handle_without_input(self, output: &mut dyn Output<'_>) -> Result<Self, Error> {
+        match self {
+            Self::VerifyClientIdentity(vci) => {
+                let verified = vci.verify_with_config()?;
+                vci.continue_with(verified, output)
+            }
+            _ => Ok(self),
+        }
+    }
+
+    fn is_traffic(&self) -> bool {
+        match self {
+            Self::Tls12(sm) | Self::Tls13(sm) => sm.is_traffic(),
+            _ => false,
+        }
+    }
+
+    fn handle_decrypt_error(&mut self) {
+        if let Self::Tls12(sm) | Self::Tls13(sm) = self {
+            sm.handle_decrypt_error();
+        }
+    }
 
     fn into_external_state(
         self,
         send_keys: &Option<Box<KeyScheduleTrafficSend>>,
     ) -> Result<(PartiallyExtractedSecrets, Box<dyn KernelState + 'static>), Error> {
         match self {
-            Self::Tls13(tls13::Tls13State::Traffic(e)) => e.into_external_state(send_keys),
-            Self::Tls12(tls12::Tls12State::Traffic(e)) => e.into_external_state(send_keys),
+            Self::Tls12(sm) | Self::Tls13(sm) => sm.into_external_state(send_keys),
             _ => Err(Error::HandshakeNotComplete),
         }
     }
@@ -106,11 +132,30 @@ impl Tls12Extensions {
         config: &ServerConfig,
     ) -> Result<(Self, Box<ServerExtensions<'static>>), Error> {
         let ep = ExtensionProcessing::new(hello, config);
-        let (alpn_protocol, mut extensions) =
+        let (alpn_protocol, common) =
             ep.process_common(extra_exts, output, ocsp_response, resumedata)?;
+
+        let mut extensions = Box::new(ServerExtensions {
+            server_name_ack: common.server_name_ack,
+            selected_protocol: common.selected_protocol,
+            transport_parameters: common.transport_parameters,
+            ..ServerExtensions::default()
+        });
 
         // Renegotiation.
         // (We don't do reneg at all, but would support the secure version if we did.)
+        //
+        // RFC 5746 section 3.6: `renegotiated_connection` must be empty in an
+        // initial handshake.  A non-empty value means the client believes it is
+        // renegotiating an existing connection.
+        if hello
+            .renegotiation_info
+            .as_ref()
+            .is_some_and(|info| !info.is_empty())
+        {
+            return Err(PeerMisbehaved::NonEmptyRenegotiationInfo.into());
+        }
+
         if hello.renegotiation_info.is_some()
             || hello
                 .cipher_suites
@@ -131,7 +176,7 @@ impl Tls12Extensions {
 
         // Confirm use of EMS if offered.
         if using_ems {
-            extensions.extended_master_secret_ack = Some(());
+            extensions.extended_main_secret_ack = Some(());
         }
 
         // Send confirmation of OCSP staple request if we will send one.
@@ -161,10 +206,17 @@ impl Tls13Extensions {
         hello: &ClientHelloPayload,
         output: &mut dyn Output<'_>,
         config: &ServerConfig,
-    ) -> Result<(Self, Box<ServerExtensions<'static>>), Error> {
+    ) -> Result<(Self, Box<EncryptedExtensions<'static>>), Error> {
         let ep = ExtensionProcessing::new(hello, config);
-        let (alpn_protocol, mut extensions) =
+        let (alpn_protocol, common) =
             ep.process_common(extra_exts, output, ocsp_response, resumedata)?;
+
+        let mut extensions = Box::new(EncryptedExtensions {
+            server_name_ack: common.server_name_ack,
+            selected_protocol: common.selected_protocol,
+            transport_parameters: common.transport_parameters,
+            ..EncryptedExtensions::default()
+        });
 
         let expected_client_type = select_cert_type(
             hello
@@ -221,15 +273,9 @@ impl<'a> ExtensionProcessing<'a> {
         output: &mut dyn Output<'_>,
         ocsp_response: &mut Option<&[u8]>,
         resumedata: Option<&CommonServerSessionValue<'_>>,
-    ) -> Result<
-        (
-            Option<ApplicationProtocol<'static>>,
-            Box<ServerExtensions<'static>>,
-        ),
-        Error,
-    > {
+    ) -> Result<(Option<ApplicationProtocol<'static>>, CommonExtensions), Error> {
         let Self { config, hello } = self;
-        let mut extensions = Box::new(ServerExtensions::default());
+        let mut extensions = CommonExtensions::default();
 
         let ServerExtensionsInput {
             transport_parameters,
@@ -303,6 +349,17 @@ impl<'a> ExtensionProcessing<'a> {
 
         Ok((chosen_protocol.map(|p| p.to_owned()), extensions))
     }
+}
+
+/// Extension values common to both TLS 1.2 ServerHello & TLS 1.3 EncryptedExtensions.
+///
+/// These are negotiated identically for both protocols prior to placement in the
+/// right message.
+#[derive(Default)]
+struct CommonExtensions {
+    server_name_ack: Option<()>,
+    selected_protocol: Option<SingleProtocolName>,
+    transport_parameters: Option<Payload<'static>>,
 }
 
 fn select_cert_type(
@@ -407,14 +464,22 @@ impl ChooseConfig {
             .with_input(ClientHelloInput::from_input(&self.client_hello)?, output)
     }
 
-    pub(crate) fn client_hello(&self) -> &ClientHelloPayload {
-        match &self.client_hello.message.payload {
-            MessagePayload::Handshake { parsed, .. } => match &parsed.0 {
-                HandshakePayload::ClientHello(ch) => ch,
-                _ => unreachable!(),
-            },
-            _ => unreachable!(),
-        }
+    pub(crate) fn client_hello(&self) -> ClientHello<'_> {
+        let MessagePayload::Handshake {
+            parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(client_hello)),
+            ..
+        } = &self.client_hello.message.payload
+        else {
+            unreachable!();
+        };
+
+        let server_name = client_hello
+            .server_name
+            .as_ref()
+            .and_then(ServerNamePayload::to_dns_name_normalized)
+            .map(Cow::Owned);
+
+        ClientHello::new(client_hello, None, server_name, None, None)
     }
 
     fn set_resumption_data(&mut self, resumption_data: &[u8]) -> Result<(), Error> {
@@ -438,7 +503,7 @@ pub(crate) struct ExpectClientHello {
     pub(super) sni: Option<DnsName<'static>>,
     pub(super) resumption_data: Vec<u8>,
     pub(super) using_ems: bool,
-    pub(super) done_retry: bool,
+    pub(super) previous_hello: Option<PreviousClientHello>,
     pub(super) send_tickets: usize,
     pub(super) reality_server_hello_template: Option<Vec<u8>>,
 }
@@ -465,7 +530,7 @@ impl ExpectClientHello {
             sni: None,
             resumption_data,
             using_ems: false,
-            done_retry: false,
+            previous_hello: None,
             send_tickets: 0,
             reality_server_hello_template: None,
         }
@@ -479,10 +544,11 @@ impl ExpectClientHello {
     ) -> Result<ServerState, Error> {
         let tls13_enabled = self
             .config
-            .supports_version(ProtocolVersion::TLSv1_3);
+            .supports_version(ProtocolVersion::TLSv1_3, self.protocol);
         let tls12_enabled = self
             .config
-            .supports_version(ProtocolVersion::TLSv1_2);
+            .supports_version(ProtocolVersion::TLSv1_2, self.protocol)
+            && !self.previous_hello.is_some();
 
         // Are we doing TLS1.3?
         if let Some(versions) = &input.client_hello.supported_versions {
@@ -498,10 +564,10 @@ impl ExpectClientHello {
         } else if u16::from(input.client_hello.client_version) < u16::from(ProtocolVersion::TLSv1_2)
         {
             Err(PeerIncompatible::Tls12NotOffered.into())
-        } else if !tls12_enabled && tls13_enabled {
-            Err(PeerIncompatible::SupportedVersionsExtensionRequired.into())
         } else if self.protocol.is_quic() {
             Err(PeerIncompatible::Tls13RequiredForQuic.into())
+        } else if !tls12_enabled && tls13_enabled {
+            Err(PeerIncompatible::SupportedVersionsExtensionRequired.into())
         } else {
             self.with_version::<Tls12CipherSuite>(input, output)
         }
@@ -533,7 +599,7 @@ impl ExpectClientHello {
             None
         };
 
-        if self.done_retry {
+        if self.previous_hello.is_some() {
             let ch_sni = input
                 .client_hello
                 .server_name
@@ -560,7 +626,7 @@ impl ExpectClientHello {
             })
             .collect::<Vec<_>>();
 
-        let mut sig_schemes = input.sig_schemes.clone();
+        let mut sig_schemes = input.sig_schemes.to_owned();
         if T::VERSION == ProtocolVersion::TLSv1_2 {
             sig_schemes.retain(|scheme| {
                 client_suites
@@ -576,10 +642,10 @@ impl ExpectClientHello {
             .config
             .cert_resolver
             .resolve(&ClientHello::new(
-                &input,
-                &sig_schemes,
-                sni.as_ref(),
-                T::VERSION,
+                input.client_hello,
+                Some(&sig_schemes),
+                sni.as_ref().map(Cow::Borrowed),
+                Some(T::VERSION),
                 reality_auth_key,
             ))?;
         self.finish_client_hello(input, output, sni, credentials)
@@ -610,6 +676,18 @@ impl ExpectClientHello {
                 .unwrap_or_default(),
             &input.client_hello.cipher_suites,
         )?;
+
+        // RFC 9846 section 4.2.4: the server must negotiate the same cipher suite it
+        // named in its HelloRetryRequest
+        if let Some(PreviousClientHello {
+            suite: before_retry,
+            ..
+        }) = self.previous_hello
+        {
+            if before_retry != suite.suite() {
+                return Err(PeerMisbehaved::CipherSuiteDifferedOnRetry.into());
+            }
+        }
 
         debug!("decided upon suite {suite:?}");
         output.output(OutputEvent::CipherSuite(suite.into()));
@@ -693,6 +771,8 @@ impl ExpectClientHello {
 
                 // Reduce our supported ciphersuites by the certified key's algorithm.
                 (suite.usable_for_signature_scheme(sig_scheme)
+                // And usable by the current protocol
+                && suite.usable_for_protocol(self.protocol)
                 // And support for one of the key exchange groups
                 && (ecdhe_possible && suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::ECDHE)
                 || ffdhe_possible && suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::DHE)))
@@ -765,6 +845,11 @@ impl From<Box<ExpectClientHello>> for ServerState {
     }
 }
 
+pub(crate) struct PreviousClientHello {
+    pub(super) offered_psk: bool,
+    pub(super) suite: CipherSuite,
+}
+
 pub(crate) trait ServerHandler<T>: fmt::Debug + Sealed + Send + Sync {
     fn handle_client_hello(
         &self,
@@ -780,7 +865,7 @@ pub(crate) trait ServerHandler<T>: fmt::Debug + Sealed + Send + Sync {
 pub(crate) struct ClientHelloInput<'a> {
     pub(super) message: &'a Message<'a>,
     pub(super) client_hello: &'a ClientHelloPayload,
-    pub(super) sig_schemes: &'a Vec<SignatureScheme>,
+    pub(super) sig_schemes: &'a [SignatureScheme],
     pub(super) proof: HandshakeAlignedProof,
 }
 
@@ -812,7 +897,7 @@ impl<'a> ClientHelloInput<'a> {
 
         let sig_schemes = client_hello
             .signature_schemes
-            .as_ref()
+            .as_deref()
             .ok_or(PeerIncompatible::SignatureAlgorithmsExtensionRequired)?;
 
         Ok(ClientHelloInput {

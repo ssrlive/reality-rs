@@ -1,5 +1,6 @@
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use std::{error, vec};
 
 use pki_types::UnixTime;
@@ -7,54 +8,40 @@ use pki_types::UnixTime;
 use super::hs::ClientHelloInput;
 use super::{
     ClientHelloVerifier, CommonServerSessionValue, ServerConfig, ServerConnection,
-    ServerSessionValue, Tls13ServerSessionValue,
+    ServerSessionKey, ServerSessionValue, Tls13ServerSessionValue,
 };
-use crate::conn::{Connection, Input};
-use crate::crypto::cipher::FakeAead;
+use crate::conn::{Connection, Input, VecInput};
+use crate::crypto::cipher::{EncodableVersion, FakeAead};
 use crate::crypto::kx::ffdhe::{FFDHE2048, FfdheGroup};
 use crate::crypto::kx::{
     ActiveKeyExchange, KeyExchangeAlgorithm, NamedGroup, SharedSecret, StartedKeyExchange,
     SupportedKxGroup,
 };
-use crate::crypto::test_provider::{FAKE_HASH, FAKE_HMAC};
+use crate::crypto::test_provider::{
+    FAKE_HASH, FAKE_HMAC, KEY_EXCHANGE_GROUP, TLS_TEST_SUITE, TLS13_TEST_SUITE_ALT,
+};
 use crate::crypto::{
     CertificateIdentity, CipherSuite, Credentials, CryptoProvider, Identity, SignatureScheme,
-    SingleCredential, TEST_PROVIDER, tls12, tls12_only,
+    SingleCredential, TEST_PROVIDER, TLS13_TEST_SUITE, tls12, tls12_only,
 };
 use crate::enums::{CertificateType, ProtocolVersion};
-use crate::error::{Error, PeerIncompatible};
+use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::msgs::{
     ClientExtensions, ClientHelloPayload, Codec, Compression, HEADER_SIZE, HandshakeMessagePayload,
-    HandshakePayload, KeyShareEntry, Message, MessagePayload, Random, Reader, SessionId,
+    HandshakePayload, KeyShareEntry, Message, MessagePayload, PresharedKeyBinder,
+    PresharedKeyIdentity, PresharedKeyOffer, PskKeyExchangeModes, Random, Reader, SessionId,
     SizedPayload, SupportedProtocolVersions,
 };
 use crate::pki_types::pem::PemObject;
 use crate::pki_types::{CertificateDer, FipsStatus, PrivateKeyDer};
 use crate::server::RealityClientHello;
-use crate::suites::CipherSuiteCommon;
+use crate::suites::{CipherSuiteCommon, Suite};
 use crate::sync::Arc;
 use crate::tls12::Tls12CipherSuite;
-use crate::tls13::Tls13CipherSuite;
+use crate::tls13::key_schedule::KeyScheduleEarlyServer;
+use crate::tls13::{Tls13CipherSuite, Tls13ProtocolSuite};
+use crate::verify::VerifiedIdentity;
 use crate::version::TLS12_VERSION;
-
-#[test]
-fn serversessionvalue_is_debug() {
-    use std::{println, vec};
-    let ssv = ServerSessionValue::Tls13(Tls13ServerSessionValue::new(
-        CommonServerSessionValue::new(
-            None,
-            CipherSuite::TLS13_AES_128_GCM_SHA256,
-            None,
-            None,
-            vec![4, 5, 6],
-            UnixTime::now(),
-        ),
-        &[1, 2, 3],
-        0x12345678,
-    ));
-    println!("{ssv:?}");
-    println!("{:#04x?}", ssv.get_encoding());
-}
 
 #[test]
 fn serversessionvalue_no_sni() {
@@ -75,10 +62,12 @@ fn serversessionvalue_with_cert() {
             CommonServerSessionValue::new(
                 None,
                 CipherSuite::TLS13_AES_128_GCM_SHA256,
-                Some(Identity::X509(CertificateIdentity {
-                    end_entity: CertificateDer::from(&[10, 11, 12][..]),
-                    intermediates: alloc::vec![],
-                })),
+                Some(VerifiedIdentity::assertion(Identity::X509(
+                    CertificateIdentity {
+                        end_entity: CertificateDer::from(&[10, 11, 12][..]),
+                        intermediates: alloc::vec![],
+                    }
+                ))),
                 None,
                 alloc::vec![4, 5, 6],
                 UnixTime::now(),
@@ -112,7 +101,7 @@ fn null_compression_required() {
 
 fn test_process_client_hello(hello: ClientHelloPayload) -> Result<(), Error> {
     let m = Message {
-        version: ProtocolVersion::TLSv1_2,
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
         payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ClientHello(
             hello,
         ))),
@@ -163,17 +152,17 @@ fn select_cipher_suite(
     client_hello: ClientHelloPayload,
 ) -> Result<CipherSuite, Box<dyn error::Error>> {
     let ch = Message {
-        version: ProtocolVersion::TLSv1_3,
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
         payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ClientHello(
             client_hello,
         ))),
     };
-    conn.read_tls(&mut ch.into_wire_bytes().as_slice())?;
-    conn.process_new_packets()?;
 
+    let mut input = VecInput::default();
+    input.read(&mut ch.into_wire_bytes().as_slice())?;
     let mut flight = vec![];
-    conn.write_tls(&mut &mut flight)
-        .unwrap();
+    conn.read_tls(&mut input, &mut flight)
+        .handle_all(&mut Vec::new())?;
     let mut r = Reader::new(&flight[HEADER_SIZE..]);
     let HandshakeMessagePayload(HandshakePayload::ServerHello(server_hello)) =
         HandshakeMessagePayload::read(&mut r).unwrap()
@@ -184,7 +173,7 @@ fn select_cipher_suite(
 }
 
 #[test]
-fn test_server_rejects_no_extended_master_secret_extension_when_require_ems_or_fips() {
+fn test_server_rejects_no_extended_main_secret_extension_when_require_ems_or_fips() {
     let provider = tls12_only(TEST_PROVIDER.clone());
     let mut config = ServerConfig::builder(provider.into())
         .with_no_client_auth()
@@ -197,25 +186,55 @@ fn test_server_rejects_no_extended_master_secret_extension_when_require_ems_or_f
         config.require_ems = true;
     }
     let mut conn = ServerConnection::new(config.into()).unwrap();
+    let mut input = VecInput::default();
 
     let mut ch = minimal_client_hello();
     ch.extensions
-        .extended_master_secret_request
+        .extended_main_secret_request
         .take();
     let ch = Message {
-        version: ProtocolVersion::TLSv1_3,
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
         payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ClientHello(
             ch,
         ))),
     };
-    conn.read_tls(&mut ch.into_wire_bytes().as_slice())
+    input
+        .read(&mut ch.into_wire_bytes().as_slice())
         .unwrap();
 
     assert_eq!(
-        conn.process_new_packets(),
-        Err(Error::PeerIncompatible(
-            PeerIncompatible::ExtendedMasterSecretExtensionRequired
-        ))
+        process(&mut input, &mut conn).unwrap_err(),
+        Error::PeerIncompatible(PeerIncompatible::ExtendedMainSecretExtensionRequired)
+    );
+}
+
+#[test]
+fn test_server_rejects_non_empty_renegotiation_info_in_initial_handshake() {
+    let provider = tls12_only(TEST_PROVIDER.clone());
+    let config = ServerConfig::builder(provider.into())
+        .with_no_client_auth()
+        .with_single_cert(server_identity(), server_key())
+        .unwrap();
+    let mut conn = ServerConnection::new(config.into()).unwrap();
+    let mut input = VecInput::default();
+
+    // a client behaving as if it were renegotiating an existing connection:
+    // `renegotiated_connection` carries its verify_data instead of being empty.
+    let mut ch = minimal_client_hello();
+    ch.extensions.renegotiation_info = Some(SizedPayload::from(vec![0x55; 12]));
+    let ch = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ClientHello(
+            ch,
+        ))),
+    };
+    input
+        .read(&mut ch.into_wire_bytes().as_slice())
+        .unwrap();
+
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        Error::PeerMisbehaved(PeerMisbehaved::NonEmptyRenegotiationInfo)
     );
 }
 
@@ -263,15 +282,17 @@ fn configured_client_hello_verifier_can_reject_handshake() {
 
     let mut conn = ServerConnection::new(config.into()).unwrap();
     let ch = Message {
-        version: ProtocolVersion::TLSv1_3,
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
         payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ClientHello(
             minimal_client_hello(),
         ))),
     };
-    conn.read_tls(&mut ch.into_wire_bytes().as_slice())
+    let mut input = VecInput::default();
+    input
+        .read(&mut ch.into_wire_bytes().as_slice())
         .unwrap();
 
-    let err = conn.process_new_packets().unwrap_err();
+    let err = process(&mut input, &mut conn).unwrap_err();
     assert!(matches!(err, Error::General(message) if message.contains("test verifier")));
 }
 
@@ -287,14 +308,16 @@ fn configured_reality_verifier_observes_tls13_client_hello() {
 
     let mut conn = ServerConnection::new(config.into()).unwrap();
     let ch = Message {
-        version: ProtocolVersion::TLSv1_3,
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
         payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ClientHello(
             minimal_client_hello(),
         ))),
     };
-    conn.read_tls(&mut ch.into_wire_bytes().as_slice())
+    let mut input = VecInput::default();
+    input
+        .read(&mut ch.into_wire_bytes().as_slice())
         .unwrap();
-    conn.process_new_packets().unwrap();
+    process(&mut input, &mut conn).unwrap();
 }
 
 #[test]
@@ -363,18 +386,19 @@ fn server_chooses_ffdhe_group_for_client_hello(
     mut conn: ServerConnection,
     client_hello: ClientHelloPayload,
 ) {
+    let mut input = VecInput::default();
     let ch = Message {
-        version: ProtocolVersion::TLSv1_3,
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
         payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ClientHello(
             client_hello,
         ))),
     };
-    conn.read_tls(&mut ch.into_wire_bytes().as_slice())
+    input
+        .read(&mut ch.into_wire_bytes().as_slice())
         .unwrap();
-    conn.process_new_packets().unwrap();
-
     let mut flight = vec![];
-    conn.write_tls(&mut &mut flight)
+    conn.read_tls(&mut input, &mut flight)
+        .handle_all(&mut Vec::new())
         .unwrap();
 
     let mut r = Reader::new(&flight[HEADER_SIZE..]);
@@ -398,69 +422,275 @@ fn server_chooses_ffdhe_group_for_client_hello(
 }
 
 #[test]
-fn test_server_requiring_rpk_client_rejects_x509_client() {
-    let Some(server_config) = server_config_for_rpk(TEST_PROVIDER.clone()) else {
-        return;
+fn second_client_hello_cannot_withdraw_psk_offer() {
+    // Per RFC 9846 section 4.2.2, dropping a PreSharedKey offer is not one of the
+    // changes a client may make after a HelloRetryRequest.
+    let config = ServerConfig::builder(TEST_PROVIDER.clone().into())
+        .with_no_client_auth()
+        .with_single_cert(server_identity(), server_key())
+        .unwrap();
+    let mut conn = ServerConnection::new(config.into()).unwrap();
+    let mut input = VecInput::default();
+
+    let encode = |hello| {
+        Message {
+            version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::ClientHello(hello),
+            )),
+        }
+        .into_wire_bytes()
     };
+
+    // this hello offers a PSK, but no key share for a group we support, so
+    // it draws a HelloRetryRequest.
+    let mut first = minimal_client_hello();
+    first.extensions.key_shares = Some(vec![]);
+    first.extensions.preshared_key_modes = Some(PskKeyExchangeModes {
+        psk_dhe: true,
+        psk: false,
+    });
+    first.extensions.preshared_key_offer = Some(PresharedKeyOffer::new(
+        PresharedKeyIdentity::new(vec![0u8; 16], 0),
+        vec![0u8; 32],
+    ));
+    input
+        .read(&mut encode(first).as_slice())
+        .unwrap();
+    process(&mut input, &mut conn).unwrap();
+
+    // the second hello follows the retry, but drops the PSK offer entirely.
+    let mut second = minimal_client_hello();
+    second.extensions.preshared_key_modes = Some(PskKeyExchangeModes {
+        psk_dhe: true,
+        psk: false,
+    });
+    input
+        .read(&mut encode(second).as_slice())
+        .unwrap();
+
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::MissingPskExtensionInSecondClientHello.into(),
+    );
+}
+
+#[test]
+fn second_client_hello_cannot_change_cipher_suite() {
+    // RFC 9846 section 4.2.4 requires the server to negotiate the same cipher suite it
+    // named in its HelloRetryRequest, and section 4.2.2 does not let the client vary its
+    // offer, so a second hello that withdraws the retried suite cannot be honoured.
+    let provider = CryptoProvider {
+        tls13_cipher_suites: Cow::Borrowed(&[TLS13_TEST_SUITE, TLS13_TEST_SUITE_ALT]),
+        ..TEST_PROVIDER.clone()
+    };
+    let config = ServerConfig::builder(provider.into())
+        .with_no_client_auth()
+        .with_single_cert(server_identity(), server_key())
+        .unwrap();
+    let mut conn = ServerConnection::new(config.into()).unwrap();
+    let mut input = VecInput::default();
+
+    let encode = |hello| {
+        Message {
+            version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::ClientHello(hello),
+            )),
+        }
+        .into_wire_bytes()
+    };
+
+    // this hello has no key share for a group we support, so it draws a
+    // HelloRetryRequest naming `TLS13_TEST_SUITE`.
+    let mut first = minimal_client_hello();
+    first.cipher_suites = vec![TLS13_TEST_SUITE.common.suite];
+    first.extensions.key_shares = Some(vec![]);
+    input
+        .read(&mut encode(first).as_slice())
+        .unwrap();
+    process(&mut input, &mut conn).unwrap();
+
+    // the second hello follows the retry, but offers only a different suite. It shares
+    // the retried suite's hash, so the transcript stays valid and nothing else objects.
+    let mut second = minimal_client_hello();
+    second.cipher_suites = vec![TLS13_TEST_SUITE_ALT.common.suite];
+    input
+        .read(&mut encode(second).as_slice())
+        .unwrap();
+
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::CipherSuiteDifferedOnRetry.into(),
+    );
+}
+
+#[test]
+fn early_data_accepted_for_first_psk_identity() {
+    let (selected, early_data_accepted) = resume_with_early_data(0);
+    assert_eq!(selected, Some(0));
+    assert!(early_data_accepted);
+}
+
+#[test]
+fn early_data_rejected_for_later_psk_identity() {
+    // RFC 9846 section 4.3.10: "In order to accept early data, the server MUST have
+    // accepted a PSK cipher suite and selected the first key offered in the client's
+    // "pre_shared_key" extension." The server may still resume with a later PSK.
+    let (selected, early_data_accepted) = resume_with_early_data(1);
+    assert_eq!(selected, Some(1));
+    assert!(!early_data_accepted);
+}
+
+/// Offer a resumable PSK at `index` (preceded by unknown identities) along with an
+/// early data request, returning the selected PSK index and whether early data was accepted.
+fn resume_with_early_data(index: usize) -> (Option<u16>, bool) {
+    let mut config = ServerConfig::builder(TEST_PROVIDER.clone().into())
+        .with_no_client_auth()
+        .with_single_cert(server_identity(), server_key())
+        .unwrap();
+    config.max_early_data_size = 1024;
+
+    let secret = [0x42u8; 32];
+    let ticket = b"resumable ticket";
+    let session = ServerSessionValue::Tls13(Tls13ServerSessionValue::new(
+        CommonServerSessionValue::new(
+            None,
+            TLS13_TEST_SUITE.common.suite,
+            None,
+            None,
+            vec![],
+            config.current_time().unwrap(),
+        ),
+        &secret,
+        0,
+    ));
+    assert!(
+        config
+            .session_storage
+            .put(ServerSessionKey::new(ticket), session.get_encoding())
+    );
+
+    let binder_len = TLS13_TEST_SUITE
+        .common
+        .hash_provider
+        .output_len();
+    let mut identities = vec![PresharedKeyIdentity::new(b"unknown ticket".to_vec(), 0); index];
+    identities.push(PresharedKeyIdentity::new(ticket.to_vec(), 0));
+    let binders = vec![PresharedKeyBinder::from(vec![0u8; binder_len]); identities.len()];
+
+    let mut ch = minimal_client_hello();
+    ch.cipher_suites = vec![TLS13_TEST_SUITE.common.suite];
+    ch.extensions.preshared_key_modes = Some(PskKeyExchangeModes {
+        psk_dhe: true,
+        psk: false,
+    });
+    ch.extensions.early_data_request = Some(());
+    ch.extensions.preshared_key_offer = Some(PresharedKeyOffer {
+        identities,
+        binders,
+    });
+    let mut hmp = HandshakeMessagePayload(HandshakePayload::ClientHello(ch));
+
+    // compute a genuine binder for the resumable PSK over the final ClientHello
+    let key_schedule =
+        KeyScheduleEarlyServer::new(Tls13ProtocolSuite::Tcp(TLS13_TEST_SUITE), &secret).unwrap();
+    let handshake_hash = TLS13_TEST_SUITE
+        .common
+        .hash_provider
+        .hash(&hmp.encoding_for_binder_signing());
+    let binder = key_schedule.resumption_psk_binder_key_and_sign_verify_data(&handshake_hash);
+    let HandshakePayload::ClientHello(ch) = &mut hmp.0 else {
+        unreachable!();
+    };
+    ch.preshared_key_offer
+        .as_mut()
+        .unwrap()
+        .binders[index] = PresharedKeyBinder::from(binder.as_ref().to_vec());
+
+    let ch = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(hmp),
+    };
+    let mut input = VecInput::default();
+    input
+        .read(&mut ch.into_wire_bytes().as_slice())
+        .unwrap();
+
+    let mut conn = ServerConnection::new(config.into()).unwrap();
+    let mut flight = vec![];
+    conn.read_tls(&mut input, &mut flight)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+
+    let mut r = Reader::new(&flight[HEADER_SIZE..]);
+    let HandshakeMessagePayload(HandshakePayload::ServerHello(server_hello)) =
+        HandshakeMessagePayload::read(&mut r).unwrap()
+    else {
+        panic!("expected ServerHello");
+    };
+
+    (
+        server_hello.extensions.preshared_key,
+        conn.early_exporter().is_ok(),
+    )
+}
+
+#[test]
+fn test_server_requiring_rpk_client_rejects_x509_client() {
+    let server_config = server_config_for_rpk(TEST_PROVIDER.clone());
 
     let mut ch = minimal_client_hello();
     ch.extensions.client_certificate_types = Some(vec![CertificateType::X509]);
     let ch = Message {
-        version: ProtocolVersion::TLSv1_3,
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
         payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ClientHello(
             ch,
         ))),
     };
 
     let mut conn = ServerConnection::new(Arc::new(server_config)).unwrap();
-    conn.read_tls(&mut ch.into_wire_bytes().as_slice())
+    let mut input = VecInput::default();
+    input
+        .read(&mut ch.into_wire_bytes().as_slice())
         .unwrap();
     assert_eq!(
-        conn.process_new_packets().unwrap_err(),
+        process(&mut input, &mut conn).unwrap_err(),
         PeerIncompatible::IncorrectCertificateTypeExtension.into(),
     );
 }
 
 #[test]
 fn test_rpk_only_server_rejects_x509_only_client() {
-    let Some(server_config) = server_config_for_rpk(TEST_PROVIDER.clone()) else {
-        return;
-    };
+    let server_config = server_config_for_rpk(TEST_PROVIDER.clone());
 
     let mut ch = minimal_client_hello();
     ch.extensions.server_certificate_types = Some(vec![CertificateType::X509]);
     let ch = Message {
-        version: ProtocolVersion::TLSv1_3,
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
         payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ClientHello(
             ch,
         ))),
     };
 
     let mut conn = ServerConnection::new(Arc::new(server_config)).unwrap();
-    conn.read_tls(&mut ch.into_wire_bytes().as_slice())
+    let mut input = VecInput::default();
+    input
+        .read(&mut ch.into_wire_bytes().as_slice())
         .unwrap();
 
     assert_eq!(
-        conn.process_new_packets().unwrap_err(),
+        process(&mut input, &mut conn).unwrap_err(),
         PeerIncompatible::IncorrectCertificateTypeExtension.into(),
     );
 }
 
-fn server_config_for_rpk(provider: CryptoProvider) -> Option<ServerConfig> {
-    let provider = CryptoProvider {
-        kx_groups: Cow::Owned(vec![
-            provider.find_kx_group(NamedGroup::X25519, ProtocolVersion::TLSv1_2)?,
-        ]),
-        ..provider
-    };
-
+fn server_config_for_rpk(provider: CryptoProvider) -> ServerConfig {
     let credentials = SingleCredential::from(server_credentials(&provider));
-    Some(
-        ServerConfig::builder(Arc::new(provider))
-            .with_no_client_auth()
-            .with_server_credential_resolver(Arc::new(credentials))
-            .unwrap(),
-    )
+    ServerConfig::builder(Arc::new(provider))
+        .with_no_client_auth()
+        .with_server_credential_resolver(Arc::new(credentials))
+        .unwrap()
 }
 
 fn server_credentials(provider: &CryptoProvider) -> Credentials {
@@ -571,7 +801,7 @@ fn minimal_client_hello() -> ClientHelloPayload {
         client_version: ProtocolVersion::TLSv1_3,
         random: Random::from([0u8; 32]),
         session_id: SessionId::from([0u8; 32]),
-        cipher_suites: vec![CipherSuite(0xff13), CipherSuite(0xff12)],
+        cipher_suites: vec![TLS13_TEST_SUITE.suite(), TLS_TEST_SUITE.suite()],
         compression_methods: vec![Compression::Null],
         extensions: Box::new(ClientExtensions {
             signature_schemes: Some(vec![SignatureScheme::ECDSA_NISTP256_SHA256]),
@@ -581,11 +811,22 @@ fn minimal_client_hello() -> ClientHelloPayload {
                 tls13: true,
             }),
             key_shares: Some(vec![KeyShareEntry {
-                group: NamedGroup::from(0xfe00),
-                payload: SizedPayload::from(b"KxPeerShareKxPeerShareKxPeerShare".to_vec()),
+                group: KEY_EXCHANGE_GROUP.name(),
+                payload: KEY_EXCHANGE_GROUP
+                    .start()
+                    .unwrap()
+                    .pub_key()
+                    .to_vec()
+                    .into(),
             }]),
-            extended_master_secret_request: Some(()),
+            extended_main_secret_request: Some(()),
             ..ClientExtensions::default()
         }),
     }
+}
+
+fn process(input: &mut VecInput, conn: &mut ServerConnection) -> Result<(), Error> {
+    conn.read_tls(input, &mut Vec::new())
+        .handle_all(&mut Vec::new())?;
+    Ok(())
 }

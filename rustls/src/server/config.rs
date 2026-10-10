@@ -8,10 +8,10 @@ use core::marker::PhantomData;
 use pki_types::PrivateKeyDer;
 use pki_types::{DnsName, FipsStatus, UnixTime};
 
-use super::hs::ClientHelloInput;
 use super::reality::{RealityClientHello, RealityClientHelloProbe};
 use super::{ServerSessionKey, handy};
 use crate::builder::{ConfigBuilder, WantsVerifier};
+use crate::common_state::Protocol;
 #[cfg(doc)]
 use crate::crypto;
 use crate::crypto::kx::NamedGroup;
@@ -22,7 +22,7 @@ use crate::crypto::{
 use crate::crypto::{Credentials, Identity, SingleCredential};
 use crate::enums::{ApplicationProtocol, CertificateType, ProtocolVersion};
 use crate::error::{Error, PeerMisbehaved};
-use crate::msgs::ServerNamePayload;
+use crate::msgs::{ClientHelloPayload, ClientTicketRequest, ServerNamePayload};
 use crate::suites::Suite;
 use crate::sync::Arc;
 use crate::time_provider::{DefaultTimeProvider, TimeProvider};
@@ -35,7 +35,7 @@ use crate::{KeyLog, NoKeyLog, Tls12CipherSuite, Tls13CipherSuite, compress};
 /// from the operating system to add to the [`RootCertStore`] passed to a `ClientVerifier`
 /// builder may take on the order of a few hundred milliseconds.
 ///
-/// These must be created via the [`ServerConfig::builder()`] or [`ServerConfig::builder()`]
+/// These must be created via the [`ServerConfig::builder()`] or [`ServerConfig::builder_with_details()`]
 /// function.
 ///
 /// # Defaults
@@ -43,12 +43,10 @@ use crate::{KeyLog, NoKeyLog, Tls12CipherSuite, Tls13CipherSuite, compress};
 /// * [`ServerConfig::max_fragment_size`]: the default is `None` (meaning 16kB).
 /// * [`ServerConfig::session_storage`]: if the `std` feature is enabled, the default stores 256
 ///   sessions in memory. If the `std` feature is not enabled, the default is to not store any
-///   sessions. In a no-std context, by enabling the `hashbrown` feature you may provide your
-///   own `session_storage` using [`ServerSessionMemoryCache`] and a `crate::lock::MakeMutex`
-///   implementation.
+///   sessions.
 /// * [`ServerConfig::alpn_protocols`]: the default is empty -- no ALPN protocol is negotiated.
 /// * [`ServerConfig::key_log`]: key material is not logged.
-/// * [`ServerConfig::send_tls13_tickets`]: 2 tickets are sent.
+/// * [`ServerConfig::send_tls13_tickets`]: 2 tickets are sent, with a maximum of 2.
 /// * [`ServerConfig::cert_compressors`]: depends on the crate features, see [`compress::default_cert_compressors()`].
 /// * [`ServerConfig::cert_compression_cache`]: caches the most recently used 4 compressions
 /// * [`ServerConfig::cert_decompressors`]: depends on the crate features, see [`compress::default_cert_decompressors()`].
@@ -97,7 +95,7 @@ pub struct ServerConfig {
     /// Setting this value to a little less than the TCP MSS may improve latency
     /// for stream-y workloads.
     ///
-    /// [TLS maximum]: https://datatracker.ietf.org/doc/html/rfc8446#section-5.1
+    /// [TLS maximum]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.1
     /// [ServerConnection::new]: crate::server::ServerConnection::new
     pub max_fragment_size: Option<usize>,
 
@@ -115,7 +113,6 @@ pub struct ServerConfig {
 
     /// How to choose a server cert and key. This is usually set by
     /// [ConfigBuilder::with_single_cert] or [ConfigBuilder::with_server_credential_resolver].
-    /// For async applications, see also [`Acceptor`][super::Acceptor].
     pub cert_resolver: Arc<dyn ServerCredentialResolver>,
 
     /// Protocol names we support, most preferred first.
@@ -141,7 +138,7 @@ pub struct ServerConfig {
     /// default is 0.
     ///
     /// Read the early data via
-    /// [`ServerConnection::early_data()`][super::ServerConnection::early_data()].
+    /// [`MessageHandler::next_early_data()`][crate::conn::MessageHandler::next_early_data()].
     ///
     /// The units for this are _both_ plaintext bytes, _and_ ciphertext
     /// bytes, depending on whether the server accepts a client's early_data
@@ -177,11 +174,9 @@ pub struct ServerConfig {
     /// Because TLS1.3 tickets are single-use, this allows
     /// a client to perform multiple resumptions.
     ///
-    /// The default is 2.
-    ///
-    /// If this is 0, no tickets are sent and clients will not be able to
-    /// do any resumption.
-    pub send_tls13_tickets: usize,
+    /// See [`Tls13Tickets`] for the meaning of the default and maximum
+    /// counts.
+    pub send_tls13_tickets: Tls13Tickets,
 
     /// If set to `true`, requires the client to support the extended
     /// master secret extraction method defined in [RFC 7627].
@@ -204,12 +199,12 @@ pub struct ServerConfig {
     ///
     /// If a client supports this extension, and advertises support
     /// for one of the compression algorithms included here, the
-    /// server certificate will be compressed according to [RFC8779].
+    /// server certificate will be compressed according to [RFC 8879].
     ///
     /// This only applies to TLS1.3 connections.  It is ignored for
     /// TLS1.2 connections.
     ///
-    /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
+    /// [RFC 8879]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_compressors: Vec<&'static dyn compress::CertCompressor>,
 
     /// Caching for compressed certificates.
@@ -220,7 +215,7 @@ pub struct ServerConfig {
 
     /// How to decompress the clients's certificate chain.
     ///
-    /// If this is non-empty, the [RFC8779] certificate compression
+    /// If this is non-empty, the [RFC 8879] certificate compression
     /// extension is offered when requesting client authentication,
     /// and any compressed certificates are transparently decompressed
     /// during the handshake.
@@ -228,7 +223,7 @@ pub struct ServerConfig {
     /// This only applies to TLS1.3 connections.  It is ignored for
     /// TLS1.2 connections.
     ///
-    /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
+    /// [RFC 8879]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
 
     /// Policy for how an invalid Server Name Indication (SNI) value from a client is handled.
@@ -290,13 +285,13 @@ impl ServerConfig {
         }
     }
 
-    /// Return the crypto provider used to construct this client configuration.
-    pub fn crypto_provider(&self) -> &Arc<CryptoProvider> {
+    /// Return the crypto provider used to construct this server configuration.
+    pub fn provider(&self) -> &Arc<CryptoProvider> {
         &self.provider
     }
 
-    pub(crate) fn supports_version(&self, v: ProtocolVersion) -> bool {
-        self.provider.supports_version(v)
+    pub(crate) fn supports_version(&self, v: ProtocolVersion, protocol: Protocol) -> bool {
+        self.provider.supports_version(v) && protocol.supports_version(v)
     }
 
     pub(super) fn current_time(&self) -> Result<UnixTime, Error> {
@@ -338,6 +333,39 @@ pub trait ClientHelloVerifier: Debug + Send + Sync + Any {
 
     /// Include verifier configuration in the server config hash.
     fn hash_config(&self, _h: &mut dyn core::hash::Hasher) {}
+}
+
+/// How many TLS 1.3 session tickets the server sends after a handshake.
+#[expect(clippy::exhaustive_structs)]
+#[derive(Clone, Copy, Debug)]
+pub struct Tls13Tickets {
+    /// Tickets sent when the client does not request a specific number.
+    pub default: usize,
+
+    /// Upper bound on the number of tickets sent.
+    pub max: usize,
+}
+
+impl Tls13Tickets {
+    pub(super) fn resolve(&self, requested: Option<&ClientTicketRequest>, resuming: bool) -> usize {
+        let Some(req) = requested else {
+            return self.default;
+        };
+
+        Ord::min(
+            usize::from(match resuming {
+                true => req.resumption_count,
+                false => req.new_session_count,
+            }),
+            self.max,
+        )
+    }
+}
+
+impl Default for Tls13Tickets {
+    fn default() -> Self {
+        Self { default: 2, max: 2 }
+    }
 }
 
 /// A trait for the ability to store server session data.
@@ -387,10 +415,6 @@ pub trait StoresServerSessions: Debug + Send + Sync {
 ///
 /// This is suitable when selecting a certificate does not require
 /// I/O or when the application is using blocking I/O anyhow.
-///
-/// For applications that use async I/O and need to do I/O to choose
-/// a certificate (for instance, fetching a certificate from a data store),
-/// the [`Acceptor`][super::Acceptor] interface is more suitable.
 pub trait ServerCredentialResolver: Debug + Send + Sync {
     /// Choose a certificate chain and matching key given simplified ClientHello information.
     ///
@@ -435,45 +459,59 @@ pub struct ClientHello<'a> {
     pub(super) cipher_suites: &'a [CipherSuite],
     /// The [certificate_authorities] extension, if it was sent by the client.
     ///
-    /// [certificate_authorities]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
+    /// [certificate_authorities]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.3.4
     pub(super) certificate_authorities: Option<&'a [DistinguishedName]>,
     pub(super) named_groups: Option<&'a [NamedGroup]>,
     pub(super) reality_auth_key: Option<[u8; 32]>,
 }
 
 impl<'a> ClientHello<'a> {
+    #[cfg(test)]
+    pub(super) fn empty() -> Self {
+        Self {
+            server_name: None,
+            signature_schemes: &[],
+            alpn: None,
+            server_cert_types: None,
+            client_cert_types: None,
+            cipher_suites: &[],
+            certificate_authorities: None,
+            named_groups: None,
+            reality_auth_key: None,
+        }
+    }
+
     pub(super) fn new(
-        input: &'a ClientHelloInput<'a>,
-        signature_schemes: &'a [SignatureScheme],
-        sni: Option<&'a DnsName<'static>>,
-        version: ProtocolVersion,
+        payload: &'a ClientHelloPayload,
+        signature_schemes: Option<&'a [SignatureScheme]>,
+        server_name: Option<Cow<'a, DnsName<'a>>>,
+        version: Option<ProtocolVersion>,
         reality_auth_key: Option<[u8; 32]>,
     ) -> Self {
         Self {
-            server_name: sni.map(Cow::Borrowed),
-            signature_schemes,
-            alpn: input.client_hello.protocols.as_ref(),
-            server_cert_types: input
-                .client_hello
+            server_name,
+            signature_schemes: signature_schemes.unwrap_or_else(|| {
+                payload
+                    .signature_schemes
+                    .as_deref()
+                    .unwrap_or_default()
+            }),
+            alpn: payload.protocols.as_ref(),
+            server_cert_types: payload
                 .server_certificate_types
                 .as_deref(),
-            client_cert_types: input
-                .client_hello
+            client_cert_types: payload
                 .client_certificate_types
                 .as_deref(),
-            cipher_suites: &input.client_hello.cipher_suites,
+            cipher_suites: &payload.cipher_suites,
             // We adhere to the TLS 1.2 RFC by not exposing this to the cert resolver if TLS version is 1.2
             certificate_authorities: match version {
-                ProtocolVersion::TLSv1_2 => None,
-                _ => input
-                    .client_hello
+                Some(ProtocolVersion::TLSv1_2) => None,
+                _ => payload
                     .certificate_authority_names
                     .as_deref(),
             },
-            named_groups: input
-                .client_hello
-                .named_groups
-                .as_deref(),
+            named_groups: payload.named_groups.as_deref(),
             reality_auth_key,
         }
     }
@@ -514,7 +552,7 @@ impl<'a> ClientHello<'a> {
     ///
     /// The server can specify supported ALPN protocols by setting [`ServerConfig::alpn_protocols`].
     /// During the handshake, the server will select the first protocol configured that the client supports.
-    pub fn alpn(&self) -> Option<impl Iterator<Item = &'a [u8]>> {
+    pub fn alpn(&self) -> Option<impl Iterator<Item = &'a [u8]> + use<'a>> {
         self.alpn.map(|protocols| {
             protocols
                 .iter()
@@ -545,7 +583,7 @@ impl<'a> ClientHello<'a> {
     ///
     /// Returns `None` if the client did not send this extension.
     ///
-    /// [certificate_authorities]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
+    /// [certificate_authorities]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.3.4
     pub fn certificate_authorities(&self) -> Option<&'a [DistinguishedName]> {
         self.certificate_authorities
     }
@@ -557,7 +595,7 @@ impl<'a> ClientHello<'a> {
     /// Originally it was introduced as the "[`elliptic_curves`]" extension for TLS1.2.
     /// It described the elliptic curves supported by a client for all purposes: key
     /// exchange, signature verification (for server authentication), and signing (for
-    /// client auth).  Later [RFC7919] extended this to include FFDHE "named groups",
+    /// client auth).  Later [RFC 7919] extended this to include FFDHE "named groups",
     /// but FFDHE groups in this context only relate to key exchange.
     ///
     /// In TLS1.3 it was renamed to "[`named_groups`]" and now describes all types
@@ -565,8 +603,8 @@ impl<'a> ClientHello<'a> {
     /// used for signatures.
     ///
     /// [`elliptic_curves`]: https://datatracker.ietf.org/doc/html/rfc4492#section-5.1.1
-    /// [RFC7919]: https://datatracker.ietf.org/doc/html/rfc7919#section-2
-    /// [`named_groups`]:https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.7
+    /// [RFC 7919]: https://datatracker.ietf.org/doc/html/rfc7919#section-2
+    /// [`named_groups`]:https://datatracker.ietf.org/doc/html/rfc9846#section-4.3.7
     pub fn named_groups(&self) -> Option<&'a [NamedGroup]> {
         self.named_groups
     }
@@ -574,7 +612,7 @@ impl<'a> ClientHello<'a> {
 
 /// A policy describing how an invalid Server Name Indication (SNI) value from a client is handled by the server.
 ///
-/// The only valid form of SNI according to relevant RFCs ([RFC6066], [RFC1035]) is
+/// The only valid form of SNI according to relevant RFCs ([RFC 6066], [RFC 1035]) is
 /// non-IP-address host name, however some misconfigured clients may send a bare IP address, or
 /// another invalid value. Some servers may wish to ignore these invalid values instead of producing
 /// an error.
@@ -584,8 +622,8 @@ impl<'a> ClientHello<'a> {
 ///
 /// When an SNI value is ignored, Rustls treats the client as if it sent no SNI at all.
 ///
-/// [RFC1035]: https://datatracker.ietf.org/doc/html/rfc1035#section-2.3.1
-/// [RFC6066]: https://datatracker.ietf.org/doc/html/rfc6066#section-3
+/// [RFC 1035]: https://datatracker.ietf.org/doc/html/rfc1035#section-2.3.1
+/// [RFC 6066]: https://datatracker.ietf.org/doc/html/rfc6066#section-3
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum InvalidSniPolicy {
@@ -657,46 +695,50 @@ pub struct WantsServerCert {
 }
 
 impl ConfigBuilder<ServerConfig, WantsServerCert> {
-    /// Sets a single certificate chain and matching private key.  This
-    /// certificate and key is used for all subsequent connections,
-    /// irrespective of things like SNI hostname.
+    /// Sets a single [`Identity`] and matching private key.
+    ///
+    /// This identity and key is used for all subsequent connections, irrespective of
+    /// things like SNI hostname.
     ///
     /// Note that the end-entity certificate must have the
     /// [Subject Alternative Name](https://tools.ietf.org/html/rfc6125#section-4.1)
     /// extension to describe, e.g., the valid DNS name. The `commonName` field is
     /// disregarded.
     ///
-    /// `cert_chain` is a vector of DER-encoded certificates.
-    /// `key_der` is a DER-encoded private key as PKCS#1, PKCS#8, or SEC1. The
-    /// `aws-lc-rs` and `ring` [`CryptoProvider`]s support
-    /// all three encodings, but other `CryptoProvider`s may not.
+    /// - `identity` is the [`Identity`], typically containing a certificate chain.
+    /// - `key_der` is a DER-encoded private key as PKCS#1, PKCS#8, or SEC1.  Supported key
+    ///   formats and types depends on the configured provider.
     ///
-    /// This function fails if `key_der` is invalid, or if the
-    /// `SubjectPublicKeyInfo` from the private key does not match the public
-    /// key for the end-entity certificate from the `cert_chain`.
+    /// This function fails if `key_der` is invalid, or if the `SubjectPublicKeyInfo` from
+    /// the private key does not match the public key from the `identity`.
     #[cfg(feature = "webpki")]
     pub fn with_single_cert(
         self,
         identity: Arc<Identity<'static>>,
         key_der: PrivateKeyDer<'static>,
     ) -> Result<ServerConfig, Error> {
-        let credentials = Credentials::from_der(identity, key_der, self.crypto_provider())?;
+        let credentials = Credentials::from_der(identity, key_der, self.provider())?;
         self.with_server_credential_resolver(Arc::new(SingleCredential::from(credentials)))
     }
 
-    /// Sets a single certificate chain, matching private key and optional OCSP
-    /// response.  This certificate and key is used for all
-    /// subsequent connections, irrespective of things like SNI hostname.
+    /// Sets a single [`Identity`], matching private key, and stapled OCSP response.
     ///
-    /// `cert_chain` is a vector of DER-encoded certificates.
-    /// `key_der` is a DER-encoded private key as PKCS#1, PKCS#8, or SEC1. The
-    /// `aws-lc-rs` and `ring` [`CryptoProvider`]s support
-    /// all three encodings, but other `CryptoProvider`s may not.
-    /// `ocsp` is a DER-encoded OCSP response.  Ignored if zero length.
+    /// This identity and key is used for all subsequent connections, irrespective of
+    /// things like SNI hostname.
     ///
-    /// This function fails if `key_der` is invalid, or if the
-    /// `SubjectPublicKeyInfo` from the private key does not match the public
-    /// key for the end-entity certificate from the `cert_chain`.
+    /// Note that the end-entity certificate must have the
+    /// [Subject Alternative Name](https://tools.ietf.org/html/rfc6125#section-4.1)
+    /// extension to describe, e.g., the valid DNS name. The `commonName` field is
+    /// disregarded.
+    ///
+    /// - `identity` is the [`Identity`], typically containing a certificate chain.
+    /// - `key_der` is a DER-encoded private key as PKCS#1, PKCS#8, or SEC1.  Supported key
+    ///   formats and types depends on the configured provider.
+    /// - `ocsp` is a DER-encoded OCSP response.  It is ignored if zero length but it is
+    ///   not validated otherwise.
+    ///
+    /// This function fails if `key_der` is invalid, or if the `SubjectPublicKeyInfo` from
+    /// the private key does not match the public key from the `identity`.
     #[cfg(feature = "webpki")]
     pub fn with_single_cert_with_ocsp(
         self,
@@ -704,7 +746,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
         key_der: PrivateKeyDer<'static>,
         ocsp: Arc<[u8]>,
     ) -> Result<ServerConfig, Error> {
-        let mut credentials = Credentials::from_der(identity, key_der, self.crypto_provider())?;
+        let mut credentials = Credentials::from_der(identity, key_der, self.provider())?;
         if !ocsp.is_empty() {
             credentials.ocsp = Some(ocsp);
         }
@@ -732,7 +774,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
             enable_secret_extraction: false,
             max_early_data_size: 0,
             send_half_rtt_data: false,
-            send_tls13_tickets: 2,
+            send_tls13_tickets: Tls13Tickets::default(),
             require_ems,
             time_provider: self.time_provider,
             cert_compressors: compress::default_cert_compressors().to_vec(),
@@ -770,9 +812,7 @@ impl CipherSuiteSelector for PreferClientOrder {
 pub mod danger {
     use super::{ClientHelloVerifier, ServerConfig};
     use crate::sync::Arc;
-    pub use crate::verify::{
-        ClientIdentity, ClientVerifier, PeerVerified, SignatureVerificationInput,
-    };
+    pub use crate::verify::{ClientIdentity, ClientVerifier, SignatureVerificationInput};
 
     /// Accessor for dangerous server configuration options.
     #[derive(Debug)]
@@ -907,7 +947,7 @@ pub trait CipherSuiteSelector: Debug + Send + Sync {
     /// mutually supported cipher suite could be agreed on.
     fn select_tls13_cipher_suite(
         &self,
-        server: &mut dyn Iterator<Item = &'static Tls13CipherSuite>,
+        client: &mut dyn Iterator<Item = &'static Tls13CipherSuite>,
         server: &[&'static Tls13CipherSuite],
     ) -> Option<&'static Tls13CipherSuite>;
 }

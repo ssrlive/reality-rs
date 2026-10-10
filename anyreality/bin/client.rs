@@ -280,15 +280,23 @@ async fn dial_carrier(ctx: Arc<DialCtx>) -> std::io::Result<Box<dyn AsyncReadWri
         std_tcp.set_write_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
         let server_name =
             rustls::pki_types::ServerName::try_from(server_name).map_err(|err| std::io::Error::other(format!("invalid sni: {err}")))?;
-        let mut conn = tls_config
+        let mut output = Vec::new();
+        let conn = tls_config
             .connect(server_name)
-            .build()
+            .build(&mut output)
             .map_err(|err| std::io::Error::other(format!("rustls build: {err}")))?;
-        let mut sock = std_tcp;
-        while conn.is_handshaking() {
-            complete_io(&mut sock, &mut conn).map_err(|err| std::io::Error::other(format!("reality handshake: {err}")))?;
+        let mut tls = StreamOwned::new(conn, std_tcp, output);
+        while tls.conn.is_handshaking() {
+            complete_io(
+                &mut tls.sock,
+                &mut tls.input,
+                &mut tls.received_plaintext,
+                &mut tls.output,
+                &mut tls.conn,
+            )
+            .map_err(|err| std::io::Error::other(format!("reality handshake: {err}")))?;
         }
-        Ok(StreamOwned::new(conn, sock))
+        Ok(tls)
     })
     .await
     .map_err(|err| std::io::Error::other(format!("join handshake task: {err}")))??;

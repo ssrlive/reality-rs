@@ -15,8 +15,8 @@ use aws_lc_rs::agreement;
 use aws_lc_rs::hmac as aws_hmac;
 use pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::client::danger::{
-    HandshakeSignatureValid, PeerVerified, RealitySessionIdGenerator, RealitySessionIdSealer,
-    SealingRealitySessionIdGenerator, ServerIdentity, ServerVerifier,
+    HandshakeSignatureValid, RealitySessionIdGenerator, RealitySessionIdSealer,
+    SealingRealitySessionIdGenerator, ServerIdentity, ServerVerifier, VerifiedIdentity,
 };
 use rustls::client::{ParsedCertificate, verify_server_name};
 use rustls::crypto::Identity;
@@ -109,7 +109,10 @@ impl RealityServerVerifier {
 }
 
 impl ServerVerifier for RealityServerVerifier {
-    fn verify_identity(&self, identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
+    fn verify_identity<'a>(
+        &self,
+        identity: &ServerIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, Error> {
         let Some(auth_key) = identity.reality_auth_key else {
             return self.fallback.verify_identity(identity);
         };
@@ -127,7 +130,7 @@ impl ServerVerifier for RealityServerVerifier {
         }
         let parsed = ParsedCertificate::try_from(&certificates.end_entity)?;
         verify_server_name(&parsed, identity.server_name)?;
-        Ok(PeerVerified::assertion())
+        Ok(VerifiedIdentity::assertion(identity.identity.clone()))
     }
 
     fn verify_tls12_signature(
@@ -642,7 +645,7 @@ impl RealityServerVerifierConfig {
         let fallback = config.cert_resolver.clone();
         config.cert_resolver = Arc::new(RealityServerCredentialResolver::new(
             fallback,
-            config.crypto_provider().clone(),
+            config.provider().clone(),
         ));
         config
             .dangerous()
@@ -1052,14 +1055,14 @@ mod tests {
     use pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
     use rustls::client::ClientHelloProfile;
     use rustls::client::danger::{
-        HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
-        SignatureVerificationInput,
+        HandshakeSignatureValid, ServerIdentity, ServerVerifier, SignatureVerificationInput,
+        VerifiedIdentity,
     };
     use rustls::crypto::Identity;
     use rustls::crypto::kx::NamedGroup;
     use rustls::crypto::tls13::{Hkdf, HkdfUsingHmac};
     use rustls::server::ServerConnection;
-    use rustls::{Connection, RootCertStore, ServerConfig};
+    use rustls::{Connection, RootCertStore, ServerConfig, VecInput};
     use rustls_test::{ErrorFromPeer, bytes_for, do_handshake, do_handshake_until_error};
     use std::eprintln;
     use std::io::Cursor;
@@ -1071,7 +1074,10 @@ mod tests {
     struct RejectingVerifier;
 
     impl ServerVerifier for RejectingVerifier {
-        fn verify_identity(&self, _: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
+        fn verify_identity<'a>(
+            &self,
+            _: &ServerIdentity<'a, '_>,
+        ) -> Result<VerifiedIdentity<'a>, Error> {
             Err(Error::General("standard verifier fallback".into()))
         }
 
@@ -1105,12 +1111,11 @@ mod tests {
     }
 
     fn first_client_hello_bytes(config: ClientConfig) -> Vec<u8> {
-        let mut conn = Arc::new(config)
-            .connect(ServerName::try_from("localhost").unwrap())
-            .build()
-            .unwrap();
         let mut bytes = Vec::new();
-        conn.write_tls(&mut bytes).unwrap();
+        let _conn = Arc::new(config)
+            .connect(ServerName::try_from("localhost").unwrap())
+            .build(&mut bytes)
+            .unwrap();
         bytes
     }
 
@@ -1856,12 +1861,20 @@ mod tests {
             fixed_time,
         );
 
+        let mut client_output = Vec::new();
         let mut client = Arc::new(client_config)
             .connect(ServerName::try_from("example.com").unwrap())
-            .build()
+            .build(&mut client_output)
             .unwrap();
         let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
-        do_handshake(&mut client, &mut server);
+        do_handshake(
+            &mut VecInput::default(),
+            &mut client_output,
+            &mut client,
+            &mut VecInput::default(),
+            &mut Vec::new(),
+            &mut server,
+        );
     }
 
     #[test]
@@ -1937,42 +1950,46 @@ mod tests {
         ));
 
         let client_config = Arc::new(client_config);
-        let mut probe_client = client_config
-            .connect(ServerName::try_from("example.com").unwrap())
-            .build()
-            .unwrap();
         let mut client_hello = Vec::new();
-        while probe_client.wants_write() {
-            probe_client
-                .write_tls(&mut client_hello)
-                .unwrap();
-        }
+        let _probe_client = client_config
+            .connect(ServerName::try_from("example.com").unwrap())
+            .build(&mut client_hello)
+            .unwrap();
         let client_hello_record_len =
             u16::from_be_bytes([client_hello[3], client_hello[4]]) as usize;
         let client_hello_record = &client_hello[..5 + client_hello_record_len];
 
         let mut target = ServerConnection::new(server_config.clone()).unwrap();
-        target
-            .read_tls(&mut Cursor::new(client_hello_record))
+        let mut target_input = VecInput::default();
+        target_input
+            .read(&mut Cursor::new(client_hello_record))
             .unwrap();
-        target.process_new_packets().unwrap();
         let mut target_flight = Vec::new();
         target
-            .write_tls(&mut target_flight)
+            .read_tls(&mut target_input, &mut target_flight)
+            .handle_all(&mut Vec::new())
             .unwrap();
         assert_eq!(target_flight[0], 22);
         let target_record_len = u16::from_be_bytes([target_flight[3], target_flight[4]]) as usize;
         let target_server_hello = target_flight[5..5 + target_record_len].to_vec();
 
+        let mut client_output = Vec::new();
         let mut client = client_config
             .connect(ServerName::try_from("example.com").unwrap())
-            .build()
+            .build(&mut client_output)
             .unwrap();
         let mut server = ServerConnection::new(server_config.clone()).unwrap();
         server
             .set_reality_server_hello_template(&target_server_hello)
             .unwrap();
-        do_handshake(&mut client, &mut server);
+        do_handshake(
+            &mut VecInput::default(),
+            &mut client_output,
+            &mut client,
+            &mut VecInput::default(),
+            &mut Vec::new(),
+            &mut server,
+        );
 
         let mut incompatible_template = target_server_hello;
         incompatible_template[71..73].copy_from_slice(&0x0000u16.to_be_bytes());
@@ -1986,16 +2003,24 @@ mod tests {
             .build_client_config(test_root_store())
             .unwrap(),
         );
+        let mut client_output = Vec::new();
         let mut client = fallback_client_config
             .connect(ServerName::try_from("example.com").unwrap())
-            .build()
+            .build(&mut client_output)
             .unwrap();
-        let mut server = ServerConnection::new(server_config.clone()).unwrap();
+        let mut server = ServerConnection::new(server_config).unwrap();
         server
             .set_reality_server_hello_template(&incompatible_template)
             .unwrap();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            do_handshake(&mut client, &mut server);
+        let outcome = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            do_handshake(
+                &mut VecInput::default(),
+                &mut client_output,
+                &mut client,
+                &mut VecInput::default(),
+                &mut Vec::new(),
+                &mut server,
+            );
         }));
         assert!(
             outcome.is_ok(),
@@ -2028,13 +2053,22 @@ mod tests {
             fixed_time,
         );
 
+        let mut client_output = Vec::new();
         let mut client = Arc::new(client_config)
             .connect(ServerName::try_from("localhost").unwrap())
-            .build()
+            .build(&mut client_output)
             .unwrap();
         let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
 
-        let err = do_handshake_until_error(&mut client, &mut server).unwrap_err();
+        let err = do_handshake_until_error(
+            &mut VecInput::default(),
+            &mut client_output,
+            &mut client,
+            &mut VecInput::default(),
+            &mut Vec::new(),
+            &mut server,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             ErrorFromPeer::Server(Error::General(message)) if message.contains("short_id")

@@ -13,6 +13,7 @@ use super::handy::{ClientSessionMemoryCache, FailResolveClientCert, NoClientSess
 use super::{Tls12Session, Tls13Session};
 use crate::builder::{ConfigBuilder, WantsVerifier};
 use crate::client::connection::ClientConnectionBuilder;
+use crate::common_state::Protocol;
 #[cfg(doc)]
 use crate::crypto;
 use crate::crypto::kx::{ActiveKeyExchange, NamedGroup};
@@ -26,9 +27,10 @@ use crate::msgs::{Codec, Reader, SessionId};
 use crate::suites::SupportedCipherSuite;
 use crate::sync::Arc;
 use crate::time_provider::{DefaultTimeProvider, TimeProvider};
+use crate::verify::ServerVerifier;
 #[cfg(feature = "webpki")]
 use crate::webpki::{self, WebPkiServerVerifier};
-use crate::{DistinguishedName, DynHasher, KeyLog, compress, verify};
+use crate::{DistinguishedName, DynHasher, KeyLog, compress};
 
 /// Common configuration for (typically) all connections made by a program.
 ///
@@ -37,7 +39,7 @@ use crate::{DistinguishedName, DynHasher, KeyLog, compress, verify};
 /// (the rustls-native-certs crate is often used for this) may take on the order of a few hundred
 /// milliseconds.
 ///
-/// These must be created via the [`ClientConfig::builder()`] or [`ClientConfig::builder()`]
+/// These must be created via the [`ClientConfig::builder()`] or [`ClientConfig::builder_with_details()`]
 /// function.
 ///
 /// Note that using [`ConfigBuilder<ClientConfig, WantsVersions>::with_ech()`] will produce a common
@@ -77,7 +79,7 @@ pub struct ClientConfig {
     /// # Sharing `resumption` between `ClientConfig`s
     /// In a program using many `ClientConfig`s it may improve resumption rates
     /// (which has a significant impact on connection performance) if those
-    /// configs share a single `Resumption`.
+    /// configs share a single [`Resumption`].
     ///
     /// However, resumption is only allowed between two `ClientConfig`s if their
     /// `client_auth_cert_resolver` (ie, potential client authentication credentials)
@@ -94,7 +96,7 @@ pub struct ClientConfig {
     /// store, and then resumed by `A`.  This would give a false impression to the user
     /// of `A` that the server certificate is fully validated.
     ///
-    /// [`ServerVerifier::hash_config()`]: verify::ServerVerifier::hash_config()
+    /// [`ServerVerifier::hash_config()`]: crate::verify::ServerVerifier::hash_config()
     pub resumption: Resumption,
 
     /// The maximum size of plaintext input to be emitted in a single TLS record.
@@ -106,7 +108,7 @@ pub struct ClientConfig {
     /// Setting this value to a little less than the TCP MSS may improve latency
     /// for stream-y workloads.
     ///
-    /// [TLS maximum]: https://datatracker.ietf.org/doc/html/rfc8446#section-5.1
+    /// [TLS maximum]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.1
     pub max_fragment_size: Option<usize>,
 
     /// Whether to send the Server Name Indication (SNI) extension
@@ -115,8 +117,11 @@ pub struct ClientConfig {
     /// The default is true.
     pub enable_sni: bool,
 
-    /// How to output key material for debugging.  The default
-    /// does nothing.
+    /// How to output key material for debugging.
+    ///
+    /// The default does nothing.
+    ///
+    /// See [RFC 9850](https://datatracker.ietf.org/doc/html/rfc9850) for background.
     pub key_log: Arc<dyn KeyLog>,
 
     /// Allows traffic secrets to be extracted after the handshake,
@@ -143,31 +148,38 @@ pub struct ClientConfig {
     /// [FIPS 140-3 IG.pdf]: https://csrc.nist.gov/csrc/media/Projects/cryptographic-module-validation-program/documents/fips%20140-3/FIPS%20140-3%20IG.pdf
     pub require_ems: bool,
 
+    /// Request a specific number of TLS 1.3 session tickets via [RFC 9149].
+    ///
+    /// Set to `None` to disable sending the extension (the default).
+    ///
+    /// [RFC 9149]: https://datatracker.ietf.org/doc/html/rfc9149
+    pub send_ticket_request: Option<TicketRequest>,
+
     /// Items that affect the fundamental security properties of a connection.
     pub(super) domain: SecurityDomain,
 
     /// How to decompress the server's certificate chain.
     ///
-    /// If this is non-empty, the [RFC8779] certificate compression
+    /// If this is non-empty, the [RFC 8779] certificate compression
     /// extension is offered, and any compressed certificates are
     /// transparently decompressed during the handshake.
     ///
     /// This only applies to TLS1.3 connections.  It is ignored for
     /// TLS1.2 connections.
     ///
-    /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
+    /// [RFC 8779]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
 
     /// How to compress the client's certificate chain.
     ///
     /// If a server supports this extension, and advertises support
     /// for one of the compression algorithms included here, the
-    /// client certificate will be compressed according to [RFC8779].
+    /// client certificate will be compressed according to [RFC 8779].
     ///
     /// This only applies to TLS1.3 connections.  It is ignored for
     /// TLS1.2 connections.
     ///
-    /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
+    /// [RFC 8779]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_compressors: Vec<&'static dyn compress::CertCompressor>,
 
     /// Caching for compressed certificates.
@@ -264,7 +276,7 @@ impl ClientHelloProfile {
             Self::Chrome => &[
                 ExtensionType::ServerName,
                 ExtensionType::GREASE,
-                ExtensionType::ExtendedMasterSecret,
+                ExtensionType::ExtendedMainSecret,
                 ExtensionType::EllipticCurves,
                 ExtensionType::ECPointFormats,
                 ExtensionType::SignatureAlgorithms,
@@ -386,11 +398,10 @@ impl ClientConfig {
         &self.domain.client_auth_cert_resolver
     }
 
-    /// Return the resolver for this client configuration.
+    /// Return the verifier for this client configuration.
     ///
-    /// This is the object that determines which credentials to use for client
-    /// authentication.
-    pub fn verifier(&self) -> &Arc<dyn verify::ServerVerifier> {
+    /// This is the object that determines how server certificates are verified.
+    pub fn verifier(&self) -> &Arc<dyn ServerVerifier> {
         &self.domain.verifier
     }
 
@@ -400,8 +411,8 @@ impl ClientConfig {
             .as_ref()
     }
 
-    pub(crate) fn supports_version(&self, v: ProtocolVersion) -> bool {
-        self.domain.provider.supports_version(v)
+    pub(crate) fn supports_version(&self, v: ProtocolVersion, protocol: Protocol) -> bool {
+        self.domain.provider.supports_version(v) && protocol.supports_version(v)
     }
 
     pub(super) fn find_cipher_suite(&self, suite: CipherSuite) -> Option<SupportedCipherSuite> {
@@ -515,15 +526,14 @@ impl ClientSessionKey<'_> {
 pub trait ClientCredentialResolver: fmt::Debug + Send + Sync {
     /// Resolve a client certificate chain/private key to use as the client's identity.
     ///
-    /// The `SelectedCredential` returned from this method contains an identity and a
+    /// The [`SelectedCredential`] returned from this method contains an identity and a
     /// one-time-use [`Signer`] wrapping the private key. This is usually obtained via a
     /// [`Credentials`], on which an implementation can call [`Credentials::signer()`].
     /// An implementation can either store long-lived [`Credentials`] values, or instantiate
     /// them as needed using one of its constructors.
     ///
-    /// Return `None` to continue the handshake without any client
-    /// authentication.  The server may reject the handshake later
-    /// if it requires authentication.
+    /// Return `None` to continue the handshake without any client authentication.  The server
+    /// may reject the handshake later if it requires authentication.
     ///
     /// [RFC 5280 A.1]: https://www.rfc-editor.org/rfc/rfc5280#appendix-A.1
     ///
@@ -680,7 +690,7 @@ impl CredentialRequest<'_> {
 
     /// The negotiated certificate type.
     ///
-    /// If the server does not support [RFC 7250], this will be `CertificateType::X509`.
+    /// If the server does not support [RFC 7250], this will be [`CertificateType::X509`].
     ///
     /// [RFC 7250]: https://tools.ietf.org/html/rfc7250
     pub fn negotiated_type(&self) -> CertificateType {
@@ -702,7 +712,7 @@ pub(super) struct SecurityDomain {
     provider: Arc<CryptoProvider>,
 
     /// How to verify the server certificate chain.
-    verifier: Arc<dyn verify::ServerVerifier>,
+    verifier: Arc<dyn ServerVerifier>,
 
     /// How to decide what client auth certificate/keys to use.
     client_auth_cert_resolver: Arc<dyn ClientCredentialResolver>,
@@ -717,7 +727,7 @@ impl SecurityDomain {
     pub(crate) fn new(
         provider: Arc<CryptoProvider>,
         client_auth_cert_resolver: Arc<dyn ClientCredentialResolver + 'static>,
-        verifier: Arc<dyn verify::ServerVerifier + 'static>,
+        verifier: Arc<dyn ServerVerifier + 'static>,
         client_hello_callback: Option<Arc<dyn ClientHelloCallback>>,
         time_provider: Arc<dyn TimeProvider + 'static>,
     ) -> Self {
@@ -768,7 +778,7 @@ impl SecurityDomain {
         }
     }
 
-    fn with_verifier(&self, verifier: Arc<dyn verify::ServerVerifier + 'static>) -> Self {
+    fn with_verifier(&self, verifier: Arc<dyn ServerVerifier + 'static>) -> Self {
         let Self {
             time_provider,
             provider,
@@ -884,6 +894,26 @@ pub enum Tls12Resumption {
     SessionIdOrTickets,
 }
 
+/// Number of TLS 1.3 session tickets to request via the [RFC 9149]
+/// `ticket_request` extension.
+///
+/// [RFC 9149]: https://datatracker.ietf.org/doc/html/rfc9149
+#[expect(clippy::exhaustive_structs)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TicketRequest {
+    /// Tickets desired when the server negotiates a new connection.
+    ///
+    /// RFC 9149 recommends setting this to the desired number of tickets
+    /// and `resumption_count` to 0 for initial connections.
+    pub new_session_count: u8,
+
+    /// Tickets desired when the server resumes using a presented ticket.
+    ///
+    /// A value of 1 is a good default for primed caches. Clients racing
+    /// multiple connections may want a higher value.
+    pub resumption_count: u8,
+}
+
 impl ConfigBuilder<ClientConfig, WantsVerifier> {
     /// Choose how to verify server certificates.
     ///
@@ -913,8 +943,7 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
 
     /// Choose how to verify server certificates using a webpki verifier.
     ///
-    /// See [`webpki::WebPkiServerVerifier::builder`] and
-    /// [`webpki::WebPkiServerVerifier::builder`] for more information.
+    /// See [`webpki::WebPkiServerVerifier::builder`] for more information.
     #[cfg(feature = "webpki")]
     pub fn with_webpki_verifier(
         self,
@@ -959,20 +988,19 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
 /// For more information, see the [`ConfigBuilder`] documentation.
 #[derive(Clone)]
 pub struct WantsClientCert {
-    verifier: Arc<dyn verify::ServerVerifier>,
+    verifier: Arc<dyn ServerVerifier>,
     client_ech_mode: Option<EchMode>,
 }
 
 impl ConfigBuilder<ClientConfig, WantsClientCert> {
-    /// Sets a single certificate chain and matching private key for use
-    /// in client authentication.
+    /// Sets a single identity and matching private key for use in client authentication.
     ///
-    /// `cert_chain` is a vector of DER-encoded certificates.
-    /// `key_der` is a DER-encoded private key as PKCS#1, PKCS#8, or SEC1. The
-    /// `aws-lc-rs` and `ring` [`CryptoProvider`]s support
-    /// all three encodings, but other `CryptoProviders` may not.
+    /// - `identity` is the [`Identity`], typically containing a certificate chain.
+    /// - `key_der` is a DER-encoded private key as PKCS#1, PKCS#8, or SEC1.  Supported key
+    ///   formats and types depends on the configured provider.
     ///
-    /// This function fails if `key_der` is invalid.
+    /// This function fails if `key_der` is invalid, or if the `SubjectPublicKeyInfo` from
+    /// the private key does not match the public key from the `identity`.
     #[cfg(feature = "webpki")]
     pub fn with_client_auth_cert(
         self,
@@ -1022,6 +1050,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             enable_secret_extraction: false,
             enable_early_data: false,
             require_ems,
+            send_ticket_request: None,
             domain: SecurityDomain::new(
                 self.provider,
                 client_auth_cert_resolver,

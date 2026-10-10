@@ -35,6 +35,8 @@ jobs:
           - nightly
         os:
           - ubuntu-latest
+          # aka ubuntu-latest-arm
+          - ubuntu-24.04-arm64-8x
           - windows-latest
           - macos-latest
         exclude:
@@ -52,7 +54,7 @@ jobs:
           - os: ${{ github.event_name == 'merge_group' && 'macos-latest' }}
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -71,7 +73,7 @@ jobs:
 
       - name: Install golang for aws-lc-fips-sys on macos
         if: runner.os == 'MacOS'
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: "stable"
 
@@ -100,8 +102,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo build --lib -p rustls $(admin/all-features-except std,brotli rustls)
+          cargo build --lib -p rustls-util
           cargo build --lib -p rustls-ring --no-default-features
           cargo build --lib -p rustls-aws-lc-rs --no-default-features --features aws-lc-sys
+          cargo build --lib -p rustls-post-quantum
 
       - name: cargo build (debug; rustls-provider-test)
         if: ${{ !cancelled() }}
@@ -115,12 +119,18 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo package --all-features -p rustls
 
+      - name: cargo build (32-bit i686; cheap crossbuild test)
+        if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+        run: |
+          rustup target add i686-unknown-linux-gnu
+          cargo build -p rustls --target i686-unknown-linux-gnu
+
   msrv:
     name: MSRV
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -132,10 +142,10 @@ jobs:
 
   features:
     name: Features
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -147,8 +157,10 @@ jobs:
       - name: cargo build (debug; default features)
         run: |
           cargo build -p rustls
+          cargo build -p rustls-util
           cargo build -p rustls-ring
           cargo build -p rustls-aws-lc-rs
+          cargo build -p rustls-post-quantum
 
       - name: cargo test (debug; default features)
         run: cargo test
@@ -159,8 +171,10 @@ jobs:
       - name: cargo test (debug; no default features)
         run: |
           cargo test -p rustls --no-default-features
+          cargo test -p rustls-util
           cargo test -p rustls-ring --no-default-features
           cargo test -p rustls-aws-lc-rs --no-default-features --features aws-lc-sys
+          cargo test -p rustls-post-quantum
 
       - name: cargo test (debug; no default features; std)
         run: |
@@ -173,10 +187,10 @@ jobs:
 
   bogo:
     name: BoGo test suite
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -184,7 +198,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install golang toolchain
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: "stable"
 
@@ -208,10 +222,10 @@ jobs:
 
   fuzz:
     name: Smoke-test fuzzing targets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -235,10 +249,10 @@ jobs:
 
   benchmarks:
     name: Run benchmarks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -263,10 +277,10 @@ jobs:
 
   docs:
     name: Check for documentation errors
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -274,8 +288,13 @@ jobs:
         # use nightly to mirror docs.rs
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: cargo doc (rustls; all features)
-        run: cargo doc --all-features --no-deps --document-private-items --package rustls
+      - name: cargo doc (all public crates; all features)
+        run: |
+          cargo doc --all-features --no-deps --document-private-items --package rustls
+          cargo doc --all-features --no-deps --document-private-items --package rustls-util
+          cargo doc --all-features --no-deps --document-private-items --package rustls-ring
+          cargo doc --all-features --no-deps --document-private-items --package rustls-aws-lc-rs
+          cargo doc --all-features --no-deps --document-private-items --package rustls-post-quantum
         env:
           RUSTDOCFLAGS: -Dwarnings
 
@@ -290,14 +309,13 @@ jobs:
         with:
           config: .github/typos.toml
 
-
   coverage:
     name: Measure coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     if: github.event_name != 'merge_group'
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -315,7 +333,7 @@ jobs:
         run: ./admin/coverage --lcov --output-path final.info
 
       - name: Report to codecov.io
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: final.info
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -323,10 +341,10 @@ jobs:
 
   minver:
     name: Check minimum versions of direct dependencies
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -347,56 +365,12 @@ jobs:
           # `cargo minimal-versions` uses unstable cargo features
           RUSTC_BOOTSTRAP: 1
 
-  cross:
-    name: cross-target testing
-    runs-on: ubuntu-latest
-    if: github.event_name != 'merge_group'
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          # 32-bit Android (Linux) targets:
-          - armv7-linux-androideabi
-          - i686-linux-android
-          - thumbv7neon-linux-androideabi
-          # Other standard 32-bit (Linux) targets
-          - i586-unknown-linux-gnu
-          - i686-unknown-linux-gnu
-          # exotic Linux targets:
-          - riscv64gc-unknown-linux-gnu
-          - s390x-unknown-linux-gnu
-          # additional target(s):
-          # NOTE: This could have some overlap with 64-bit ARM-style CPU on macOS CI host;
-          # may have similar ARM-style CPU overlap with standard Windows & possibly Linux in the future
-          - aarch64-linux-android
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install cross
-        uses: taiki-e/cache-cargo-install-action@v3
-        with:
-          tool: cross
-          git: https://github.com/cross-rs/cross
-          # known-working main in feb 2025, bump as needed
-          rev: c7dee4d
-      - name: Run cross tests
-        if: ${{ !cancelled() }}
-        run: cross test --package rustls --target ${{ matrix.target }}
-      - name: Run cross tests (rustls-test)
-        if: ${{ !cancelled() }}
-        run: cross test --package rustls-test --features aws-lc-rs --no-default-features --target ${{ matrix.target }}
-
   semver:
     name: Check semver compatibility
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -405,10 +379,10 @@ jobs:
 
   format:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install rust toolchain
@@ -424,10 +398,10 @@ jobs:
 
   format-unstable:
     name: Format (unstable)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install rust nightly toolchain
@@ -445,10 +419,10 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -464,10 +438,10 @@ jobs:
 
   clippy-nightly:
     name: Clippy (Nightly)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -484,16 +458,16 @@ jobs:
 
   check-external-types:
     name: Validate external types appearing in public API
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-10-18
+          toolchain: nightly-2026-03-20
           # ^ sync with https://github.com/awslabs/cargo-check-external-types/blob/main/rust-toolchain.toml
       - name: Install cargo-check-external-types
         uses: taiki-e/cache-cargo-install-action@v3
@@ -505,12 +479,12 @@ jobs:
 
   openssl-tests:
     name: Run openssl-tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm64-8x
     env:
-      VERSION: openssl-3.4.0
+      VERSION: openssl-4.0.1
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -518,11 +492,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache ${{ env.VERSION }}
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         id: cache-openssl
         with:
           path: ${{ env.VERSION }}
-          key: ${{ env.VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ env.VERSION }}
 
       - name: Fetch and build ${{ env.VERSION }}
         if: steps.cache-openssl.outputs.cache-hit != 'true'
@@ -536,9 +510,9 @@ jobs:
 
       - name: Use ${{ env.VERSION }}
         run: |
-         path=$(pwd)/$VERSION/built/
-         echo "$path/bin" >> $GITHUB_PATH
-         echo "LD_LIBRARY_PATH=$path/lib" >> $GITHUB_ENV
+          path=$(pwd)/$VERSION/built/
+          echo "$path/bin" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=$path/lib" >> $GITHUB_ENV
 
       - name: openssl version
         run: openssl version
@@ -552,5 +526,5 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
-    - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2

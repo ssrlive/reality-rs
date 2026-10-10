@@ -2,9 +2,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
 
-use aws_lc_rs::aead::{
-    self, Aad, BoundKey, NONCE_LEN, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey,
-};
+use aws_lc_rs::aead::{self, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use aws_lc_rs::agreement;
 use aws_lc_rs::cipher::{AES_128_KEY_LEN, AES_256_KEY_LEN};
 use aws_lc_rs::digest::{SHA256_OUTPUT_LEN, SHA384_OUTPUT_LEN, SHA512_OUTPUT_LEN};
@@ -444,11 +442,16 @@ impl<const KEY_SIZE: usize, const KDF_SIZE: usize> HpkeSealer for Sealer<KEY_SIZ
 
         let key = UnboundKey::new(self.key_schedule.aead, &self.key_schedule.key.0)
             .map_err(unspecified_err)?;
-        let mut sealing_key = SealingKey::new(key, &mut self.key_schedule);
+        let sealing_key = LessSafeKey::new(key);
+
+        let nonce = self.key_schedule.compute_nonce();
+        self.key_schedule
+            .increment_seq_num()
+            .map_err(unspecified_err)?;
 
         let mut in_out_buffer = Vec::from(plaintext);
         sealing_key
-            .seal_in_place_append_tag(Aad::from(aad), &mut in_out_buffer)
+            .seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out_buffer)
             .map_err(unspecified_err)?;
 
         Ok(in_out_buffer)
@@ -498,11 +501,18 @@ impl<const KEY_SIZE: usize, const KDF_SIZE: usize> HpkeOpener for Opener<KEY_SIZ
 
         let key = UnboundKey::new(self.key_schedule.aead, &self.key_schedule.key.0)
             .map_err(unspecified_err)?;
-        let mut opening_key = OpeningKey::new(key, &mut self.key_schedule);
+        let opening_key = LessSafeKey::new(key);
 
         let mut in_out_buffer = Vec::from(ciphertext);
         let plaintext = opening_key
-            .open_in_place(Aad::from(aad), &mut in_out_buffer)
+            .open_in_place(
+                self.key_schedule.compute_nonce(),
+                Aad::from(aad),
+                &mut in_out_buffer,
+            )
+            .map_err(unspecified_err)?;
+        self.key_schedule
+            .increment_seq_num()
             .map_err(unspecified_err)?;
 
         Ok(plaintext.to_vec())
@@ -737,30 +747,27 @@ struct KeySchedule<const KEY_SIZE: usize> {
     aead: &'static aead::Algorithm,
     key: AeadKey<KEY_SIZE>,
     base_nonce: [u8; NONCE_LEN],
-    seq_num: u32,
+    seq_num: u128,
 }
 
 impl<const KEY_SIZE: usize> KeySchedule<KEY_SIZE> {
     /// See [RFC 9180 §5.2 "Encryption and Decryption"][0].
     ///
     /// [0]: https://www.rfc-editor.org/rfc/rfc9180.html#section-5.2
-    fn compute_nonce(&self) -> [u8; NONCE_LEN] {
+    fn compute_nonce(&self) -> Nonce {
         // def Context<ROLE>.ComputeNonce(seq):
         //   seq_bytes = I2OSP(seq, Nn)
         //   return xor(self.base_nonce, seq_bytes)
 
-        // Each new N-byte nonce is conceptually two parts:
-        //   * N-4 bytes of the base nonce (0s in `nonce` to XOR in as-is).
-        //   * 4 bytes derived from the sequence number XOR the base nonce.
-        let mut nonce = [0; NONCE_LEN];
         let seq_bytes = self.seq_num.to_be_bytes();
-        nonce[NONCE_LEN - seq_bytes.len()..].copy_from_slice(&seq_bytes);
+        let mut nonce = [0; NONCE_LEN];
+        nonce.copy_from_slice(&seq_bytes[seq_bytes.len() - NONCE_LEN..]);
 
         for (n, &b) in nonce.iter_mut().zip(&self.base_nonce) {
             *n ^= b;
         }
 
-        nonce
+        Nonce::assume_unique_for_key(nonce)
     }
 
     /// See [RFC 9180 §5.2 "Encryption and Decryption"][0].
@@ -773,25 +780,15 @@ impl<const KEY_SIZE: usize> KeySchedule<KEY_SIZE> {
         //   self.seq += 1
 
         // Determine the maximum sequence number using the AEAD nonce's length in bits.
-        // Do this as an u128 to prevent overflowing.
         let max_seq_num = (1u128 << (NONCE_LEN * 8)) - 1;
 
-        // Promote the u32 sequence number to an u128 and compare against the maximum allowed
-        // sequence number.
-        if u128::from(self.seq_num) >= max_seq_num {
+        // Ensure the counter portion of the nonce does not wrap when truncated to 96-bits.
+        if self.seq_num >= max_seq_num {
             return Err(aws_lc_rs::error::Unspecified);
         }
 
         self.seq_num += 1;
         Ok(())
-    }
-}
-
-impl<const KEY_SIZE: usize> NonceSequence for &mut KeySchedule<KEY_SIZE> {
-    fn advance(&mut self) -> Result<Nonce, aws_lc_rs::error::Unspecified> {
-        let nonce = self.compute_nonce();
-        self.increment_seq_num()?;
-        Nonce::try_assume_unique_for_key(&nonce)
     }
 }
 
@@ -1038,12 +1035,96 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn failed_open_does_not_consume_sequence() {
+        for suite in ALL_SUPPORTED_SUITES {
+            let (pk, sk) = suite.generate_key_pair().unwrap();
+            let (enc, mut sealer) = suite
+                .setup_sealer(b"example", &pk)
+                .unwrap();
+            let ct0 = sealer
+                .seal(b"aad", b"message 0")
+                .unwrap();
+            let ct1 = sealer
+                .seal(b"aad", b"message 1")
+                .unwrap();
+
+            let mut opener = suite
+                .setup_opener(&enc, b"example", &sk)
+                .unwrap();
+            assert!(opener.open(b"wrong aad", &ct0).is_err());
+            assert_eq!(opener.open(b"aad", &ct0).unwrap(), b"message 0");
+            assert_eq!(opener.open(b"aad", &ct1).unwrap(), b"message 1");
+        }
+    }
+
+    #[test]
+    fn seq_num_does_not_wrap() {
+        let max_seq_num = (1u128 << (NONCE_LEN * 8)) - 1;
+        let mut ks = KeySchedule::<AES_128_KEY_LEN> {
+            aead: &aead::AES_128_GCM,
+            key: AeadKey([0u8; AES_128_KEY_LEN]),
+            base_nonce: [0u8; NONCE_LEN],
+            seq_num: max_seq_num,
+        };
+        assert!(ks.increment_seq_num().is_err());
+        assert_eq!(ks.seq_num, max_seq_num);
+    }
+
+    #[test]
+    fn seal_at_the_sequence_limit_fails_without_advancing() {
+        let max_seq_num = (1u128 << (NONCE_LEN * 8)) - 1;
+        let mut sealer = Sealer::<AES_128_KEY_LEN, 32> {
+            key_schedule: KeySchedule {
+                aead: &aead::AES_128_GCM,
+                key: AeadKey([0u8; AES_128_KEY_LEN]),
+                base_nonce: [0u8; NONCE_LEN],
+                seq_num: max_seq_num,
+            },
+        };
+        assert!(sealer.seal(b"aad", b"message").is_err());
+        assert_eq!(sealer.key_schedule.seq_num, max_seq_num);
+    }
+
+    // Ensure open propagates the sequence-limit error even after successful authentication.
+    #[test]
+    fn open_at_the_sequence_limit_fails_without_advancing() {
+        let max_seq_num = (1u128 << (NONCE_LEN * 8)) - 1;
+        let mut opener = Opener::<AES_128_KEY_LEN, 32> {
+            key_schedule: KeySchedule {
+                aead: &aead::AES_128_GCM,
+                key: AeadKey([0u8; AES_128_KEY_LEN]),
+                base_nonce: [0u8; NONCE_LEN],
+                seq_num: max_seq_num,
+            },
+        };
+
+        // Seal directly: the HPKE sealer refuses to produce a ciphertext at this
+        // sequence. With an all-zero base nonce, the nonce equals the sequence number
+        // encoded as 12 bytes. At the maximum sequence, every byte is 0xff.
+        let key =
+            LessSafeKey::new(UnboundKey::new(&aead::AES_128_GCM, &[0u8; AES_128_KEY_LEN]).unwrap());
+        let mut ciphertext = b"message".to_vec();
+        key.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key([0xff; NONCE_LEN]),
+            Aad::from(b"aad"),
+            &mut ciphertext,
+        )
+        .unwrap();
+
+        assert!(
+            opener
+                .open(b"aad", &ciphertext)
+                .is_err()
+        );
+        assert_eq!(opener.key_schedule.seq_num, max_seq_num);
+    }
 }
 
 #[cfg(test)]
 mod rfc_tests {
     use alloc::string::String;
-    use std::fs::File;
     use std::println;
 
     use serde::Deserialize;
@@ -1189,8 +1270,8 @@ mod rfc_tests {
     }
 
     fn test_vectors() -> Vec<TestVector> {
-        serde_json::from_reader(
-            &mut File::open("../rustls-provider-test/tests/rfc-9180-test-vectors.json")
+        serde_json::from_slice(
+            &std::fs::read("../rustls-provider-test/tests/rfc-9180-test-vectors.json")
                 .expect("failed to open test vectors data file"),
         )
         .expect("failed to deserialize test vectors")

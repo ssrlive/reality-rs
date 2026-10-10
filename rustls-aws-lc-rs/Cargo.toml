@@ -1,35 +1,44 @@
 [package]
 name = "rustls-aws-lc-rs"
-version = "0.1.0-dev.0"
-edition = "2021"
+version = "0.1.0-dev.1"
+edition.workspace = true
 rust-version = "1.85"
 license = "Apache-2.0 OR ISC OR MIT"
 description = "An aws-lc-based crypto provider for rustls."
-homepage = "https://github.com/rustls/rustls"
 repository = "https://github.com/rustls/rustls"
 categories = ["network-programming", "cryptography"]
 autobenches = false
 
 [features]
-default = ["aws-lc-sys", "std"]
+default = ["aws-lc-sys", "reality", "std"]
 aws-lc-sys = ["aws-lc-rs/aws-lc-sys"]
 fips = ["aws-lc-rs/fips"]
+reality = ["dep:rcgen", "rustls/webpki"]
 std = []
 
 [dependencies]
 aws-lc-rs = { workspace = true, features = ["prebuilt-nasm"] }
 pki-types = { workspace = true }
-rcgen = { workspace = true }
-rustls = { path = "../rustls", version = "0.24.0-dev.0", default-features = false, features = ["webpki"] }
+rcgen = { workspace = true, features = ["aws_lc_rs"], optional = true }
+rustls = { path = "../rustls", version = "0.24.0-dev.1", default-features = false }
 subtle = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
 bencher = { workspace = true }
+criterion = { workspace = true }
 hex = { workspace = true }
 rustls-test = { workspace = true }
+rustls-util = { version = "0.1.0-dev.1", path = "../rustls-util" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
+webpki-roots = { workspace = true }
+
+[[bench]]
+name = "benchmarks"
+path = "benches/benchmarks.rs"
+harness = false
 
 [lints]
 workspace = true

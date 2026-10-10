@@ -30,7 +30,7 @@ clap = { workspace = true }
 env_logger = { workspace = true }
 hkdf = "0.13.0"
 log = { workspace = true }
-rustls = { path = "../rustls", features = ["log"] }
+rustls = { path = "../rustls", features = ["tracing"] }
 rustls-aws-lc-rs = { path = "../rustls-aws-lc-rs" }
 rustls-util = { path = "../rustls-util" }
 serde = { workspace = true }

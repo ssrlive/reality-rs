@@ -1,8 +1,8 @@
 //! This is an example server that streams 0-RTT early data from the client.
 //!
-//! Usage: cargo r --bin simple_0rtt_server --package rustls-examples <path/to/cert.pem> <path/to/privatekey.pem>
+//! Usage: cargo r --bin simple-0rtt-server --package rustls-examples <path/to/cert.pem> <path/to/privatekey.pem>
 //!
-//! You can test interaction either with simple_0rtt_client or with OpenSSL:
+//! You can test interaction either with simple-0rtt-client or with OpenSSL:
 //!
 //! `openssl s_client -connect localhost:4443 -sess_out sess.pem`
 //!
@@ -13,7 +13,7 @@
 //! that is sensible outside of example code.
 
 use core::error::Error as StdError;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::{env, io};
@@ -21,7 +21,7 @@ use std::{env, io};
 use rustls::crypto::Identity;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{Connection, ServerConfig, ServerConnection};
+use rustls::{Connection, ServerConfig, ServerConnection, VecInput};
 use rustls_aws_lc_rs::DEFAULT_PROVIDER;
 use rustls_util::complete_io;
 
@@ -56,20 +56,24 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
         let mut conn = ServerConnection::new(Arc::new(config.clone()))?;
 
+        let mut input = VecInput::default();
+        let mut output = Vec::new();
         let mut buf = Vec::new();
         let mut did_early_data = false;
         'handshake: while conn.is_handshaking() {
-            while conn.wants_write() {
-                if conn.write_tls(&mut stream)? == 0 {
+            while !output.is_empty() {
+                let len = stream.write(&output)?;
+                if len == 0 {
                     // EOF
                     stream.flush()?;
                     break 'handshake;
                 }
+                output.drain(..len);
             }
             stream.flush()?;
 
-            while conn.wants_read() {
-                match conn.read_tls(&mut stream) {
+            loop {
+                match input.read(&mut stream) {
                     Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
                     Ok(_) => break,
                     Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
@@ -77,26 +81,29 @@ fn main() -> Result<(), Box<dyn StdError>> {
                 };
             }
 
-            if let Err(e) = conn.process_new_packets() {
-                let _ignored = conn.write_tls(&mut stream);
+            let mut handler = conn.read_tls(&mut input, &mut output);
+            let mut early_data = Vec::new();
+            while let Some(result) = handler.next_early_data() {
+                match result {
+                    Ok(payload) => early_data.extend_from_slice(payload.bytes()),
+                    Err(_) => break,
+                }
+            }
+
+            if let Err(e) = handler.handle_all(&mut Vec::new()) {
+                let _ignored = stream.write_all(&output);
                 stream.flush()?;
 
                 return Err(io::Error::new(io::ErrorKind::InvalidData, e).into());
             };
 
-            if let Some(mut early_data) = conn.early_data() {
+            if !early_data.is_empty() {
                 if !did_early_data {
                     println!("Receiving early data from client");
                     did_early_data = true;
                 }
 
-                let bytes_read = early_data
-                    .read_to_end(&mut buf)
-                    .unwrap();
-
-                if bytes_read != 0 {
-                    println!("Early data from client: {buf:?}");
-                }
+                println!("Early data from client: {early_data:?}");
             }
         }
 
@@ -106,9 +113,8 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
         println!("Handshake complete\n");
 
-        conn.writer()
-            .write_all(b"Hello from the server")?;
-        conn.send_close_notify();
-        complete_io(&mut stream, &mut conn)?;
+        conn.write(b"Hello from the server".into(), &mut output)?;
+        conn.send_close_notify(&mut output)?;
+        complete_io(&mut stream, &mut input, &mut buf, &mut output, &mut conn)?;
     }
 }

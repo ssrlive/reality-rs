@@ -8,8 +8,8 @@ use crate::crypto::{CryptoProvider, Identity, SignatureScheme, WebPkiSupportedAl
 use crate::error::ApiMisuse;
 use crate::sync::Arc;
 use crate::verify::{
-    HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
-    SignatureVerificationInput,
+    HandshakeSignatureValid, ServerIdentity, ServerVerifier, SignatureVerificationInput,
+    VerifiedIdentity,
 };
 use crate::webpki::verify::{
     ParsedCertificate, verify_identity_signed_by_trust_anchor_impl, verify_tls12_signature,
@@ -17,7 +17,7 @@ use crate::webpki::verify::{
 };
 use crate::webpki::{VerifierBuilderError, parse_crls, verify_server_name};
 #[cfg(doc)]
-use crate::{ConfigBuilder, ServerConfig, crypto};
+use crate::{ClientConfig, ConfigBuilder, crypto};
 use crate::{DynHasher, Error, RootCertStore};
 
 /// A builder for configuring a `webpki` server certificate verifier.
@@ -48,7 +48,7 @@ impl ServerVerifierBuilder {
         }
     }
 
-    /// Verify the revocation state of presented client certificates against the provided
+    /// Verify the revocation state of presented server certificates against the provided
     /// certificate revocation lists (CRLs). Calling `with_crls` multiple times appends the
     /// given CRLs to the existing collection.
     pub fn with_crls(
@@ -106,8 +106,8 @@ impl ServerVerifierBuilder {
     /// signature verification algorithms is used, controlled by the selected [`crypto::CryptoProvider`].
     ///
     /// Once built, the provided `Arc<dyn ServerVerifier>` can be used with a Rustls
-    /// [`ServerConfig`] to configure client certificate validation using
-    /// [`with_client_cert_verifier`][ConfigBuilder<ClientConfig, WantsVerifier>::with_client_cert_verifier].
+    /// [`ClientConfig`] to configure server certificate validation using
+    /// [`with_webpki_verifier`][ConfigBuilder<ClientConfig, WantsVerifier>::with_webpki_verifier].
     ///
     /// # Errors
     /// This function will return a [`VerifierBuilderError`] if:
@@ -129,7 +129,7 @@ impl ServerVerifierBuilder {
     }
 }
 
-/// Default `ServerVerifier`, see the trait impl for more information.
+/// Default [`ServerVerifier`], see the trait impl for more information.
 #[derive(Debug, Hash)]
 pub struct WebPkiServerVerifier {
     roots: Arc<RootCertStore>,
@@ -173,7 +173,7 @@ impl WebPkiServerVerifier {
     ///
     /// * `roots` is the set of trust anchors to trust for issuing server certs.
     /// * `crls` are a vec of owned certificate revocation lists (CRLs) to use for
-    ///   client certificate validation.
+    ///   server certificate validation.
     /// * `revocation_check_depth` controls which certificates have their revocation status checked
     ///   when `crls` are provided.
     /// * `unknown_revocation_policy` controls how certificates with an unknown revocation status
@@ -201,7 +201,8 @@ impl WebPkiServerVerifier {
 
 impl ServerVerifier for WebPkiServerVerifier {
     /// Will verify the certificate is valid in the following ways:
-    /// - Signed by a trusted `RootCertStore` CA
+    ///
+    /// - Signed by a trusted [`RootCertStore`] CA
     /// - Not Expired
     /// - Valid for DNS entry
     /// - Valid revocation status (if applicable).
@@ -210,7 +211,10 @@ impl ServerVerifier for WebPkiServerVerifier {
     /// each certificate in the chain to a root CA (excluding the root itself), or only the
     /// end entity certificate. Similarly, unknown revocation status may be treated as an error
     /// or allowed based on configuration.
-    fn verify_identity(&self, identity: &ServerIdentity<'_>) -> Result<PeerVerified, Error> {
+    fn verify_identity<'a>(
+        &self,
+        identity: &ServerIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, Error> {
         let certificates = match identity.identity {
             Identity::X509(certificates) => certificates,
             Identity::RawPublicKey(_) => {
@@ -249,7 +253,7 @@ impl ServerVerifier for WebPkiServerVerifier {
         )?;
 
         verify_server_name(&cert, identity.server_name)?;
-        Ok(PeerVerified::assertion())
+        Ok(VerifiedIdentity::assertion(identity.identity.clone()))
     }
 
     fn verify_tls12_signature(

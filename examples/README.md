@@ -2,22 +2,22 @@
 
 This directory contains a number of examples that use Rustls.
 
-We recommend new users start by looking at `simpleclient.rs` and `simpleserver.rs`. Once those are understood, `tlsclient-mio.rs` and `tlsserver-mio.rs` provide more advanced examples.
+We recommend new users start by looking at `simple-client.rs` and `simple-server.rs`. Once those are understood, `tls-client-mio.rs` and `tls-server-mio.rs` provide more advanced examples.
 
 ## Client examples
 
-- `simpleclient.rs` - shows a simple client configuration that uses sensible defaults. It demonstrates using the `Stream` helper to treat a Rustls connection as you would a bi-directional TCP stream.
-- `tlsclient-mio.rs` - shows a more complete client example that handles command line flags for customizing TLS options, and uses MIO to handle asynchronous I/O.
-- `limitedclient.rs` - shows how to configure Rustls so that unused cryptography is discarded by the linker. This client only supports TLS 1.3 and a single cipher suite.
-- `simple_0rtt_client.rs` - shows how to make a TLS 1.3 client connection that sends early 0RTT data.
+- `simple-client.rs` - shows a simple client configuration that uses sensible defaults. It demonstrates using the `Stream` helper to treat a Rustls connection as you would a bi-directional TCP stream.
+- `tls-client-mio.rs` - shows a more complete client example that handles command line flags for customizing TLS options, and uses MIO to handle asynchronous I/O.
+- `limited-client.rs` - shows how to configure Rustls so that unused cryptography is discarded by the linker. This client only supports TLS 1.3 and a single cipher suite.
+- `simple-0rtt-client.rs` - shows how to make a TLS 1.3 client connection that sends early 0RTT data.
 - `ech-client.rs` - shows how to configure Rustls to use encrypted client hello (ECH), including fetching an ECH config list with DNS-over-HTTPS.
 
 ## Server examples
 
-- `simpleserver.rs` - shows a very minimal server example that accepts a single TLS connection. See `tlsserver-mio.rs` or `server_acceptor.rs` for a more realistic example.
-- `tlsserver-mio.rs` - shows a more complete server example that handles command line flags for customizing TLS options, and uses MIO to handle asynchronous I/O.
-- `simple_0rtt_server.rs` - shows how to make a TLS1.3 that accepts multiple connections and prints early 0RTT data.
-- `server_acceptor.rs` - shows how to use the `Acceptor` API to create a server that generates a unique `ServerConfig` for each client. This example also shows how to use client authentication, CRL revocation checking, and uses `rcgen` to generate its own certificates.
+- `simple-server.rs` - shows a very minimal server example that accepts a single TLS connection. See `tls-server-mio.rs` or `server-acceptor.rs` for a more realistic example.
+- `tls-server-mio.rs` - shows a more complete server example that handles command line flags for customizing TLS options, and uses MIO to handle asynchronous I/O.
+- `simple-0rtt-server.rs` - shows how to make a TLS1.3 server that accepts multiple connections and prints early 0RTT data.
+- `server-acceptor.rs` - shows how to use the `ServerHandshake` API to create a server that generates a unique `ServerConfig` for each client. This example also shows how to use client authentication, CRL revocation checking, and uses `rcgen` to generate its own certificates.
 
 ## Client-Server examples
 
@@ -29,7 +29,9 @@ For a longer Chinese write-up that explains both the protocol intuition and the 
 
 The REALITY-capable example programs now support both CLI flags and `--reality-config` files in JSON or TOML.
 
-`tlsserver-mio.rs` also supports `--reality-fallback-address <addr>` plus `--reality-fallback-port <port>`, or `reality.fallbackAddress` plus `reality.fallbackPort` in the config file, to raw-forward connections whose pre-read `ClientHello` SNI falls outside the configured `serverNames` allowlist to `addr:port`. The address defaults to `localhost` if only a port is set. CLI wins if both are set. The config file can also define ordered `reality.fallbackRules` entries to route specific SNI values, optional ALPN offerings, and optional key-exchange group offerings via `namedGroups`, to alternate decoy targets before the global fallback target is used. Each rule must include at least one matcher (`serverNames`, `alpns`, or `namedGroups`), and all fallback ports must be non-zero so invalid decoy targets fail at startup instead of later at connect time. This is an initial probe-diversion step for decoy handling, not a full Xray-equivalent cryptographic discriminator.
+The AWS-LC provider enables its `reality` feature by default. Downstream users disabling default features must explicitly enable `reality` to use this module; it enables WebPKI and certificate generation dependencies.
+
+`tls-server-mio.rs` also supports `--reality-fallback-address <addr>` plus `--reality-fallback-port <port>`, or `reality.fallbackAddress` plus `reality.fallbackPort` in the config file, to raw-forward connections whose pre-read `ClientHello` SNI falls outside the configured `serverNames` allowlist to `addr:port`. The address defaults to `localhost` if only a port is set. CLI wins if both are set. The config file can also define ordered `reality.fallbackRules` entries to route specific SNI values, optional ALPN offerings, and optional key-exchange group offerings via `namedGroups`, to alternate decoy targets before the global fallback target is used. Each rule must include at least one matcher (`serverNames`, `alpns`, or `namedGroups`), and all fallback ports must be non-zero so invalid decoy targets fail at startup instead of later at connect time. This is an initial probe-diversion step for decoy handling, not a full Xray-equivalent cryptographic discriminator.
 
 ### Xray field mapping
 
@@ -38,9 +40,9 @@ The REALITY-capable example programs now support both CLI flags and `--reality-c
 | `shortIds`            | `--reality-short-id`   | `--reality-short-id`                                     | `reality.shortIds`                                 | Client uses one value; server config accepts one or more hex values.                                                                                                                                |
 | `publicKey`           | `--reality-public-key` | n/a                                                      | `reality.publicKey`                                | Client uses the server's X25519 public key. The config loader also accepts Xray's client-side alias `password`.                                                                                     |
 | `privateKey`          | n/a                    | `--reality-private-key`                                  | `reality.privateKey`                               | Server uses the matching X25519 private key.                                                                                                                                                        |
-| `serverName`          | `--server-name`        | `--reality-server-name` (repeatable)                     | `reality.serverName` / `reality.serverNames`       | Client-side TLS SNI and certificate verification name. Both `tlsserver-mio.rs` and `simpleserver.rs` can enforce an allowlist via `serverNames`.                                                    |
-| decoy fallback target | n/a                    | `--reality-fallback-address` + `--reality-fallback-port` | `reality.fallbackAddress` + `reality.fallbackPort` | `tlsserver-mio.rs` only. Reject-path raw TCP forwarding target. Address defaults to `localhost` when omitted. CLI overrides config.                                                                 |
-| decoy fallback rules  | n/a                    | n/a                                                      | `reality.fallbackRules`                            | `tlsserver-mio.rs` only. Ordered decoy targets matched by SNI, optional `alpns`, and optional `namedGroups`, evaluated before the default fallback target. Each rule must set at least one matcher. |
+| `serverName`          | `--server-name`        | `--reality-server-name` (repeatable)                     | `reality.serverName` / `reality.serverNames`       | Client-side TLS SNI and certificate verification name. Both `tls-server-mio.rs` and `simple-server.rs` can enforce an allowlist via `serverNames`.                                                    |
+| decoy fallback target | n/a                    | `--reality-fallback-address` + `--reality-fallback-port` | `reality.fallbackAddress` + `reality.fallbackPort` | `tls-server-mio.rs` only. Reject-path raw TCP forwarding target. Address defaults to `localhost` when omitted. CLI overrides config.                                                                 |
+| decoy fallback rules  | n/a                    | n/a                                                      | `reality.fallbackRules`                            | `tls-server-mio.rs` only. Ordered decoy targets matched by SNI, optional `alpns`, and optional `namedGroups`, evaluated before the default fallback target. Each rule must set at least one matcher. |
 | version tag           | `--reality-version`    | `--reality-version`                                      | `reality.version`                                  | Rust examples currently require an explicit 3-byte version tag encoded as 6 hex digits.                                                                                                             |
 
 ### Config file examples
@@ -52,18 +54,18 @@ Server TOML example: [examples/config/reality-server.toml](c:/Users/Administrato
 Example client invocation using a config file:
 
 ```powershell
-cargo run -p rustls-examples --bin tlsclient-mio -- --port 9445 --protover 1.3 --cafile .\bogo\keys\cert.pem --reality-config .\examples\config\reality-client.json localhost
+cargo run -p rustls-examples --bin tls-client-mio -- --port 9445 --protover 1.3 --cafile .\bogo\keys\cert.pem --reality-config .\examples\config\reality-client.json localhost
 ```
 
 Example server invocation using a config file:
 
 ```powershell
-cargo run -p rustls-examples --bin simpleserver -- --cert .\bogo\keys\cert.pem --key .\bogo\keys\key.pem --port 9445 --reality-config .\examples\config\reality-server.toml
+cargo run -p rustls-examples --bin simple-server -- --cert .\bogo\keys\cert.pem --key .\bogo\keys\key.pem --port 9445 --reality-config .\examples\config\reality-server.toml
 ```
 
 ### REALITY server implementation status
 
-This workspace now has a usable example-level REALITY server path centered on `tlsserver-mio.rs`. It is best understood as a constrained probe-routing implementation built on top of Rustls TLS 1.3 handling, not as a full reimplementation of Xray's production REALITY server semantics.
+This workspace now has a usable example-level REALITY server path centered on `tls-server-mio.rs`. It is best understood as a constrained probe-routing implementation built on top of Rustls TLS 1.3 handling, not as a full reimplementation of Xray's production REALITY server semantics.
 
 #### Completion boundary
 
@@ -71,7 +73,7 @@ The current implementation should be treated as complete for the following scope
 
 - REALITY server configuration can be loaded from CLI flags or JSON/TOML config files.
 - REALITY handshakes are constrained to the example provider path already wired into Rustls examples.
-- `tlsserver-mio.rs` can pre-read `ClientHello`, decide whether traffic should stay on the REALITY/TLS path or be diverted to a decoy backend, and then either continue the handshake or raw-forward bytes.
+- `tls-server-mio.rs` can pre-read `ClientHello`, decide whether traffic should stay on the REALITY/TLS path or be diverted to a decoy backend, and then either continue the handshake or raw-forward bytes.
 - Decoy selection is configurable through one default fallback target plus ordered `reality.fallbackRules`.
 - Rule matching now supports `serverNames`, `alpns`, and `namedGroups`, with startup validation for obviously bad configs.
 - The example binaries and focused tests currently exercise this behavior successfully.
@@ -82,8 +84,8 @@ Outside that boundary, further work should be treated as new feature development
 
 - REALITY client and server examples support Xray-style `shortId`, `publicKey` or `privateKey`, `serverName`, and `version` fields through config loading.
 - The server side enforces REALITY mode as TLS 1.3 only.
-- `tlsserver-mio.rs` uses `Acceptor` to inspect the incoming `ClientHello` before the full handshake completes.
-- The server can reject probes by SNI allowlist and can additionally inspect the raw `session_id` prefix to distinguish expected REALITY traffic from plain TLS probes.
+- `tls-server-mio.rs` uses `ServerHandshake` to inspect the incoming `ClientHello` before the full handshake completes.
+- The server checks the SNI allowlist and authenticates REALITY using X25519, HKDF and AES-GCM; a raw `session_id` prefix is not trusted for acceptance.
 - Rejected traffic can be forwarded to a configured decoy backend using nonblocking passthrough I/O.
 - Ordered decoy routing rules can match on SNI, ALPN, and named groups before falling back to the default decoy target.
 - Sample config, config parsing, and focused tests exist for this ruleset.

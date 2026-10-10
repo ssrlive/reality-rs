@@ -154,9 +154,9 @@ macro_rules! extension_struct {
         }
 
         impl<'a> $struct_name$(<$struct_lt>)* {
-            /// Reads one extension typ, length and body from `r`.
+            /// Reads one extension type, length and body from `r`.
             ///
-            /// Unhandled extensions (according to `read_extension_body()` are inserted into `unknown_extensions`)
+            /// The `unknown` callback is invoked for extensions not handled by `read_extension_body()`.
             fn read_one(
                 &mut self,
                 r: &mut Reader<'a>,
@@ -164,13 +164,13 @@ macro_rules! extension_struct {
             ) -> Result<ExtensionType, InvalidMessage> {
                 let typ = ExtensionType::read(r)?;
                 let len = usize::from(u16::read(r)?);
-                let mut ext_body = r.sub(len)?;
-                match self.read_extension_body(typ, &mut ext_body)? {
-                    true => ext_body.expect_empty(stringify!($struct_name))?,
-                    false => unknown(typ)?,
-
-                };
-                Ok(typ)
+                r.sub(len)?
+                    .all(stringify!($struct_name), |body| {
+                        if !self.read_extension_body(typ, body)? {
+                            unknown(typ)?;
+                        }
+                        Ok(typ)
+                    })
             }
 
             /// Reads one extension body for an extension named by `typ`.
@@ -310,7 +310,7 @@ macro_rules! extension_struct {
             }
 
             /// Every `ExtensionType` this structure may encode/decode.
-            const ALL_EXTENSIONS: &'static [ExtensionType] = &[
+            pub(super) const ALL_EXTENSIONS: &'static [ExtensionType] = &[
                 $($item_id,)*
             ];
         }

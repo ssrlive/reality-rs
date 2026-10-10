@@ -129,7 +129,7 @@ pub trait HkdfExpander: Send + Sync {
 
 /// A HKDF implementation oriented to the needs of TLS1.3.
 ///
-/// See [RFC5869](https://datatracker.ietf.org/doc/html/rfc5869) for the terminology
+/// See [RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869) for the terminology
 /// used in this definition.
 ///
 /// You can use [`HkdfUsingHmac`] which implements this trait on top of an implementation
@@ -175,7 +175,7 @@ pub trait Hkdf: Send + Sync {
     /// This should use the same hash function as the HKDF functions in this
     /// trait.
     ///
-    /// See [RFC2104](https://datatracker.ietf.org/doc/html/rfc2104) for the
+    /// See [RFC 2104](https://datatracker.ietf.org/doc/html/rfc2104) for the
     /// definition of HMAC.
     fn hmac_sign(&self, key: &OkmBlock, message: &[u8]) -> hmac::Tag;
 
@@ -238,20 +238,21 @@ impl OkmBlock {
     pub fn new(bytes: &[u8]) -> Self {
         let mut tag = Self {
             buf: [0u8; Self::MAX_LEN],
-            used: bytes.len(),
+            used: 0,
         };
         tag.buf[..bytes.len()].copy_from_slice(bytes);
+        tag.used = bytes.len();
         tag
     }
 
-    /// Maximum supported HMAC tag size: supports up to SHA512.
+    /// Maximum supported OKM block size: supports up to SHA512.
     pub const MAX_LEN: usize = 64;
 }
 
 impl Drop for OkmBlock {
     #[inline(never)]
     fn drop(&mut self) {
-        self.buf.zeroize();
+        self.buf[..self.used].zeroize();
     }
 }
 

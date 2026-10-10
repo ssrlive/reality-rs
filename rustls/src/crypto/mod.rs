@@ -48,19 +48,17 @@ pub mod hpke;
 
 #[cfg(any(doc, test))]
 pub(crate) mod test_provider;
-#[cfg(test)]
-pub(crate) use test_provider::TEST_PROVIDER;
 #[cfg(doc)]
 #[doc(hidden)]
 pub use test_provider::TEST_PROVIDER;
-#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
-pub(crate) use test_provider::TLS13_TEST_SUITE;
+#[cfg(test)]
+pub(crate) use test_provider::{TEST_PROVIDER, TLS13_TEST_SUITE};
 
 // Message signing interfaces.
 mod signer;
 pub use signer::{
     CertificateIdentity, Credentials, Identity, InconsistentKeys, SelectedCredential, Signer,
-    SigningKey, SingleCredential, public_key_to_spki,
+    SigningKey, SingleCredential, VerifiedIdentity, public_key_to_spki,
 };
 
 pub use crate::suites::CipherSuiteCommon;
@@ -69,26 +67,6 @@ pub use crate::suites::CipherSuiteCommon;
 ///
 /// This structure provides defaults. Everything in it can be overridden at
 /// runtime by replacing field values as needed.
-///
-/// # Using the per-process default `CryptoProvider`
-///
-/// If it is hard to pass a specific `CryptoProvider` to all callers that need to establish
-/// TLS connections, you can store a per-process `CryptoProvider` default via
-/// [`CryptoProvider::install_default()`]. When initializing a `ClientConfig` or `ServerConfig` via
-/// [`ClientConfig::builder()`] or [`ServerConfig::builder()`], you can obtain the installed
-/// provider via [`CryptoProvider::get_default()`].
-///
-/// The intention is that an application can specify the [`CryptoProvider`] they wish to use
-/// once, and have that apply to the variety of places where their application does TLS
-/// (which may be wrapped inside other libraries).
-/// They should do this by calling [`CryptoProvider::install_default()`] early on.
-///
-/// To achieve this goal:
-///
-/// - _libraries_ should use [`ClientConfig::builder()`]/[`ServerConfig::builder()`]
-///   or otherwise rely on the [`CryptoProvider::get_default()`] provider.
-/// - _applications_ should call [`CryptoProvider::install_default()`] early
-///   in their `fn main()`.
 ///
 /// # Using a specific `CryptoProvider`
 ///
@@ -158,7 +136,7 @@ pub use crate::suites::CipherSuiteCommon;
 /// Call [`CryptoProvider::fips()`] to determine the FIPS status of a given provider.
 ///
 /// You can verify the configuration at runtime by checking
-/// [`ServerConfig::fips()`]/[`ClientConfig::fips()`] return `true`.
+/// [`ServerConfig::fips()`]/[`ClientConfig::fips()`].
 #[expect(clippy::exhaustive_structs)]
 #[derive(Debug, Clone)]
 pub struct CryptoProvider {
@@ -210,25 +188,6 @@ pub struct CryptoProvider {
 }
 
 impl CryptoProvider {
-    /// Sets this `CryptoProvider` as the default for this process.
-    ///
-    /// This can be called successfully at most once in any process execution.
-    ///
-    /// After calling this, other callers can obtain a reference to the installed
-    /// default via [`CryptoProvider::get_default()`].
-    pub fn install_default(self) -> Result<(), Arc<Self>> {
-        static_default::install_default(self)
-    }
-}
-
-impl CryptoProvider {
-    /// Returns the default `CryptoProvider` for this process.
-    ///
-    /// This will be `None` if no default has been set yet.
-    pub fn get_default() -> Option<&'static Arc<Self>> {
-        static_default::get_default()
-    }
-
     /// Return the FIPS validation status for this `CryptoProvider`.
     ///
     /// This covers only the cryptographic parts of FIPS approval.  There are
@@ -634,25 +593,6 @@ pub trait TicketProducer: Debug + Send + Sync {
     /// The objective is to limit damage to forward secrecy caused
     /// by tickets, not just limiting their lifetime.
     fn lifetime(&self) -> Duration;
-}
-
-mod static_default {
-    use std::sync::OnceLock;
-
-    use super::CryptoProvider;
-    use crate::sync::Arc;
-
-    pub(crate) fn install_default(
-        default_provider: CryptoProvider,
-    ) -> Result<(), Arc<CryptoProvider>> {
-        PROCESS_DEFAULT_PROVIDER.set(Arc::new(default_provider))
-    }
-
-    pub(crate) fn get_default() -> Option<&'static Arc<CryptoProvider>> {
-        PROCESS_DEFAULT_PROVIDER.get()
-    }
-
-    static PROCESS_DEFAULT_PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
 }
 
 #[cfg(test)]

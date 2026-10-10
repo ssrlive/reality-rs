@@ -21,9 +21,10 @@
 //! [mio]: https://docs.rs/mio/latest/mio/
 
 use core::hash::Hasher;
+use core::mem;
 use core::time::Duration;
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write, stderr};
 use std::net::TcpStream as StdTcpStream;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -35,7 +36,6 @@ use std::{fs, net};
 mod reality_config;
 
 use clap::{Parser, Subcommand};
-use log::{debug, error};
 use mio::net::{TcpListener, TcpStream};
 use rustls::crypto::kx::NamedGroup;
 use rustls::crypto::{CryptoProvider, Identity};
@@ -43,11 +43,12 @@ use rustls::enums::{ApplicationProtocol, ProtocolVersion};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 use rustls::server::{
-    Acceptor, ClientHelloVerifier, NoServerSessionStorage, RealityClientHello, WebPkiClientVerifier,
+    ClientHelloVerifier, NoServerSessionStorage, RealityClientHello, ServerHandshake,
+    WebPkiClientVerifier,
 };
-use rustls::{Connection, RootCertStore, ServerConfig, ServerConnection};
+use rustls::{Connection, RootCertStore, ServerConfig, ServerConnection, VecInput};
 use rustls_aws_lc_rs as provider;
-use rustls_util::KeyLogFile;
+use tracing::{Level, debug, error};
 
 use reality_config::{RealityFallbackRuleConfig, RealityServerConfig, load_reality_document};
 
@@ -309,7 +310,7 @@ impl TlsServer {
 
 enum ConnectionState {
     Accepting {
-        acceptor: Acceptor,
+        handshake: ServerHandshake,
         buffered: Vec<u8>,
     },
     Probing {
@@ -342,6 +343,9 @@ struct OpenConnection {
     front_send_buf: Vec<u8>,
     back_send_buf: Vec<u8>,
     reality_server_names: Vec<String>, // Added field for reality server names
+    input: VecInput,
+    output: Vec<u8>,
+    pending: Vec<u8>,
     sent_http_response: bool,
 }
 
@@ -484,7 +488,7 @@ impl OpenConnection {
             reality_fallback_target.is_some() || !reality_fallback_rules.is_empty();
         let state = if needs_acceptor {
             ConnectionState::Accepting {
-                acceptor: Acceptor::default(),
+                handshake: ServerHandshake::NeedsInput(ServerHandshake::start()),
                 buffered: Vec::new(),
             }
         } else {
@@ -512,23 +516,25 @@ impl OpenConnection {
             front_send_buf: Vec::new(),
             back_send_buf: Vec::new(),
             reality_server_names,
+            input: VecInput::default(),
+            output: Vec::new(),
+            pending: Vec::new(),
             sent_http_response: false,
         }
     }
 
     /// We're a connection, and we have something to do.
     fn ready(&mut self, registry: &mio::Registry, ev: &mio::event::Event) {
-        // If we're readable: read some TLS.  Then
-        // see if that yielded new plaintext.  Then
-        // see if the backend is readable too.
+        // If we're readable: read some TLS, handle any plaintext it
+        // yields, then see if the backend is readable too.
         if ev.is_readable() {
             match self.state {
                 ConnectionState::Accepting { .. } => self.do_accept_read(registry),
                 ConnectionState::Probing { .. } => {}
                 ConnectionState::Tls(_) => {
                     self.do_tls_read();
-                    self.try_plain_read();
                     self.try_back_read_tls();
+                    self.flush_pending();
                 }
                 ConnectionState::Passthrough => {
                     self.try_front_read_passthrough();
@@ -555,13 +561,6 @@ impl OpenConnection {
 
     fn tls_conn(&self) -> Option<&ServerConnection> {
         match &self.state {
-            ConnectionState::Tls(conn) => Some(conn),
-            _ => None,
-        }
-    }
-
-    fn tls_conn_mut(&mut self) -> Option<&mut ServerConnection> {
-        match &mut self.state {
             ConnectionState::Tls(conn) => Some(conn),
             _ => None,
         }
@@ -602,9 +601,9 @@ impl OpenConnection {
                 }
                 Ok(len) => {
                     let mut incoming = &buf[..len];
-                    if let ConnectionState::Accepting { acceptor, buffered } = &mut self.state {
+                    if let ConnectionState::Accepting { buffered, .. } = &mut self.state {
                         buffered.extend_from_slice(&buf[..len]);
-                        if let Err(err) = acceptor.read_tls(&mut incoming) {
+                        if let Err(err) = self.input.read(&mut incoming) {
                             error!("acceptor buffering error {err:?}");
                             self.closing = true;
                             return;
@@ -625,14 +624,28 @@ impl OpenConnection {
     }
 
     fn try_finish_accept(&mut self, registry: &mio::Registry) -> AcceptProgress {
-        let accept_result = match &mut self.state {
-            ConnectionState::Accepting { acceptor, .. } => acceptor.accept(),
+        let handshake = match &mut self.state {
+            ConnectionState::Accepting { handshake, .. } => mem::replace(
+                handshake,
+                ServerHandshake::NeedsInput(ServerHandshake::start()),
+            ),
             _ => return AcceptProgress::Ready,
+        };
+        let accept_result = match handshake {
+            ServerHandshake::NeedsInput(receive) => {
+                receive.process(&mut self.input, &mut self.output)
+            }
+            next => Ok(next),
         };
 
         match accept_result {
-            Ok(None) => AcceptProgress::NeedMore,
-            Ok(Some(accepted)) => {
+            Ok(next @ ServerHandshake::NeedsInput(_)) => {
+                if let ConnectionState::Accepting { handshake, .. } = &mut self.state {
+                    *handshake = next;
+                }
+                AcceptProgress::NeedMore
+            }
+            Ok(ServerHandshake::Accepted(accepted)) => {
                 if let Some(target) = self.fallback_target_for_client_hello(accepted.client_hello())
                 {
                     let buffered = self
@@ -648,10 +661,7 @@ impl OpenConnection {
 
                 match self.start_tls_from_accept_buffer() {
                     Ok(()) => {
-                        if self
-                            .tls_conn()
-                            .is_some_and(ServerConnection::wants_write)
-                        {
+                        if !self.output.is_empty() {
                             self.do_tls_write_and_handle_error();
                         }
                         AcceptProgress::Ready
@@ -663,9 +673,14 @@ impl OpenConnection {
                     }
                 }
             }
-            Err((err, mut alert)) => {
+            Ok(other) => {
+                error!("unexpected server handshake state while accepting ClientHello: {other:?}");
+                self.closing = true;
+                AcceptProgress::Closed
+            }
+            Err(err) => {
                 error!("client hello parse failed: {err:?}");
-                let _ = alert.write_all(&mut self.socket);
+                self.do_tls_write_and_handle_error();
                 self.closing = true;
                 AcceptProgress::Closed
             }
@@ -674,7 +689,7 @@ impl OpenConnection {
 
     fn take_accept_buffer(&mut self) -> Option<Vec<u8>> {
         match &mut self.state {
-            ConnectionState::Accepting { buffered, .. } => Some(core::mem::take(buffered)),
+            ConnectionState::Accepting { buffered, .. } => Some(mem::take(buffered)),
             _ => None,
         }
     }
@@ -715,7 +730,7 @@ impl OpenConnection {
         let ConnectionState::Probing {
             buffered,
             fallback_target,
-        } = core::mem::replace(&mut self.state, ConnectionState::Passthrough)
+        } = mem::replace(&mut self.state, ConnectionState::Passthrough)
         else {
             return;
         };
@@ -729,10 +744,7 @@ impl OpenConnection {
 
         match self.start_tls_from_buffer(&buffered, template.as_deref()) {
             Ok(()) => {
-                if self
-                    .tls_conn()
-                    .is_some_and(ServerConnection::wants_write)
-                {
+                if !self.output.is_empty() {
                     self.do_tls_write_and_handle_error();
                 }
             }
@@ -830,11 +842,36 @@ impl OpenConnection {
         if let Some(template) = server_hello_template {
             conn.set_reality_server_hello_template(template)?;
         }
+        let mut input = VecInput::default();
         let mut incoming = buffered;
-        conn.read_tls(&mut incoming)
-            .map_err(|err| rustls::Error::General(err.to_string()))?;
-        conn.process_new_packets()?;
+        let mut output = Vec::new();
+        let mut received_plaintext = Vec::new();
+        let mut early_data = Vec::new();
+        while !incoming.is_empty() {
+            input
+                .read(&mut incoming)
+                .map_err(|err| rustls::Error::General(err.to_string()))?;
+            let mut handler = conn.read_tls(&mut input, &mut output);
+            while let Some(result) = handler.next_early_data() {
+                match result {
+                    Ok(payload) => early_data.extend_from_slice(payload.bytes()),
+                    Err(_) => break,
+                }
+            }
+            handler.handle_all(&mut received_plaintext)?;
+        }
         self.state = ConnectionState::Tls(conn);
+        self.input = input;
+        self.output = output;
+        if self.back.is_none() {
+            self.back = open_back(&self.mode);
+        }
+        if !early_data.is_empty() {
+            self.incoming_plaintext(&early_data);
+        }
+        if !received_plaintext.is_empty() {
+            self.incoming_plaintext(&received_plaintext);
+        }
         Ok(())
     }
 
@@ -859,17 +896,9 @@ impl OpenConnection {
 
     fn do_tls_read(&mut self) {
         // Read some TLS data.
-        let read_result = match &mut self.state {
-            ConnectionState::Tls(conn) => conn.read_tls(&mut self.socket),
-            _ => return,
-        };
-
-        match read_result {
+        match self.input.read(&mut self.socket) {
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
             Err(err) => {
-                if let io::ErrorKind::WouldBlock = err.kind() {
-                    return;
-                }
-
                 error!("read error {err:?}");
                 self.closing = true;
                 return;
@@ -880,52 +909,39 @@ impl OpenConnection {
                 return;
             }
             Ok(_) => {}
-        };
-
-        // Process newly-received TLS messages.
-        if let ConnectionState::Tls(conn) = &mut self.state {
-            if let Err(err) = conn.process_new_packets() {
-                error!("cannot process packet: {err:?}");
-
-                // last gasp write to send any alerts
-                self.do_tls_write_and_handle_error();
-
-                self.closing = true;
-            }
         }
-    }
 
-    fn try_plain_read(&mut self) {
-        let Some(tls_conn) = self.tls_conn_mut() else {
-            return;
-        };
-
-        // Read and process all available plaintext.
-        if let Ok(io_state) = tls_conn.process_new_packets() {
-            if let Some(mut early_data) = tls_conn.early_data() {
-                let mut buf = Vec::new();
-                early_data
-                    .read_to_end(&mut buf)
-                    .unwrap();
-
-                if !buf.is_empty() {
-                    debug!("early data read {:?}", buf.len());
-                    self.incoming_plaintext(&buf);
-                    return;
+        let mut received_plaintext = Vec::new();
+        let mut early_data = Vec::new();
+        let handling_result = {
+            let ConnectionState::Tls(conn) = &mut self.state else {
+                return;
+            };
+            let mut handler = conn.read_tls(&mut self.input, &mut self.output);
+            while let Some(result) = handler.next_early_data() {
+                match result {
+                    Ok(payload) => early_data.extend_from_slice(payload.bytes()),
+                    Err(_) => break,
                 }
             }
+            handler.handle_all(&mut received_plaintext)
+        };
 
-            if io_state.plaintext_bytes_to_read() > 0 {
-                let mut buf = vec![0u8; io_state.plaintext_bytes_to_read()];
+        if let Err(error) = handling_result {
+            error!("cannot read plaintext: {error:?}");
+            self.do_tls_write_and_handle_error();
+            self.closing = true;
+            return;
+        }
 
-                tls_conn
-                    .reader()
-                    .read_exact(&mut buf)
-                    .unwrap();
+        if !early_data.is_empty() {
+            debug!("early data read {:?}", early_data.len());
+            self.incoming_plaintext(&early_data);
+        }
 
-                debug!("plaintext read {:?}", buf.len());
-                self.incoming_plaintext(&buf);
-            }
+        if !received_plaintext.is_empty() {
+            debug!("plaintext read {:?}", received_plaintext.len());
+            self.incoming_plaintext(&received_plaintext);
         }
     }
 
@@ -954,13 +970,7 @@ impl OpenConnection {
                 debug!("back eof");
                 self.closing = true;
             }
-            Some(len) => {
-                self.tls_conn_mut()
-                    .unwrap()
-                    .writer()
-                    .write_all(&buf[..len])
-                    .unwrap();
-            }
+            Some(len) => self.send_plaintext(&buf[..len]),
             None => {}
         };
     }
@@ -1073,16 +1083,50 @@ impl OpenConnection {
         true
     }
 
+    /// Encrypt `plaintext` into `output`, or queue it if the handshake is
+    /// still in progress (which can happen if plaintext arrives as early data).
+    fn send_plaintext(&mut self, plaintext: &[u8]) {
+        let is_handshaking = self
+            .tls_conn()
+            .is_some_and(ServerConnection::is_handshaking);
+        if is_handshaking {
+            self.pending
+                .extend_from_slice(plaintext);
+        } else {
+            self.flush_pending();
+            if let ConnectionState::Tls(conn) = &mut self.state {
+                conn.write(plaintext.into(), &mut self.output)
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Encrypt plaintext that was queued while the handshake was in progress.
+    fn flush_pending(&mut self) {
+        if self
+            .tls_conn()
+            .is_none_or(ServerConnection::is_handshaking)
+            || self.pending.is_empty()
+        {
+            return;
+        }
+
+        let pending = mem::take(&mut self.pending);
+        let close_notify = self.sent_http_response;
+        if let ConnectionState::Tls(conn) = &mut self.state {
+            conn.write((&pending).into(), &mut self.output)
+                .unwrap();
+            if close_notify {
+                conn.send_close_notify(&mut self.output)
+                    .unwrap();
+            }
+        }
+    }
+
     /// Process some amount of received plaintext.
     fn incoming_plaintext(&mut self, buf: &[u8]) {
         match self.mode {
-            ServerMode::Echo => {
-                self.tls_conn_mut()
-                    .unwrap()
-                    .writer()
-                    .write_all(buf)
-                    .unwrap();
-            }
+            ServerMode::Echo => self.send_plaintext(buf),
             ServerMode::Http => {
                 self.send_http_response_once();
             }
@@ -1100,23 +1144,25 @@ impl OpenConnection {
         let response =
             b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nHello world from rustls tlsserver\r\n";
         if !self.sent_http_response {
-            self.tls_conn_mut()
-                .unwrap()
-                .writer()
-                .write_all(response)
-                .unwrap();
+            self.send_plaintext(response);
             self.sent_http_response = true;
-            self.tls_conn_mut()
-                .unwrap()
-                .send_close_notify();
+            // If the response was queued until the handshake completes,
+            // flush_pending() sends the close_notify instead.
+            if self
+                .tls_conn()
+                .is_some_and(|conn| !conn.is_handshaking())
+                && let ConnectionState::Tls(conn) = &mut self.state
+            {
+                conn.send_close_notify(&mut self.output)
+                    .unwrap();
+            }
         }
     }
 
     fn tls_write(&mut self) -> io::Result<usize> {
-        match &mut self.state {
-            ConnectionState::Tls(conn) => conn.write_tls(&mut self.socket),
-            _ => Ok(0),
-        }
+        let len = self.socket.write(&self.output)?;
+        self.output.drain(..len);
+        Ok(len)
     }
 
     fn do_tls_write_and_handle_error(&mut self) {
@@ -1187,31 +1233,22 @@ impl OpenConnection {
             self.socket_registered = false;
         }
 
-        if let Some(back) = self.back.as_mut() {
-            if self.back_registered {
-                registry.deregister(back).unwrap();
-                self.back_registered = false;
-            }
+        if let Some(back) = self.back.as_mut()
+            && self.back_registered
+        {
+            registry.deregister(back).unwrap();
+            self.back_registered = false;
         }
     }
 
-    /// What IO events we're currently waiting for,
-    /// based on wants_read/wants_write.
+    /// What IO events we're currently waiting for, based on buffered output.
     fn front_event_set(&self) -> mio::Interest {
-        if matches!(self.state, ConnectionState::Passthrough) {
-            return if self.front_send_buf.is_empty() {
-                mio::Interest::READABLE
-            } else {
-                mio::Interest::READABLE | mio::Interest::WRITABLE
-            };
-        }
-
-        let Some(tls_conn) = self.tls_conn() else {
-            return mio::Interest::READABLE;
+        let rd = !matches!(&self.state, ConnectionState::Probing { .. });
+        let wr = match &self.state {
+            ConnectionState::Tls(_) => !self.output.is_empty(),
+            ConnectionState::Passthrough => !self.front_send_buf.is_empty(),
+            ConnectionState::Accepting { .. } | ConnectionState::Probing { .. } => false,
         };
-
-        let rd = tls_conn.wants_read();
-        let wr = tls_conn.wants_write();
 
         if rd && wr {
             mio::Interest::READABLE | mio::Interest::WRITABLE
@@ -1800,7 +1837,11 @@ fn make_config(args: &Args, reality: Option<&RealityServerConfig>) -> Arc<Server
         )
         .expect("bad certificates/private key");
 
-    config.key_log = Arc::new(KeyLogFile::new());
+    // Allow using SSLKEYLOGFILE in debug builds.
+    #[cfg(debug_assertions)]
+    {
+        config.key_log = Arc::new(rustls_util::KeyLogFile::new());
+    }
 
     if args.no_resumption {
         config.session_storage = Arc::new(NoServerSessionStorage {});
@@ -1908,8 +1949,10 @@ fn main() {
     let reality = resolve_reality_config(&args).unwrap();
     args.validate(reality.as_ref()).unwrap();
     if args.verbose {
-        env_logger::Builder::new()
-            .parse_filters("trace")
+        tracing_subscriber::fmt()
+            .with_max_level(Level::TRACE)
+            .with_writer(stderr)
+            .with_ansi(stderr().is_terminal())
             .init();
     }
 
@@ -2021,6 +2064,47 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("config")
             .join(name)
+    }
+
+    #[test]
+    fn accepted_client_hello_replay_consumes_more_than_one_read() {
+        let mut args = base_args(ServerMode::Http);
+        args.certs = test_cert_path("cert.pem");
+        args.key = test_cert_path("key.pem");
+        let server_config = make_config(&args, None);
+        let mut client_config = rustls::ClientConfig::builder(provider::DEFAULT_PROVIDER.into())
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth()
+            .unwrap();
+        client_config.alpn_protocols = (0..24)
+            .map(|index| ApplicationProtocol::from(vec![index; 200]))
+            .collect();
+        let mut client_hello = Vec::new();
+        let _client = Arc::new(client_config)
+            .connect(rustls::pki_types::ServerName::try_from("localhost").unwrap())
+            .build(&mut client_hello)
+            .unwrap();
+        assert!(client_hello.len() > 4096);
+
+        let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let (probe_sender, _probe_receiver) = mpsc::sync_channel(1);
+        let mut connection = OpenConnection::new(
+            TcpStream::from_std(socket),
+            mio::Token(1),
+            ServerMode::Http,
+            server_config,
+            Vec::new(),
+            None,
+            Vec::new(),
+            probe_sender,
+        );
+        connection
+            .start_tls_from_buffer(&client_hello, None)
+            .unwrap();
+        assert!(!connection.output.is_empty());
     }
 
     #[test]

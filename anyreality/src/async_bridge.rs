@@ -106,7 +106,7 @@ where
 
     let result = pump_io(&mut tls, &inbound_tx, &mut outbound_rx);
 
-    tls.conn.send_close_notify();
+    let _ = tls.conn.send_close_notify(&mut tls.output);
     let _ = tls.flush();
     let _ = tls.sock.shutdown(std::net::Shutdown::Both);
     result

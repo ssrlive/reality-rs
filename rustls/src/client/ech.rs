@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::iter;
 
 use pki_types::{DnsName, EchConfigListBytes, FipsStatus, ServerName};
 use subtle::ConstantTimeEq;
@@ -8,7 +9,7 @@ use subtle::ConstantTimeEq;
 use super::config::ClientConfig;
 use super::{Retrieved, Tls13Session, tls13};
 use crate::common_state::Protocol;
-use crate::crypto::cipher::Payload;
+use crate::crypto::cipher::{EncodableVersion, Payload};
 use crate::crypto::hash::Hash;
 use crate::crypto::hpke::{
     EncapsulatedSecret, Hpke, HpkeKem, HpkePublicKey, HpkeSealer, HpkeSuite,
@@ -18,18 +19,18 @@ use crate::crypto::{CipherSuite, SecureRandom};
 use crate::enums::ProtocolVersion;
 use crate::error::{EncryptedClientHelloError, Error, PeerMisbehaved, RejectedEch};
 use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
-use crate::log::{debug, trace, warn};
 use crate::msgs::{
     ClientExtensions, ClientHelloPayload, Codec, EchConfigContents, EchConfigPayload, Encoding,
     EncryptedClientHello, EncryptedClientHelloOuter, ExtensionType, HandshakeAlignedProof,
     HandshakeMessagePayload, HandshakePayload, HelloRetryRequest, HpkeKeyConfig, Message,
-    MessagePayload, PresharedKeyBinder, PresharedKeyOffer, Random, Reader, ServerHelloPayload,
-    ServerNamePayload, SizedPayload,
+    MessagePayload, PresharedKeyBinder, PresharedKeyIdentity, PresharedKeyOffer, Random,
+    ServerHelloPayload, ServerNamePayload, SizedPayload,
 };
 use crate::tls13::Tls13CipherSuite;
 use crate::tls13::key_schedule::{
     KeyScheduleEarlyClient, KeyScheduleHandshakeStart, server_ech_hrr_confirmation_secret,
 };
+use crate::tracing::{debug, trace, warn};
 
 /// Controls how Encrypted Client Hello (ECH) is used in a client handshake.
 #[non_exhaustive]
@@ -47,7 +48,7 @@ pub enum EchMode {
 }
 
 impl EchMode {
-    /// Returns true if the ECH mode will use a FIPS approved HPKE suite.
+    /// Returns the FIPS status of the HPKE suite that will be used.
     pub fn fips(&self) -> FipsStatus {
         match self {
             Self::Enable(ech_config) => ech_config.suite.fips(),
@@ -100,17 +101,16 @@ impl EchConfig {
         ech_config_list: EchConfigListBytes<'_>,
         hpke_suites: &[&'static dyn Hpke],
     ) -> Result<Self, Error> {
-        let ech_configs = Vec::<EchConfigPayload>::read(&mut Reader::new(&ech_config_list))
-            .map_err(|_| {
-                Error::InvalidEncryptedClientHello(EncryptedClientHelloError::InvalidConfigList)
-            })?;
+        let ech_configs = Vec::<EchConfigPayload>::read_bytes(&ech_config_list).map_err(|_| {
+            Error::InvalidEncryptedClientHello(EncryptedClientHelloError::InvalidConfigList)
+        })?;
 
         Self::new_for_configs(ech_configs, hpke_suites)
     }
 
     /// Build an EchConfig for retrying ECH using a retry config from a server's previous rejection
     ///
-    /// Returns an error if the server provided no retry configurations in `RejectedEch`, or if
+    /// Returns an error if the server provided no retry configurations in [`RejectedEch`], or if
     /// none of the retry configurations are compatible with the supported `hpke_suites`.
     pub fn for_retry(
         rejection: RejectedEch,
@@ -126,13 +126,11 @@ impl EchConfig {
     pub(super) fn state(
         &self,
         server_name: ServerName<'static>,
-        protocol: Protocol,
         config: &ClientConfig,
     ) -> Result<EchState, Error> {
         EchState::new(
             self,
-            server_name.clone(),
-            protocol,
+            server_name,
             !config
                 .resolver()
                 .supported_certificate_types()
@@ -232,7 +230,6 @@ impl EchGreaseConfig {
     pub(crate) fn grease_ext(
         &self,
         secure_random: &'static dyn SecureRandom,
-        protocol: Protocol,
         inner_name: ServerName<'static>,
         outer_hello: &ClientHelloPayload,
     ) -> Result<EncryptedClientHello, Error> {
@@ -262,7 +259,6 @@ impl EchGreaseConfig {
                 suite: self.suite,
             },
             inner_name,
-            protocol,
             false,
             secure_random,
             false, // Does not matter if we enable/disable SNI here. Inner hello is not used.
@@ -270,7 +266,7 @@ impl EchGreaseConfig {
 
         // Construct an inner hello using the outer hello - this allows us to know the size of
         // dummy payload we should use for the GREASE extension.
-        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, None);
+        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, None)?;
 
         // Generate a payload of random data equivalent in length to a real inner hello.
         let payload_len = encoded_inner_hello.len()
@@ -326,8 +322,6 @@ pub(crate) struct EchState {
     pub(crate) inner_hello_transcript: HandshakeHashBuffer,
     // A source of secure random data.
     secure_random: &'static dyn SecureRandom,
-    // The top level protocol
-    protocol: Protocol,
     // An HPKE sealer context that can be used for encrypting ECH data.
     sender: Box<dyn HpkeSealer>,
     // The ID of the ECH configuration we've chosen - this is included in the outer ECH extension.
@@ -347,13 +341,18 @@ pub(crate) struct EchState {
     enable_sni: bool,
     // The extensions sent in the inner hello.
     sent_extensions: Vec<ExtensionType>,
+    // The GREASE PSK identities offered in the first outer hello, if any. A retry hello
+    // re-offers the same identities.
+    grease_psk_identities: Option<Vec<PresharedKeyIdentity>>,
+    // Whether a hello retry request accepted our ECH offer, if we received one. RFC 9849
+    // section 6.1.4 makes that decision final.
+    accepted_by_hello_retry_request: Option<bool>,
 }
 
 impl EchState {
     pub(crate) fn new(
         config: &EchConfig,
         inner_name: ServerName<'static>,
-        protocol: Protocol,
         client_auth_enabled: bool,
         secure_random: &'static dyn SecureRandom,
         enable_sni: bool,
@@ -389,10 +388,11 @@ impl EchState {
             inner_name,
             maximum_name_length: config_contents.maximum_name_length,
             cipher_suite: config.suite.suite().sym,
-            protocol,
             enc,
             enable_sni,
             sent_extensions: Vec::new(),
+            grease_psk_identities: None,
+            accepted_by_hello_retry_request: None,
         })
     }
 
@@ -416,7 +416,7 @@ impl EchState {
         );
 
         // Construct the encoded inner hello and update the transcript.
-        let encoded_inner_hello = self.encode_inner_hello(&outer_hello, retry_req, resuming);
+        let encoded_inner_hello = self.encode_inner_hello(&outer_hello, retry_req, resuming)?;
 
         // Complete the ClientHelloOuterAAD with an ech extension, the payload should be a placeholder
         // of size L, all zeroes. L == length of encrypting encoded client hello inner w/ the selected
@@ -475,7 +475,16 @@ impl EchState {
         server_hello: &ServerHelloPayload,
         server_hello_encoded: &Payload<'_>,
         hash: &'static dyn Hash,
+        server_name: &mut ServerName<'static>,
     ) -> Result<Option<EchAccepted>, Error> {
+        // After a rejecting hello retry request the handshake continues with the outer hello
+        // without consulting the server hello, see RFC 9849 section 6.1.6.
+        if self.accepted_by_hello_retry_request == Some(false) {
+            trace!("ECH rejected by server in hello retry request");
+            *server_name = self.outer_name.into();
+            return Ok(None);
+        }
+
         // Start the inner transcript hash now that we know the hash algorithm to use.
         let inner_transcript = self
             .inner_hello_transcript
@@ -509,22 +518,36 @@ impl EchState {
                     sent_extensions: self.sent_extensions,
                 }))
             }
+            // An accepting hello retry request requires an "illegal_parameter" alert here
+            // -- <https://www.rfc-editor.org/info/rfc9849/#section-6.1.5>
+            false if self.accepted_by_hello_retry_request == Some(true) => {
+                Err(PeerMisbehaved::EchAcceptanceVariedAfterRetry.into())
+            }
             false => {
                 trace!("ECH rejected by server");
+
+                // "If the server rejects ECH, the client proceeds with the handshake, authenticating
+                // for ECHConfig.contents.public_name"
+                // -- <https://www.rfc-editor.org/info/rfc9849/#section-6.1.6>
+                *server_name = self.outer_name.into();
+
                 Ok(None)
             }
         }
     }
 
     pub(crate) fn confirm_hrr_acceptance(
-        &self,
+        &mut self,
         hrr: &HelloRetryRequest,
         cs: &Tls13CipherSuite,
     ) -> Result<bool, Error> {
         // The client checks for the "encrypted_client_hello" extension.
         let ech_conf = match &hrr.encrypted_client_hello {
             // If none is found, the server has implicitly rejected ECH.
-            None => return Ok(false),
+            None => {
+                self.accepted_by_hello_retry_request = Some(false);
+                return Ok(false);
+            }
             // Otherwise, if it has a length other than 8, the client aborts the
             // handshake with a "decode_error" alert.
             Some(ech_conf) if ech_conf.bytes().len() != 8 => {
@@ -547,16 +570,18 @@ impl EchState {
             confirmation_transcript.current_hash(),
         );
 
-        match ConstantTimeEq::ct_eq(derived.as_ref(), ech_conf.bytes()).into() {
+        let accepted = match ConstantTimeEq::ct_eq(derived.as_ref(), ech_conf.bytes()).into() {
             true => {
                 trace!("ECH accepted by server in hello retry request");
-                Ok(true)
+                true
             }
             false => {
                 trace!("ECH rejected by server in hello retry request");
-                Ok(false)
+                false
             }
-        }
+        };
+        self.accepted_by_hello_retry_request = Some(accepted);
+        Ok(accepted)
     }
 
     /// Update the ECH context inner hello transcript based on a received hello retry request message.
@@ -581,13 +606,58 @@ impl EchState {
         self.inner_hello_transcript = inner_transcript_buffer;
     }
 
+    // See https://datatracker.ietf.org/doc/html/rfc9849#name-grease-psk
+    pub(super) fn grease_psk(&mut self, psk_offer: &mut PresharedKeyOffer) -> Result<(), Error> {
+        match &self.grease_psk_identities {
+            // This is a retry hello: re-offer the identities and ages from the first hello,
+            // as a genuine PSK offer would. Only the binders are regenerated below; a fresh
+            // GREASE PSK here would "stick out" to an attacker triggering a retry.
+            Some(identities) => psk_offer.identities = identities.clone(),
+            None => {
+                for ident in psk_offer.identities.iter_mut() {
+                    // "For each PSK identity advertised in the ClientHelloInner, the
+                    // client generates a random PSK identity with the same length."
+                    let Some(identity) = ident.identity.as_mut() else {
+                        unreachable!();
+                    };
+                    self.secure_random.fill(identity)?;
+
+                    // "It also generates a random, 32-bit, unsigned integer to use as
+                    // the obfuscated_ticket_age."
+                    let mut ticket_age = [0_u8; 4];
+                    self.secure_random
+                        .fill(&mut ticket_age)?;
+                    ident.obfuscated_ticket_age = u32::from_be_bytes(ticket_age);
+                }
+
+                self.grease_psk_identities = Some(psk_offer.identities.clone());
+            }
+        }
+
+        // "Likewise, for each inner PSK binder, the client generates a random string
+        // of the same length."
+        psk_offer.binders = psk_offer
+            .binders
+            .iter()
+            .map(|old_binder| {
+                // We can't access the wrapped binder PresharedKeyBinder's PayloadU8 mutably,
+                // so we construct new PresharedKeyBinder's from scratch with the same length.
+                let mut new_binder = vec![0; old_binder.as_ref().len()];
+                self.secure_random
+                    .fill(&mut new_binder)?;
+                Ok::<PresharedKeyBinder, Error>(PresharedKeyBinder::from(new_binder))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(())
+    }
+
     // 5.1 "Encoding the ClientHelloInner"
     fn encode_inner_hello(
         &mut self,
         outer_hello: &ClientHelloPayload,
         retryreq: Option<&HelloRetryRequest>,
         resuming: Option<&Retrieved<&Tls13Session>>,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, Error> {
         // Start building an inner hello using the outer_hello as a template.
         let mut inner_hello = ClientHelloPayload {
             // Some information is copied over as-is.
@@ -640,7 +710,7 @@ impl EchState {
             // to the inner hello.
             if matches!(
                 ext,
-                ExtensionType::ExtendedMasterSecret
+                ExtensionType::ExtendedMainSecret
                     | ExtensionType::SessionTicket
                     | ExtensionType::ECPointFormats
             ) {
@@ -679,7 +749,7 @@ impl EchState {
             let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(inner_hello));
 
             let key_schedule =
-                KeyScheduleEarlyClient::new(self.protocol, resuming.suite, resuming.secret.bytes());
+                KeyScheduleEarlyClient::new(resuming.suite, resuming.secret.bytes())?;
             tls13::fill_in_psk_binder(&key_schedule, &self.inner_hello_transcript, &mut chp);
             self.early_data_key_schedule = Some(key_schedule);
 
@@ -701,44 +771,39 @@ impl EchState {
 
         // Calculate padding
         // max_name_len = L
-        let max_name_len = self.maximum_name_length;
+        let max_name_len = usize::from(self.maximum_name_length);
         let max_name_len = if max_name_len > 0 { max_name_len } else { 255 };
 
-        let padding_len = match &self.inner_name {
-            ServerName::DnsName(name) => {
+        let name_padding_len = match &inner_hello.server_name {
+            Some(ServerNamePayload::SingleDnsName(name)) => {
                 // name.len() = D
                 // max(0, L - D)
-                core::cmp::max(
-                    0,
-                    max_name_len.saturating_sub(name.as_ref().len() as u8) as usize,
-                )
+                Ord::max(0, max_name_len.saturating_sub(name.as_ref().len()))
             }
-            _ => {
-                // L + 9
-                // "This is the length of a "server_name" extension with an L-byte name."
-                // We widen to usize here to avoid overflowing u8 + u8.
-                max_name_len as usize + 9
-            }
+            // L + 9
+            // "This is the length of a "server_name" extension with an L-byte name."
+            _ => max_name_len + 9,
         };
+        encoded_hello.extend(iter::repeat_n(0, name_padding_len));
 
         // Let L be the length of the EncodedClientHelloInner with all the padding computed so far
         // Let N = 31 - ((L - 1) % 32) and add N bytes of padding.
-        let padding_len = 31 - ((encoded_hello.len() + padding_len - 1) % 32);
-        encoded_hello.extend(vec![0; padding_len]);
+        let padding_len = 31 - ((encoded_hello.len() - 1) % 32);
+        encoded_hello.extend(iter::repeat_n(0, padding_len));
 
         // Construct the inner hello message that will be used for the transcript.
         let inner_hello_msg = Message {
             version: match retryreq {
-                // <https://datatracker.ietf.org/doc/html/rfc8446#section-5.1>:
+                // <https://datatracker.ietf.org/doc/html/rfc9846#section-5.1>:
                 // "This value MUST be set to 0x0303 for all records generated
                 //  by a TLS 1.3 implementation ..."
-                Some(_) => ProtocolVersion::TLSv1_2,
+                Some(_) => EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
                 // "... other than an initial ClientHello (i.e., one not
                 // generated after a HelloRetryRequest), where it MAY also be
                 // 0x0301 for compatibility purposes"
                 //
                 // (retryreq == None means we're in the "initial ClientHello" case)
-                None => ProtocolVersion::TLSv1_0,
+                None => EncodableVersion::InitialClientHello(Protocol::Tcp),
             },
             payload: MessagePayload::handshake(HandshakeMessagePayload(
                 HandshakePayload::ClientHello(inner_hello),
@@ -749,42 +814,7 @@ impl EchState {
         self.inner_hello_transcript
             .add_message(&inner_hello_msg);
 
-        encoded_hello
-    }
-
-    // See https://datatracker.ietf.org/doc/html/rfc9849#name-grease-psk
-    fn grease_psk(&self, psk_offer: &mut PresharedKeyOffer) -> Result<(), Error> {
-        for ident in psk_offer.identities.iter_mut() {
-            // "For each PSK identity advertised in the ClientHelloInner, the
-            // client generates a random PSK identity with the same length."
-            match ident.identity.as_mut() {
-                Some(ident) => self.secure_random.fill(ident)?,
-                None => unreachable!(),
-            }
-
-            // "It also generates a random, 32-bit, unsigned integer to use as
-            // the obfuscated_ticket_age."
-            let mut ticket_age = [0_u8; 4];
-            self.secure_random
-                .fill(&mut ticket_age)?;
-            ident.obfuscated_ticket_age = u32::from_be_bytes(ticket_age);
-        }
-
-        // "Likewise, for each inner PSK binder, the client generates a random string
-        // of the same length."
-        psk_offer.binders = psk_offer
-            .binders
-            .iter()
-            .map(|old_binder| {
-                // We can't access the wrapped binder PresharedKeyBinder's PayloadU8 mutably,
-                // so we construct new PresharedKeyBinder's from scratch with the same length.
-                let mut new_binder = vec![0; old_binder.as_ref().len()];
-                self.secure_random
-                    .fill(&mut new_binder)?;
-                Ok::<PresharedKeyBinder, Error>(PresharedKeyBinder::from(new_binder))
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(())
+        Ok(encoded_hello)
     }
 
     fn server_hello_conf(
@@ -802,7 +832,7 @@ impl EchState {
         encoded[SERVER_HELLO_ECH_CONFIRMATION_SPAN].fill(0x00);
 
         Message {
-            version: ProtocolVersion::TLSv1_3,
+            version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
             payload: MessagePayload::Handshake {
                 encoded: Payload::Owned(encoded),
                 parsed: HandshakeMessagePayload(HandshakePayload::ServerHello(
@@ -822,7 +852,7 @@ impl EchState {
         let mut hmp_encoded = Vec::new();
         hmp.payload_encode(&mut hmp_encoded, Encoding::EchConfirmation);
         Message {
-            version: ProtocolVersion::TLSv1_3,
+            version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
             payload: MessagePayload::Handshake {
                 encoded: Payload::new(hmp_encoded),
                 parsed: hmp,
@@ -841,7 +871,7 @@ impl EchState {
 const SERVER_HELLO_ECH_CONFIRMATION_SPAN: core::ops::Range<usize> =
     (1 + 3 + 2 + 24)..(1 + 3 + 2 + 32);
 
-/// Returned from EchState::check_acceptance when the server has accepted the ECH offer.
+/// Returned from EchState::confirm_acceptance when the server has accepted the ECH offer.
 ///
 /// Holds the state required to continue the handshake with the inner hello from the ECH offer.
 pub(crate) struct EchAccepted {
@@ -852,9 +882,31 @@ pub(crate) struct EchAccepted {
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use core::time::Duration;
+    use std::string::String;
+
+    use pki_types::{CertificateDer, SubjectPublicKeyInfoDer, UnixTime};
+
     use super::*;
-    use crate::crypto::CipherSuite;
-    use crate::msgs::{Compression, Random, ServerExtensions, SessionId};
+    use crate::client::{
+        ClientSessionKey, ClientSessionMemoryCache, ClientSessionStore, Resumption,
+        Tls13ClientSessionInput, VerifiedIdentity,
+    };
+    use crate::common_state::Side;
+    use crate::conn::Connection;
+    use crate::crypto::cipher::Record;
+    use crate::crypto::hpke::{HpkeAead, HpkeKdf};
+    use crate::crypto::kx::SharedSecret;
+    use crate::crypto::{CipherSuite, GetRandomFailed, Identity, TEST_PROVIDER, tls13_only};
+    use crate::msgs::{
+        Compression, Deframer, HelloRetryRequestExtensions, NewSessionTicketPayloadTls13, Random,
+        Reader, ServerExtensions, SessionId, SupportedProtocolVersions,
+    };
+    use crate::sync::Arc;
+    use crate::tls13::Tls13ProtocolSuite;
+    use crate::tls13::key_schedule::KeySchedulePreHandshake;
+    use crate::{RootCertStore, VecInput};
 
     #[test]
     fn server_hello_conf_alters_server_hello_random() {
@@ -867,7 +919,7 @@ mod tests {
             extensions: Box::new(ServerExtensions::default()),
         };
         let message = Message {
-            version: ProtocolVersion::TLSv1_3,
+            version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
             payload: MessagePayload::handshake(HandshakeMessagePayload(
                 HandshakePayload::ServerHello(server_hello.clone()),
             )),
@@ -908,5 +960,590 @@ mod tests {
             "020000280303ffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000001302000000",
             "                          afterwards those bytes are zeroed ^^^^^^^^^^^^^^^^            "
         );
+    }
+
+    #[test]
+    fn inner_client_hello_length_conceals_inner_name_length() {
+        let base_inner_len = inner_hello_encoding_for_name(dns_name_of_len(1), true)
+            .unwrap()
+            .len();
+        assert!(
+            base_inner_len % 32 == 0,
+            "inner hello length must be 32-byte padded"
+        );
+        assert!(
+            base_inner_len >= 256,
+            "inner hello must include inner name and its padding"
+        );
+
+        for inner_name_len in 1..251 {
+            assert_eq!(
+                inner_hello_encoding_for_name(dns_name_of_len(inner_name_len), true)
+                    .unwrap()
+                    .len(),
+                base_inner_len,
+                "all inner hello lengths must be invariant wrt inner name length"
+            );
+        }
+    }
+
+    #[test]
+    fn inner_client_hello_length_does_not_leak_length_of_omitted_inner_name() {
+        let base_inner_len = inner_hello_encoding_for_name(dns_name_of_len(1), false)
+            .unwrap()
+            .len();
+        assert!(
+            base_inner_len % 32 == 0,
+            "inner hello length must be 32-byte padded"
+        );
+        assert!(
+            base_inner_len >= 256,
+            "inner hello must include maximum_name_length bytes of padding"
+        );
+
+        for inner_name_len in 1..251 {
+            assert_eq!(
+                inner_hello_encoding_for_name(dns_name_of_len(inner_name_len), false)
+                    .unwrap()
+                    .len(),
+                base_inner_len,
+                "all inner hello lengths must be invariant wrt inner name length"
+            );
+        }
+    }
+
+    #[test]
+    fn ech_rejected_by_hello_retry_request_conceals_inner_psk() {
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_slice(include_bytes!(
+                "../../../test-ca/rsa-2048/ca.der"
+            )))
+            .unwrap();
+
+        // `TEST_PROVIDER`'s fixed-fill `SecureRandom` would mask a regression here: a
+        // fresh GREASE PSK generated for the retry would repeat the first hello's
+        // identity by happenstance. A counter makes consecutive fills distinct.
+        let mut provider = tls13_only(TEST_PROVIDER.clone());
+        provider.secure_random = &CountingRandom;
+
+        let config = ClientConfig::builder(Arc::new(provider))
+            .with_ech(EchMode::Enable(EchConfig {
+                config: EchConfigPayload::V18(EchConfigContents {
+                    key_config: HpkeKeyConfig {
+                        config_id: 0,
+                        kem_id: MockHpke::SUITE.kem,
+                        public_key: vec![0; 32].into(),
+                        symmetric_cipher_suites: vec![MockHpke::SUITE.sym],
+                    },
+                    maximum_name_length: 255,
+                    public_name: DnsName::try_from("public.example.com").unwrap(),
+                    extensions: vec![],
+                }),
+                suite: &MockHpke,
+            }))
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+            .unwrap();
+        let store = Arc::new(ClientSessionMemoryCache::new(256));
+        let config = Arc::new(ClientConfig {
+            resumption: Resumption::store(store.clone()),
+            ..config
+        });
+
+        // cache a ticket for the concealed inner name
+        let server_name = ServerName::try_from("inner.example.com").unwrap();
+        store.insert_tls13_ticket(
+            ClientSessionKey {
+                config_hash: config.config_hash(),
+                server_name: server_name.clone(),
+            },
+            Tls13Session::new(
+                &NewSessionTicketPayloadTls13::new(
+                    Duration::from_secs(1800),
+                    0x1234_5678,
+                    [0u8; 32],
+                    TICKET.to_vec(),
+                ),
+                Tls13ClientSessionInput {
+                    suite: Tls13ProtocolSuite::Tcp(TEST_PROVIDER.tls13_cipher_suites[0]),
+                    peer_identity: VerifiedIdentity::assertion(Identity::RawPublicKey(
+                        SubjectPublicKeyInfoDer::from(&b"spki"[..]),
+                    )),
+                    quic_params: None,
+                },
+                &[0x55; 32],
+                UnixTime::now(),
+            ),
+        );
+
+        let mut first_flight = Vec::new();
+        let mut conn = config
+            .connect(server_name)
+            .build(&mut first_flight)
+            .unwrap();
+
+        // the ticket belongs to the concealed inner name, so the outer hello offers
+        // a GREASE PSK in its place
+        let first = client_hello_in(&first_flight);
+        assert_ne!(psk_identity(&first), TICKET);
+
+        // a HelloRetryRequest without `encrypted_client_hello` rejects our ECH offer
+        let hrr = Message {
+            version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::HelloRetryRequest(HelloRetryRequest {
+                    legacy_version: ProtocolVersion::TLSv1_2,
+                    session_id: first.session_id,
+                    cipher_suite: first.cipher_suites[0],
+                    extensions: HelloRetryRequestExtensions {
+                        cookie: Some(SizedPayload::from(vec![1, 2, 3, 4])),
+                        supported_versions: Some(ProtocolVersion::TLSv1_3),
+                        ..HelloRetryRequestExtensions::default()
+                    },
+                }),
+            )),
+        };
+        let mut input = VecInput::default();
+        input
+            .read(&mut hrr.into_wire_bytes().as_slice())
+            .unwrap();
+        let mut retry_flight = Vec::new();
+        conn.read_tls(&mut input, &mut retry_flight)
+            .handle_all(&mut Vec::new())
+            .unwrap();
+
+        // we continue with a second outer hello: it must conceal the ticket too, and
+        // must re-offer the first hello's GREASE identity as a genuine PSK offer would
+        let second = client_hello_in(&retry_flight);
+        assert_ne!(psk_identity(&second), TICKET);
+        assert_eq!(psk_identity(&second), psk_identity(&first));
+
+        fn client_hello_in(bytes: &[u8]) -> ClientHelloPayload {
+            let mut reader = Reader::new(bytes);
+            while reader.any_left() {
+                let record = Record::<Payload<'_>>::read(&mut reader)
+                    .unwrap()
+                    .into_owned();
+                if let Ok(Message {
+                    payload:
+                        MessagePayload::Handshake {
+                            parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(ch)),
+                            ..
+                        },
+                    ..
+                }) = Message::try_from(&record)
+                {
+                    return ch;
+                }
+            }
+            panic!("no ClientHello written");
+        }
+
+        fn psk_identity(hello: &ClientHelloPayload) -> &[u8] {
+            hello
+                .preshared_key_offer
+                .as_ref()
+                .unwrap()
+                .identities[0]
+                .identity
+                .bytes()
+        }
+
+        const TICKET: &[u8] = b"inner name resumption ticket";
+
+        #[derive(Debug)]
+        struct CountingRandom;
+
+        impl SecureRandom for CountingRandom {
+            fn fill(&self, bytes: &mut [u8]) -> Result<(), GetRandomFailed> {
+                static COUNTER: AtomicU8 = AtomicU8::new(0);
+                for byte in bytes.iter_mut() {
+                    *byte = COUNTER.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn ech_rejection_in_server_hello_after_acceptance_in_hello_retry_request() {
+        let suite = TEST_PROVIDER.tls13_cipher_suites[0];
+        let hash = suite.common.hash_provider;
+        let proof = Deframer::default().aligned().unwrap();
+        let mut state = ech_state();
+
+        // the server accepts our offer in its hello retry request...
+        state
+            .ech_hello(outer_hello(), None, None)
+            .unwrap();
+        let hrr = accepting_hello_retry_request(&state, suite);
+        assert!(
+            state
+                .confirm_hrr_acceptance(&hrr, suite)
+                .unwrap()
+        );
+        state.transcript_hrr_update(hash, &hrr_message(&hrr), &proof);
+        state
+            .ech_hello(outer_hello(), Some(&hrr), None)
+            .unwrap();
+
+        // ...but its server hello does not confirm that acceptance
+        let server_hello = server_hello(suite);
+        let mut server_name = inner_name();
+        assert_eq!(
+            state
+                .confirm_acceptance(
+                    &handshake_key_schedule(suite),
+                    &server_hello,
+                    &encode(&server_hello),
+                    hash,
+                    &mut server_name,
+                )
+                .err(),
+            Some(PeerMisbehaved::EchAcceptanceVariedAfterRetry.into())
+        );
+    }
+
+    #[test]
+    fn ech_acceptance_in_server_hello_after_rejection_in_hello_retry_request() {
+        let suite = TEST_PROVIDER.tls13_cipher_suites[0];
+        let hash = suite.common.hash_provider;
+        let proof = Deframer::default().aligned().unwrap();
+        let key_schedule = handshake_key_schedule(suite);
+
+        // without a hello retry request, a confirming server hello accepts ECH
+        let mut state = ech_state();
+        state
+            .ech_hello(outer_hello(), None, None)
+            .unwrap();
+        let server_hello = confirming_server_hello(&state, &key_schedule, suite);
+        let mut server_name = inner_name();
+        assert!(
+            state
+                .confirm_acceptance(
+                    &key_schedule,
+                    &server_hello,
+                    &encode(&server_hello),
+                    hash,
+                    &mut server_name,
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(server_name, inner_name());
+
+        // but after a rejecting hello retry request, a confirming server hello cannot revive it
+        let mut state = ech_state();
+        state
+            .ech_hello(outer_hello(), None, None)
+            .unwrap();
+        let hrr = hello_retry_request(suite, None);
+        assert!(
+            !state
+                .confirm_hrr_acceptance(&hrr, suite)
+                .unwrap()
+        );
+        state.transcript_hrr_update(hash, &hrr_message(&hrr), &proof);
+        let server_hello = confirming_server_hello(&state, &key_schedule, suite);
+        let mut server_name = inner_name();
+        assert!(
+            state
+                .confirm_acceptance(
+                    &key_schedule,
+                    &server_hello,
+                    &encode(&server_hello),
+                    hash,
+                    &mut server_name,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(server_name, ServerName::from(public_name()));
+    }
+
+    fn ech_state() -> EchState {
+        let config = EchConfig {
+            config: EchConfigPayload::V18(EchConfigContents {
+                key_config: HpkeKeyConfig {
+                    config_id: 0,
+                    kem_id: MockHpke::SUITE.kem,
+                    public_key: vec![0; 32].into(),
+                    symmetric_cipher_suites: vec![MockHpke::SUITE.sym],
+                },
+                maximum_name_length: 255,
+                public_name: public_name(),
+                extensions: vec![],
+            }),
+            suite: &MockHpke,
+        };
+
+        EchState::new(
+            &config,
+            inner_name(),
+            false,
+            TEST_PROVIDER.secure_random,
+            true,
+        )
+        .unwrap()
+    }
+
+    fn inner_name() -> ServerName<'static> {
+        ServerName::try_from("inner.example.com").unwrap()
+    }
+
+    fn public_name() -> DnsName<'static> {
+        DnsName::try_from("public.example.com").unwrap()
+    }
+
+    fn outer_hello() -> ClientHelloPayload {
+        ClientHelloPayload {
+            client_version: ProtocolVersion::TLSv1_2,
+            random: Random([0u8; 32]),
+            session_id: SessionId::empty(),
+            cipher_suites: vec![
+                TEST_PROVIDER.tls13_cipher_suites[0]
+                    .common
+                    .suite,
+            ],
+            compression_methods: vec![Compression::Null],
+            extensions: Box::new(ClientExtensions {
+                server_name: Some(ServerNamePayload::from(&public_name())),
+                supported_versions: Some(SupportedProtocolVersions {
+                    tls13: true,
+                    tls12: false,
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn hello_retry_request(
+        suite: &'static Tls13CipherSuite,
+        encrypted_client_hello: Option<Payload<'static>>,
+    ) -> HelloRetryRequest {
+        HelloRetryRequest {
+            legacy_version: ProtocolVersion::TLSv1_2,
+            session_id: SessionId::empty(),
+            cipher_suite: suite.common.suite,
+            extensions: HelloRetryRequestExtensions {
+                cookie: Some(SizedPayload::from(vec![1, 2, 3, 4])),
+                supported_versions: Some(ProtocolVersion::TLSv1_3),
+                encrypted_client_hello,
+                ..HelloRetryRequestExtensions::default()
+            },
+        }
+    }
+
+    /// A hello retry request accepting the offer in `state`, see RFC 9849 section 7.2.1.
+    fn accepting_hello_retry_request(
+        state: &EchState,
+        suite: &'static Tls13CipherSuite,
+    ) -> HelloRetryRequest {
+        let mut hrr = hello_retry_request(suite, Some(Payload::new(vec![0u8; 8])));
+        let mut transcript = state
+            .inner_hello_transcript
+            .clone()
+            .start_hash(suite.common.hash_provider);
+        transcript.rollup_for_hrr();
+        transcript.add_message(&EchState::hello_retry_request_conf(&hrr));
+        let confirmation = server_ech_hrr_confirmation_secret(
+            suite.hkdf_provider,
+            &state.inner_hello_random.0,
+            transcript.current_hash(),
+        );
+        hrr.encrypted_client_hello = Some(Payload::new(confirmation.to_vec()));
+        hrr
+    }
+
+    fn hrr_message(hrr: &HelloRetryRequest) -> Message<'static> {
+        Message {
+            version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::HelloRetryRequest(hrr.clone()),
+            )),
+        }
+    }
+
+    fn server_hello(suite: &'static Tls13CipherSuite) -> ServerHelloPayload {
+        ServerHelloPayload {
+            legacy_version: ProtocolVersion::TLSv1_2,
+            random: Random([0x55u8; 32]),
+            session_id: SessionId::empty(),
+            cipher_suite: suite.common.suite,
+            compression_method: Compression::Null,
+            extensions: Box::new(ServerExtensions::default()),
+        }
+    }
+
+    /// A server hello accepting the offer in `state`, see RFC 9849 section 7.2.
+    fn confirming_server_hello(
+        state: &EchState,
+        key_schedule: &KeyScheduleHandshakeStart,
+        suite: &'static Tls13CipherSuite,
+    ) -> ServerHelloPayload {
+        let mut server_hello = server_hello(suite);
+        let mut transcript = state
+            .inner_hello_transcript
+            .clone()
+            .start_hash(suite.common.hash_provider);
+        transcript.add_message(&EchState::server_hello_conf(
+            &server_hello,
+            &encode(&server_hello),
+        ));
+        let confirmation = key_schedule
+            .server_ech_confirmation_secret(&state.inner_hello_random.0, transcript.current_hash());
+        server_hello.random.0[24..].copy_from_slice(&confirmation);
+        server_hello
+    }
+
+    fn encode(server_hello: &ServerHelloPayload) -> Payload<'static> {
+        Payload::new(
+            HandshakeMessagePayload(HandshakePayload::ServerHello(server_hello.clone()))
+                .get_encoding(),
+        )
+    }
+
+    fn handshake_key_schedule(suite: &'static Tls13CipherSuite) -> KeyScheduleHandshakeStart {
+        KeySchedulePreHandshake::new(Side::Client, Tls13ProtocolSuite::Tcp(suite))
+            .unwrap()
+            .into_handshake(SharedSecret::from(&[0u8; 32][..]))
+    }
+
+    fn inner_hello_encoding_for_name(
+        name: DnsName<'static>,
+        enable_sni: bool,
+    ) -> Result<Vec<u8>, Error> {
+        let config = EchConfig {
+            config: EchConfigPayload::V18(EchConfigContents {
+                key_config: HpkeKeyConfig {
+                    config_id: 0,
+                    kem_id: MockHpke::SUITE.kem,
+                    public_key: vec![0; 32].into(),
+                    symmetric_cipher_suites: vec![],
+                },
+                maximum_name_length: 255,
+                public_name: DnsName::try_from("public").unwrap(),
+                extensions: vec![],
+            }),
+            suite: &MockHpke,
+        };
+
+        EchState::new(
+            &config,
+            ServerName::from(name.clone()),
+            false,
+            TEST_PROVIDER.secure_random,
+            enable_sni,
+        )
+        .unwrap()
+        .encode_inner_hello(
+            &ClientHelloPayload {
+                client_version: ProtocolVersion::TLSv1_3,
+                random: Random([0u8; 32]),
+                session_id: SessionId::empty(),
+                cipher_suites: vec![],
+                compression_methods: vec![Compression::Null],
+                extensions: Box::new(ClientExtensions {
+                    server_name: Some(ServerNamePayload::from(&name)),
+                    ..Default::default()
+                }),
+            },
+            None,
+            None,
+        )
+    }
+
+    fn dns_name_of_len(mut len: usize) -> DnsName<'static> {
+        let mut s = String::new();
+        let labels = len.div_ceil(63);
+        for _ in 0..labels {
+            let chars = Ord::min(len, 63);
+            len -= chars;
+            for _ in 0..chars {
+                s.push('a');
+            }
+            if len != 0 {
+                s.push('.');
+            }
+        }
+        DnsName::try_from(s).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct MockHpke;
+
+    impl MockHpke {
+        const SUITE: HpkeSuite = HpkeSuite {
+            kem: HpkeKem::DHKEM_P256_HKDF_SHA256,
+            sym: HpkeSymmetricCipherSuite {
+                kdf_id: HpkeKdf::HKDF_SHA256,
+                aead_id: HpkeAead::AES_128_GCM,
+            },
+        };
+    }
+
+    impl Hpke for MockHpke {
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        fn seal(
+            &self,
+            _info: &[u8],
+            _aad: &[u8],
+            _plaintext: &[u8],
+            _pub_key: &HpkePublicKey,
+        ) -> Result<(EncapsulatedSecret, Vec<u8>), Error> {
+            todo!()
+        }
+
+        fn setup_sealer(
+            &self,
+            _info: &[u8],
+            _pub_key: &HpkePublicKey,
+        ) -> Result<(EncapsulatedSecret, Box<dyn HpkeSealer + 'static>), Error> {
+            Ok((EncapsulatedSecret(vec![]), Box::new(MockHpkeSealer)))
+        }
+
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        fn open(
+            &self,
+            _enc: &EncapsulatedSecret,
+            _info: &[u8],
+            _aad: &[u8],
+            _ciphertext: &[u8],
+            _secret_key: &crate::crypto::hpke::HpkePrivateKey,
+        ) -> Result<Vec<u8>, Error> {
+            todo!()
+        }
+
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        fn setup_opener(
+            &self,
+            _enc: &EncapsulatedSecret,
+            _info: &[u8],
+            _secret_key: &crate::crypto::hpke::HpkePrivateKey,
+        ) -> Result<Box<dyn crate::crypto::hpke::HpkeOpener + 'static>, Error> {
+            todo!()
+        }
+
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        fn generate_key_pair(
+            &self,
+        ) -> Result<(HpkePublicKey, crate::crypto::hpke::HpkePrivateKey), Error> {
+            todo!()
+        }
+
+        fn suite(&self) -> HpkeSuite {
+            Self::SUITE
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockHpkeSealer;
+
+    impl HpkeSealer for MockHpkeSealer {
+        fn seal(&mut self, _aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+            // ciphertext length as if sealed with the AEAD named in `MockHpke::SUITE`
+            Ok(vec![0xff; plaintext.len() + 16])
+        }
     }
 }

@@ -49,6 +49,9 @@ default-members = [
 ]
 resolver = "2"
 
+[workspace.package]
+edition = "2024"
+
 [workspace.dependencies]
 anyhow = "1.0.104"
 asn1 = "0.24.1"
@@ -97,6 +100,8 @@ tikv-jemallocator = "0.7.0"
 tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "rt"] }
 tokio-rustls = "0.26.6"
 toml = "1.1.8"
+tracing = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "std"] }
 webpki = { package = "rustls-webpki", version = "=0.104.0-alpha.7", features = [
   "alloc",
 ], default-features = false }
@@ -113,6 +118,7 @@ lto = true
 alloc_instead_of_core = "warn"
 cloned_instead_of_copied = "warn"
 manual_let_else = "warn"
+needless_bitwise_bool = "warn"
 needless_collect = "warn"
 needless_pass_by_ref_mut = "warn"
 or_fun_call = "warn"
@@ -129,6 +135,11 @@ too_many_arguments = "allow"
 # - new_without_default: for internal constructors, the indirection is not
 #   helpful
 new_without_default = "allow"
+
+# - double_must_use: async-trait expands async methods to Pin<Box<dyn Future>>,
+#   which is already must_use, and also emits a bare #[must_use]. Nightly
+#   clippy 1.99+ flags that combination; not actionable on our source.
+double_must_use = "allow"
 
 [workspace.lints.rust]
 elided_lifetimes_in_paths = "warn"

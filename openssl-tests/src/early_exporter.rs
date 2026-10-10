@@ -7,7 +7,7 @@ use openssl::ssl::{SslConnector, SslMethod, SslSession, SslStream};
 use rustls::crypto::Identity;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{Connection, ServerConfig};
+use rustls::{Connection, ServerConfig, VecInput};
 use rustls_aws_lc_rs as provider;
 use rustls_util::complete_io;
 
@@ -34,27 +34,42 @@ fn test_early_exporter() {
         config.max_early_data_size = 8192;
         let config = Arc::new(config);
 
+        let mut received_plaintext = Vec::new();
         for _ in 0..ITERS {
             let mut server = rustls::ServerConnection::new(config.clone()).unwrap();
             let (mut tcp_stream, _addr) = listener.accept().unwrap();
+            let mut input = VecInput::default();
+            let mut output = Vec::new();
 
-            // read clienthello and then inspect early_data status
-            server
-                .read_tls(&mut tcp_stream)
-                .unwrap();
-            server.process_new_packets().unwrap();
+            // drive the handshake, collecting early data as it arrives
+            let mut early_data = Vec::new();
+            while server.is_handshaking() {
+                if !output.is_empty() {
+                    tcp_stream.write_all(&output).unwrap();
+                    tcp_stream.flush().unwrap();
+                    output.clear();
+                }
 
-            let message = if let Some(mut early) = server.early_data() {
-                let secret = early
-                    .exporter()
+                input.read(&mut tcp_stream).unwrap();
+                let mut handler = server.read_tls(&mut input, &mut output);
+                while let Some(result) = handler.next_early_data() {
+                    early_data.extend_from_slice(result.unwrap().bytes());
+                }
+                handler
+                    .handle_all(&mut Vec::new())
+                    .unwrap();
+            }
+
+            let message = if !early_data.is_empty() {
+                let mut buf = b"early data: ".to_vec();
+                buf.extend_from_slice(&early_data);
+                buf.push(b'\n');
+
+                let secret = server
+                    .early_exporter()
                     .unwrap()
                     .derive(b"label", Some(b"context"), [0u8; 64])
                     .unwrap();
-
-                let mut buf = b"early data: ".to_vec();
-                early.read_to_end(&mut buf).unwrap();
-                buf.push(b'\n');
-
                 buf.extend_from_slice(b"exported: ");
                 buf.extend_from_slice(format!("{:02x?}", secret).as_bytes());
                 buf.push(b'\n');
@@ -64,11 +79,17 @@ fn test_early_exporter() {
             };
 
             server
-                .writer()
-                .write_all(&message)
+                .write((&message).into(), &mut output)
                 .unwrap();
 
-            complete_io(&mut tcp_stream, &mut server).unwrap();
+            complete_io(
+                &mut tcp_stream,
+                &mut input,
+                &mut received_plaintext,
+                &mut output,
+                &mut server,
+            )
+            .unwrap();
 
             tcp_stream.flush().unwrap();
         }

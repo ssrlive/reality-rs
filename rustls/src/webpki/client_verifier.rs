@@ -18,7 +18,7 @@ use crate::server::ServerConfig;
 use crate::sync::Arc;
 use crate::verify::{
     ClientIdentity, ClientVerifier, DistinguishedName, HandshakeSignatureValid, NoClientAuth,
-    PeerVerified, SignatureVerificationInput,
+    SignatureVerificationInput, VerifiedIdentity,
 };
 use crate::webpki::parse_crls;
 use crate::webpki::verify::{ParsedCertificate, verify_tls12_signature, verify_tls13_signature};
@@ -206,9 +206,9 @@ impl ClientVerifierBuilder {
 /// ```no_run
 /// # use rustls::RootCertStore;
 /// # use rustls::server::WebPkiClientVerifier;
-/// # let DEFAULT_PROVIDER = rustls::crypto::CryptoProvider::get_default().unwrap();
+/// # let provider: std::sync::Arc<rustls::crypto::CryptoProvider> = unreachable!();
 /// # let roots = RootCertStore::empty();
-/// let client_verifier = WebPkiClientVerifier::builder(roots.into(), &DEFAULT_PROVIDER)
+/// let client_verifier = WebPkiClientVerifier::builder(roots.into(), &provider)
 ///   .build()
 ///   .unwrap();
 /// ```
@@ -218,9 +218,9 @@ impl ClientVerifierBuilder {
 /// ```no_run
 /// # use rustls::RootCertStore;
 /// # use rustls::server::WebPkiClientVerifier;
-/// # let DEFAULT_PROVIDER = rustls::crypto::CryptoProvider::get_default().unwrap();
+/// # let provider: std::sync::Arc<rustls::crypto::CryptoProvider> = unreachable!();
 /// # let roots = RootCertStore::empty();
-/// let client_verifier = WebPkiClientVerifier::builder(roots.into(), &DEFAULT_PROVIDER)
+/// let client_verifier = WebPkiClientVerifier::builder(roots.into(), &provider)
 ///   .allow_unauthenticated()
 ///   .build()
 ///   .unwrap();
@@ -239,10 +239,10 @@ impl ClientVerifierBuilder {
 /// ```no_run
 /// # use rustls::RootCertStore;
 /// # use rustls::server::WebPkiClientVerifier;
-/// # let DEFAULT_PROVIDER = rustls::crypto::CryptoProvider::get_default().unwrap();
+/// # let provider: std::sync::Arc<rustls::crypto::CryptoProvider> = unreachable!();
 /// # let roots = RootCertStore::empty();
 /// # let crls = Vec::new();
-/// let client_verifier = WebPkiClientVerifier::builder(roots.into(), &DEFAULT_PROVIDER)
+/// let client_verifier = WebPkiClientVerifier::builder(roots.into(), &provider)
 ///   .with_crls(crls)
 ///   .build()
 ///   .unwrap();
@@ -325,7 +325,10 @@ impl WebPkiClientVerifier {
 }
 
 impl ClientVerifier for WebPkiClientVerifier {
-    fn verify_identity(&self, identity: &ClientIdentity<'_>) -> Result<PeerVerified, Error> {
+    fn verify_identity<'a>(
+        &self,
+        identity: &ClientIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, Error> {
         let certificates = match identity.identity {
             Identity::X509(certificates) => certificates,
             Identity::RawPublicKey(_) => {
@@ -361,7 +364,7 @@ impl ClientVerifier for WebPkiClientVerifier {
                 None,
             )
             .map_err(pki_error)
-            .map(|_| PeerVerified::assertion())
+            .map(|_| VerifiedIdentity::assertion(identity.identity.clone()))
     }
 
     fn verify_tls12_signature(

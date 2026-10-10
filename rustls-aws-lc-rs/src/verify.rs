@@ -2,9 +2,85 @@ use aws_lc_rs::signature;
 use pki_types::{
     AlgorithmIdentifier, FipsStatus, InvalidSignature, SignatureVerificationAlgorithm, alg_id,
 };
+use rustls::crypto::{SignatureScheme, WebPkiSupportedAlgorithms};
 
 // nb. aws-lc-rs has an API that is broadly compatible with *ring*,
 // so this is very similar to ring_algs.rs.
+
+/// A `WebPkiSupportedAlgorithms` value that reflects webpki's capabilities when
+/// compiled against aws-lc-rs.
+pub static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = match WebPkiSupportedAlgorithms::new(
+    &[
+        ECDSA_P256_SHA256,
+        ECDSA_P256_SHA384,
+        ECDSA_P256_SHA512,
+        ECDSA_P384_SHA256,
+        ECDSA_P384_SHA384,
+        ECDSA_P384_SHA512,
+        ECDSA_P521_SHA256,
+        ECDSA_P521_SHA384,
+        ECDSA_P521_SHA512,
+        ED25519,
+        RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+        RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+        RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+        RSA_PKCS1_2048_8192_SHA256,
+        RSA_PKCS1_2048_8192_SHA384,
+        RSA_PKCS1_2048_8192_SHA512,
+        RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS,
+        RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS,
+        RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS,
+        ML_DSA_44,
+        ML_DSA_65,
+        ML_DSA_87,
+    ],
+    &[
+        // Note: for TLS1.2 the curve is not fixed by SignatureScheme. For TLS1.3 it is.
+        (
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            &[ECDSA_P384_SHA384, ECDSA_P256_SHA384, ECDSA_P521_SHA384],
+        ),
+        (
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            &[ECDSA_P256_SHA256, ECDSA_P384_SHA256, ECDSA_P521_SHA256],
+        ),
+        (
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            &[ECDSA_P521_SHA512, ECDSA_P384_SHA512, ECDSA_P256_SHA512],
+        ),
+        (SignatureScheme::ED25519, &[ED25519]),
+        (
+            SignatureScheme::RSA_PSS_SHA512,
+            &[RSA_PSS_2048_8192_SHA512_LEGACY_KEY],
+        ),
+        (
+            SignatureScheme::RSA_PSS_SHA384,
+            &[RSA_PSS_2048_8192_SHA384_LEGACY_KEY],
+        ),
+        (
+            SignatureScheme::RSA_PSS_SHA256,
+            &[RSA_PSS_2048_8192_SHA256_LEGACY_KEY],
+        ),
+        (
+            SignatureScheme::RSA_PKCS1_SHA512,
+            &[RSA_PKCS1_2048_8192_SHA512],
+        ),
+        (
+            SignatureScheme::RSA_PKCS1_SHA384,
+            &[RSA_PKCS1_2048_8192_SHA384],
+        ),
+        (
+            SignatureScheme::RSA_PKCS1_SHA256,
+            &[RSA_PKCS1_2048_8192_SHA256],
+        ),
+        (SignatureScheme::ML_DSA_44, &[ML_DSA_44]),
+        (SignatureScheme::ML_DSA_65, &[ML_DSA_65]),
+        (SignatureScheme::ML_DSA_87, &[ML_DSA_87]),
+    ],
+) {
+    Ok(algs) => algs,
+    Err(_) => panic!("bad WebPkiSupportedAlgorithms"),
+};
 
 /// An array of all the verification algorithms exported by this crate.
 ///
@@ -30,6 +106,9 @@ pub static ALL_VERIFICATION_ALGS: &[&dyn SignatureVerificationAlgorithm] = &[
     RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
     RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
     RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+    ML_DSA_44,
+    ML_DSA_65,
+    ML_DSA_87,
 ];
 
 /// A `SignatureVerificationAlgorithm` implemented using aws-lc-rs.
@@ -42,8 +121,6 @@ pub struct AwsLcRsVerificationAlgorithm {
     pub signature_alg_id: AlgorithmIdentifier,
     /// The aws-lc-rs verification algorithm to use for this signature algorithm.
     pub verification_alg: &'static dyn signature::VerificationAlgorithm,
-    /// Whether this algorithm is included in the FIPS submission for aws-lc-rs.
-    pub in_fips_submission: bool,
 }
 
 impl SignatureVerificationAlgorithm for AwsLcRsVerificationAlgorithm {
@@ -84,10 +161,7 @@ impl SignatureVerificationAlgorithm for AwsLcRsVerificationAlgorithm {
     }
 
     fn fips_status(&self) -> FipsStatus {
-        match self.in_fips_submission {
-            true => super::fips(),
-            false => FipsStatus::Unvalidated,
-        }
+        super::fips()
     }
 }
 
@@ -96,7 +170,6 @@ pub static ECDSA_P256_SHA256: &dyn SignatureVerificationAlgorithm = &AwsLcRsVeri
     public_key_alg_id: alg_id::ECDSA_P256,
     signature_alg_id: alg_id::ECDSA_SHA256,
     verification_alg: &signature::ECDSA_P256_SHA256_ASN1,
-    in_fips_submission: true,
 };
 
 /// ECDSA signatures using the P-256 curve and SHA-384. Deprecated.
@@ -104,7 +177,6 @@ pub static ECDSA_P256_SHA384: &dyn SignatureVerificationAlgorithm = &AwsLcRsVeri
     public_key_alg_id: alg_id::ECDSA_P256,
     signature_alg_id: alg_id::ECDSA_SHA384,
     verification_alg: &signature::ECDSA_P256_SHA384_ASN1,
-    in_fips_submission: true,
 };
 
 /// ECDSA signatures using the P-256 curve and SHA-512. Deprecated.
@@ -112,7 +184,6 @@ pub static ECDSA_P256_SHA512: &dyn SignatureVerificationAlgorithm = &AwsLcRsVeri
     public_key_alg_id: alg_id::ECDSA_P256,
     signature_alg_id: alg_id::ECDSA_SHA512,
     verification_alg: &signature::ECDSA_P256_SHA512_ASN1,
-    in_fips_submission: true,
 };
 
 /// ECDSA signatures using the P-384 curve and SHA-256. Deprecated.
@@ -120,7 +191,6 @@ pub static ECDSA_P384_SHA256: &dyn SignatureVerificationAlgorithm = &AwsLcRsVeri
     public_key_alg_id: alg_id::ECDSA_P384,
     signature_alg_id: alg_id::ECDSA_SHA256,
     verification_alg: &signature::ECDSA_P384_SHA256_ASN1,
-    in_fips_submission: true,
 };
 
 /// ECDSA signatures using the P-384 curve and SHA-384.
@@ -128,7 +198,6 @@ pub static ECDSA_P384_SHA384: &dyn SignatureVerificationAlgorithm = &AwsLcRsVeri
     public_key_alg_id: alg_id::ECDSA_P384,
     signature_alg_id: alg_id::ECDSA_SHA384,
     verification_alg: &signature::ECDSA_P384_SHA384_ASN1,
-    in_fips_submission: true,
 };
 
 /// ECDSA signatures using the P-384 curve and SHA-512. Deprecated.
@@ -136,7 +205,6 @@ pub static ECDSA_P384_SHA512: &dyn SignatureVerificationAlgorithm = &AwsLcRsVeri
     public_key_alg_id: alg_id::ECDSA_P384,
     signature_alg_id: alg_id::ECDSA_SHA512,
     verification_alg: &signature::ECDSA_P384_SHA512_ASN1,
-    in_fips_submission: true,
 };
 
 /// ECDSA signatures using the P-521 curve and SHA-256.
@@ -144,7 +212,6 @@ pub static ECDSA_P521_SHA256: &dyn SignatureVerificationAlgorithm = &AwsLcRsVeri
     public_key_alg_id: alg_id::ECDSA_P521,
     signature_alg_id: alg_id::ECDSA_SHA256,
     verification_alg: &signature::ECDSA_P521_SHA256_ASN1,
-    in_fips_submission: true,
 };
 
 /// ECDSA signatures using the P-521 curve and SHA-384.
@@ -152,7 +219,6 @@ pub static ECDSA_P521_SHA384: &dyn SignatureVerificationAlgorithm = &AwsLcRsVeri
     public_key_alg_id: alg_id::ECDSA_P521,
     signature_alg_id: alg_id::ECDSA_SHA384,
     verification_alg: &signature::ECDSA_P521_SHA384_ASN1,
-    in_fips_submission: true,
 };
 
 /// ECDSA signatures using the P-521 curve and SHA-512.
@@ -160,7 +226,6 @@ pub static ECDSA_P521_SHA512: &dyn SignatureVerificationAlgorithm = &AwsLcRsVeri
     public_key_alg_id: alg_id::ECDSA_P521,
     signature_alg_id: alg_id::ECDSA_SHA512,
     verification_alg: &signature::ECDSA_P521_SHA512_ASN1,
-    in_fips_submission: true,
 };
 
 /// RSA PKCS#1 1.5 signatures using SHA-256 for keys of 2048-8192 bits.
@@ -169,7 +234,6 @@ pub static RSA_PKCS1_2048_8192_SHA256: &dyn SignatureVerificationAlgorithm =
         public_key_alg_id: alg_id::RSA_ENCRYPTION,
         signature_alg_id: alg_id::RSA_PKCS1_SHA256,
         verification_alg: &signature::RSA_PKCS1_2048_8192_SHA256,
-        in_fips_submission: true,
     };
 
 /// RSA PKCS#1 1.5 signatures using SHA-384 for keys of 2048-8192 bits.
@@ -178,7 +242,6 @@ pub static RSA_PKCS1_2048_8192_SHA384: &dyn SignatureVerificationAlgorithm =
         public_key_alg_id: alg_id::RSA_ENCRYPTION,
         signature_alg_id: alg_id::RSA_PKCS1_SHA384,
         verification_alg: &signature::RSA_PKCS1_2048_8192_SHA384,
-        in_fips_submission: true,
     };
 
 /// RSA PKCS#1 1.5 signatures using SHA-512 for keys of 2048-8192 bits.
@@ -187,13 +250,33 @@ pub static RSA_PKCS1_2048_8192_SHA512: &dyn SignatureVerificationAlgorithm =
         public_key_alg_id: alg_id::RSA_ENCRYPTION,
         signature_alg_id: alg_id::RSA_PKCS1_SHA512,
         verification_alg: &signature::RSA_PKCS1_2048_8192_SHA512,
-        in_fips_submission: true,
     };
+
+/// ML-DSA signatures using the [4, 4] matrix (security strength category 2).
+pub static ML_DSA_44: &dyn SignatureVerificationAlgorithm = &AwsLcRsVerificationAlgorithm {
+    public_key_alg_id: alg_id::ML_DSA_44,
+    signature_alg_id: alg_id::ML_DSA_44,
+    verification_alg: &signature::ML_DSA_44,
+};
+
+/// ML-DSA signatures using the [6, 5] matrix (security strength category 3).
+pub static ML_DSA_65: &dyn SignatureVerificationAlgorithm = &AwsLcRsVerificationAlgorithm {
+    public_key_alg_id: alg_id::ML_DSA_65,
+    signature_alg_id: alg_id::ML_DSA_65,
+    verification_alg: &signature::ML_DSA_65,
+};
+
+/// ML-DSA signatures using the [8, 7] matrix (security strength category 5).
+pub static ML_DSA_87: &dyn SignatureVerificationAlgorithm = &AwsLcRsVerificationAlgorithm {
+    public_key_alg_id: alg_id::ML_DSA_87,
+    signature_alg_id: alg_id::ML_DSA_87,
+    verification_alg: &signature::ML_DSA_87,
+};
 
 /// RSA PKCS#1 1.5 signatures using SHA-256 for keys of 2048-8192 bits,
 /// with illegally absent AlgorithmIdentifier parameters.
 ///
-/// RFC4055 says on sha256WithRSAEncryption and company:
+/// RFC 4055 says on sha256WithRSAEncryption and company:
 ///
 /// >   When any of these four object identifiers appears within an
 /// >   AlgorithmIdentifier, the parameters MUST be NULL.  Implementations
@@ -208,13 +291,12 @@ pub static RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS: &dyn SignatureVerificationA
             "data/alg-rsa-pkcs1-sha256-absent-params.der"
         )),
         verification_alg: &signature::RSA_PKCS1_2048_8192_SHA256,
-        in_fips_submission: true,
     };
 
 /// RSA PKCS#1 1.5 signatures using SHA-384 for keys of 2048-8192 bits,
 /// with illegally absent AlgorithmIdentifier parameters.
 ///
-/// RFC4055 says on sha256WithRSAEncryption and company:
+/// RFC 4055 says on sha256WithRSAEncryption and company:
 ///
 /// >   When any of these four object identifiers appears within an
 /// >   AlgorithmIdentifier, the parameters MUST be NULL.  Implementations
@@ -229,13 +311,12 @@ pub static RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS: &dyn SignatureVerificationA
             "data/alg-rsa-pkcs1-sha384-absent-params.der"
         )),
         verification_alg: &signature::RSA_PKCS1_2048_8192_SHA384,
-        in_fips_submission: true,
     };
 
 /// RSA PKCS#1 1.5 signatures using SHA-512 for keys of 2048-8192 bits,
 /// with illegally absent AlgorithmIdentifier parameters.
 ///
-/// RFC4055 says on sha256WithRSAEncryption and company:
+/// RFC 4055 says on sha256WithRSAEncryption and company:
 ///
 /// >   When any of these four object identifiers appears within an
 /// >   AlgorithmIdentifier, the parameters MUST be NULL.  Implementations
@@ -250,7 +331,6 @@ pub static RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS: &dyn SignatureVerificationA
             "data/alg-rsa-pkcs1-sha512-absent-params.der"
         )),
         verification_alg: &signature::RSA_PKCS1_2048_8192_SHA512,
-        in_fips_submission: true,
     };
 
 /// RSA PKCS#1 1.5 signatures using SHA-384 for keys of 3072-8192 bits.
@@ -259,7 +339,6 @@ pub static RSA_PKCS1_3072_8192_SHA384: &dyn SignatureVerificationAlgorithm =
         public_key_alg_id: alg_id::RSA_ENCRYPTION,
         signature_alg_id: alg_id::RSA_PKCS1_SHA384,
         verification_alg: &signature::RSA_PKCS1_3072_8192_SHA384,
-        in_fips_submission: true,
     };
 
 /// RSA PSS signatures using SHA-256 for keys of 2048-8192 bits and of
@@ -271,7 +350,6 @@ pub static RSA_PSS_2048_8192_SHA256_LEGACY_KEY: &dyn SignatureVerificationAlgori
         public_key_alg_id: alg_id::RSA_ENCRYPTION,
         signature_alg_id: alg_id::RSA_PSS_SHA256,
         verification_alg: &signature::RSA_PSS_2048_8192_SHA256,
-        in_fips_submission: true,
     };
 
 /// RSA PSS signatures using SHA-384 for keys of 2048-8192 bits and of
@@ -283,7 +361,6 @@ pub static RSA_PSS_2048_8192_SHA384_LEGACY_KEY: &dyn SignatureVerificationAlgori
         public_key_alg_id: alg_id::RSA_ENCRYPTION,
         signature_alg_id: alg_id::RSA_PSS_SHA384,
         verification_alg: &signature::RSA_PSS_2048_8192_SHA384,
-        in_fips_submission: true,
     };
 
 /// RSA PSS signatures using SHA-512 for keys of 2048-8192 bits and of
@@ -295,7 +372,6 @@ pub static RSA_PSS_2048_8192_SHA512_LEGACY_KEY: &dyn SignatureVerificationAlgori
         public_key_alg_id: alg_id::RSA_ENCRYPTION,
         signature_alg_id: alg_id::RSA_PSS_SHA512,
         verification_alg: &signature::RSA_PSS_2048_8192_SHA512,
-        in_fips_submission: true,
     };
 
 /// ED25519 signatures according to RFC 8410
@@ -303,5 +379,4 @@ pub static ED25519: &dyn SignatureVerificationAlgorithm = &AwsLcRsVerificationAl
     public_key_alg_id: alg_id::ED25519,
     signature_alg_id: alg_id::ED25519,
     verification_alg: &signature::ED25519,
-    in_fips_submission: true,
 };

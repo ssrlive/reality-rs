@@ -8,6 +8,7 @@ use crate::enums::{ApplicationProtocol, ProtocolVersion};
 use crate::error::InvalidMessage;
 use crate::msgs::{Codec, MaybeEmpty, Reader, SessionId, SizedPayload};
 pub use crate::verify::NoClientAuth;
+use crate::verify::VerifiedIdentity;
 #[cfg(feature = "webpki")]
 pub use crate::webpki::{
     ClientVerifierBuilder, ParsedCertificate, VerifierBuilderError, WebPkiClientVerifier,
@@ -16,14 +17,14 @@ pub use crate::webpki::{
 pub(crate) mod config;
 pub use config::{
     CipherSuiteSelector, ClientHello, ClientHelloVerifier, InvalidSniPolicy, PreferClientOrder,
-    PreferServerOrder, ServerConfig, ServerCredentialResolver, StoresServerSessions,
+    PreferServerOrder, ServerConfig, ServerCredentialResolver, StoresServerSessions, Tls13Tickets,
     WantsServerCert,
 };
 
 mod connection;
-pub use connection::{
-    Accepted, AcceptedAlert, Acceptor, ReadEarlyData, ServerConnection, ServerSide,
-};
+pub use connection::{ServerConnection, ServerHandshake, ServerSide};
+
+pub use crate::conn::Accepted;
 
 pub(crate) mod handy;
 #[cfg(feature = "webpki")]
@@ -31,7 +32,7 @@ pub use handy::ServerNameResolver;
 pub use handy::{NoServerSessionStorage, ServerSessionMemoryCache};
 
 mod hs;
-pub(crate) use hs::ServerHandler;
+pub(crate) use hs::{ChooseConfig, ServerHandler, ServerState};
 
 mod tls12;
 pub(crate) use tls12::TLS12_HANDLER;
@@ -50,7 +51,6 @@ pub use reality::{RealityClientHello, RealityClientHelloProbe, RealityServerHell
 #[cfg(test)]
 mod test;
 
-#[derive(Debug)]
 pub(crate) enum ServerSessionValue<'a> {
     Tls12(Tls12ServerSessionValue<'a>),
     Tls13(Tls13ServerSessionValue<'a>),
@@ -79,12 +79,11 @@ impl<'a> Codec<'a> for ServerSessionValue<'a> {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct CommonServerSessionValue<'a> {
     pub(crate) creation_time_sec: u64,
     pub(crate) sni: Option<DnsName<'a>>,
     pub(crate) cipher_suite: CipherSuite,
-    pub(crate) peer_identity: Option<Identity<'a>>,
+    pub(crate) peer_identity: Option<VerifiedIdentity<'a>>,
     pub(crate) alpn: Option<ApplicationProtocol<'a>>,
     pub(crate) application_data: SizedPayload<'a, u16, MaybeEmpty>,
 }
@@ -93,7 +92,7 @@ impl<'a> CommonServerSessionValue<'a> {
     pub(crate) fn new(
         sni: Option<&DnsName<'a>>,
         cipher_suite: CipherSuite,
-        peer_identity: Option<Identity<'a>>,
+        peer_identity: Option<VerifiedIdentity<'a>>,
         alpn: Option<ApplicationProtocol<'a>>,
         application_data: Vec<u8>,
         creation_time: UnixTime,
@@ -130,7 +129,7 @@ impl<'a> CommonServerSessionValue<'a> {
         // a different name. Instead, it proceeds with a full handshake to
         // establish a new session."
         //
-        // RFC 8446: "The server MUST ensure that it selects
+        // RFC 9846: "The server MUST ensure that it selects
         // a compatible PSK (if any) and cipher suite."
         self.cipher_suite == suite && self.sni.as_ref() == sni
     }
@@ -183,7 +182,7 @@ impl Codec<'_> for CommonServerSessionValue<'_> {
             sni,
             cipher_suite: CipherSuite::read(r)?,
             peer_identity: match u8::read(r)? {
-                1 => Some(Identity::read(r)?.into_owned()),
+                1 => Some(VerifiedIdentity::assertion(Identity::read(r)?.into_owned())),
                 _ => None,
             },
             alpn: match u8::read(r)? {

@@ -33,7 +33,7 @@ mod cache {
     use crate::sync::Arc;
 
     /// An implementer of `StoresServerSessions` that stores everything
-    /// in memory.  If enforces a limit on the number of stored sessions
+    /// in memory.  It enforces a limit on the number of stored sessions
     /// to bound memory usage.
     pub struct ServerSessionMemoryCache {
         cache: Mutex<limited_cache::LimitedCache<Vec<u8>, Vec<u8>>>,
@@ -115,6 +115,8 @@ mod cache {
             assert_eq!(c.get(ServerSessionKey::new(&[0x01])), Some(vec![0x04]));
         }
 
+        /// After five sessions are put into a cache of size 2, exactly the
+        /// two most recently added sessions remain.
         #[test]
         fn test_serversessionmemorycache_drops_to_maintain_size_invariant() {
             let c = ServerSessionMemoryCache::new(2);
@@ -124,24 +126,24 @@ mod cache {
             assert!(c.put(ServerSessionKey::new(&[0x07]), vec![0x08]));
             assert!(c.put(ServerSessionKey::new(&[0x09]), vec![0x0a]));
 
-            let count = c
-                .get(ServerSessionKey::new(&[0x01]))
-                .iter()
-                .count()
-                + c.get(ServerSessionKey::new(&[0x03]))
-                    .iter()
-                    .count()
-                + c.get(ServerSessionKey::new(&[0x05]))
-                    .iter()
-                    .count()
-                + c.get(ServerSessionKey::new(&[0x07]))
-                    .iter()
-                    .count()
-                + c.get(ServerSessionKey::new(&[0x09]))
-                    .iter()
-                    .count();
+            assert_eq!(c.get(ServerSessionKey::new(&[0x01])), None);
+            assert_eq!(c.get(ServerSessionKey::new(&[0x03])), None);
+            assert_eq!(c.get(ServerSessionKey::new(&[0x05])), None);
+            assert_eq!(c.get(ServerSessionKey::new(&[0x07])), Some(vec![0x08]));
+            assert_eq!(c.get(ServerSessionKey::new(&[0x09])), Some(vec![0x0a]));
+        }
 
-            assert!(count < 5);
+        /// A cache of size 1 keeps the session put into it, and a second
+        /// put replaces it.
+        #[test]
+        fn test_serversessionmemorycache_size_one_retains_session() {
+            let c = ServerSessionMemoryCache::new(1);
+            assert!(c.put(ServerSessionKey::new(&[0x01]), vec![0x02]));
+            assert_eq!(c.get(ServerSessionKey::new(&[0x01])), Some(vec![0x02]));
+
+            assert!(c.put(ServerSessionKey::new(&[0x03]), vec![0x04]));
+            assert_eq!(c.get(ServerSessionKey::new(&[0x01])), None);
+            assert_eq!(c.get(ServerSessionKey::new(&[0x03])), Some(vec![0x04]));
         }
     }
 }
@@ -234,42 +236,21 @@ mod sni_resolver {
             let rscsni = ServerNameResolver::new();
             assert!(
                 rscsni
-                    .resolve(&ClientHello {
-                        server_name: None,
-                        signature_schemes: &[],
-                        alpn: None,
-                        server_cert_types: None,
-                        client_cert_types: None,
-                        cipher_suites: &[],
-                        certificate_authorities: None,
-                        named_groups: None,
-                        reality_auth_key: None,
-                    })
+                    .resolve(&ClientHello::empty())
                     .is_err()
             );
         }
 
         #[test]
         fn test_server_name_resolver_handles_unknown_name() {
-            let rscsni = ServerNameResolver::new();
-            let name = DnsName::try_from("hello.com")
+            let server_name = DnsName::try_from("hello.com")
                 .unwrap()
                 .to_owned();
-            assert!(
-                rscsni
-                    .resolve(&ClientHello {
-                        server_name: Some(Cow::Borrowed(&name)),
-                        signature_schemes: &[],
-                        alpn: None,
-                        server_cert_types: None,
-                        client_cert_types: None,
-                        cipher_suites: &[],
-                        certificate_authorities: None,
-                        named_groups: None,
-                        reality_auth_key: None,
-                    })
-                    .is_err()
-            );
+            let mut ch = ClientHello::empty();
+            ch.server_name = Some(Cow::Borrowed(&server_name));
+
+            let rscsni = ServerNameResolver::new();
+            assert!(rscsni.resolve(&ch).is_err());
         }
     }
 }

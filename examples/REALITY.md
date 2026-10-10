@@ -32,7 +32,7 @@
 
 - 客户端生成符合当前实现约定的 REALITY `session_id`。
 - 服务端在很早阶段读取 `ClientHello`，决定是继续 REALITY/TLS 路径，还是转发到 decoy 后端。
-- `tlsserver-mio` 会将原始 `ClientHello` 发给规则选中的 fallback 后端，异步采样其 TLS 1.3 ServerHello；认证成功时保留目标 ServerHello 的原始编码、扩展顺序和 random，只替换 session_id 与本地 ECDH key_share。
+- `tls-server-mio` 会将原始 `ClientHello` 发给规则选中的 fallback 后端，异步采样其 TLS 1.3 ServerHello；认证成功时保留目标 ServerHello 的原始编码、扩展顺序和 random，只替换 session_id 与本地 ECDH key_share。
 - decoy 转发可以按规则匹配，例如：
   - `serverNames`
   - `alpns`
@@ -82,8 +82,8 @@
 
 相关示例入口：
 
-- `simpleserver.rs` 仍然要求 `--cert` 和 `--key`
-- `tlsserver-mio.rs` 也仍然要求 `--certs` 和 `--key`
+- `simple-server.rs` 仍然要求 `--cert` 和 `--key`
+- `tls-server-mio.rs` 也仍然要求 `--certs` 和 `--key`
 
 ### 2. 我们为什么没有直接声称“已经和 Xray 一样”
 
@@ -155,11 +155,11 @@
 
 服务端示例主路径在：
 
-- `examples/src/bin/tlsserver-mio.rs`
+- `examples/src/bin/tls-server-mio.rs`
 
 这里没有一上来就直接把流量完全交给 TLS 握手，而是先用：
 
-- `rustls::server::Acceptor`
+- `rustls::server::ServerHandshake`
 
 去预读 `ClientHello`。这样可以在完整握手前就做分流决策。
 
@@ -384,11 +384,11 @@
 
 ### 示例层分流入口
 
-- `examples/src/bin/tlsclient-mio.rs`
+- `examples/src/bin/tls-client-mio.rs`
   - 客户端 config 加载和 REALITY 参数接入
-- `examples/src/bin/simpleserver.rs`
+- `examples/src/bin/simple-server.rs`
   - 最小服务端示例
-- `examples/src/bin/tlsserver-mio.rs`
+- `examples/src/bin/tls-server-mio.rs`
   - `resolve_reality_config()`
   - `fallback_target_for_client_hello()`
   - `select_fallback_target()`

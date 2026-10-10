@@ -2,7 +2,7 @@
 //! it accepts the default configuration, loads a server certificate and private key,
 //! and then accepts a single client connection.
 //!
-//! Usage: cargo r --bin simpleserver -- --cert <path/to/cert.pem> --key <path/to/privatekey.pem>
+//! Usage: cargo r --bin simple-server -- --cert <path/to/cert.pem> --key <path/to/privatekey.pem>
 //!
 //! Note that `unwrap()` is used to deal with networking errors; this is not something
 //! that is sensible outside of example code.
@@ -23,7 +23,7 @@ use rustls::crypto::Identity;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHelloVerifier, RealityClientHello};
-use rustls::{ServerConfig, ServerConnection};
+use rustls::{ServerConfig, ServerConnection, VecInput};
 use rustls_aws_lc_rs as provider;
 use rustls_util::Stream;
 
@@ -269,7 +269,16 @@ fn main() -> Result<(), Box<dyn StdError>> {
     let listener = TcpListener::bind(format!("[::]:{}", args.port)).unwrap();
     let (mut tcp_stream, _) = listener.accept()?;
     let mut conn = ServerConnection::new(Arc::new(config))?;
-    let mut tls_stream = Stream::new(&mut conn, &mut tcp_stream);
+    let mut input = VecInput::default();
+    let mut received_plaintext = Vec::new();
+    let mut output = Vec::new();
+    let mut tls_stream = Stream::new(
+        &mut input,
+        &mut received_plaintext,
+        &mut output,
+        &mut conn,
+        &mut tcp_stream,
+    );
 
     tls_stream.write_all(b"Hello from the server")?;
     tls_stream.flush()?;
@@ -321,7 +330,7 @@ mod tests {
         let config = build_config(&args, reality.as_ref()).unwrap();
         assert!(
             !config
-                .crypto_provider()
+                .provider()
                 .tls12_cipher_suites
                 .is_empty()
         );
@@ -344,7 +353,7 @@ mod tests {
         let config = build_config(&args, reality.as_ref()).unwrap();
         assert!(
             config
-                .crypto_provider()
+                .provider()
                 .tls12_cipher_suites
                 .is_empty()
         );

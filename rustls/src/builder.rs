@@ -25,7 +25,7 @@ use crate::{ClientConfig, ServerConfig};
 /// This can be selected by passing in `rustls_aws_lc_rs::DEFAULT_PROVIDER`,
 /// which includes safe defaults for cipher suites and protocol versions.
 ///
-/// After choosing the `CryptoProvider`, you must choose (a) how to verify certificates and (b) what certificates
+/// After choosing the [`CryptoProvider`], you must choose (a) how to verify certificates and (b) what certificates
 /// (if any) to send to the peer. The methods to do this are specific to whether you're building a ClientConfig
 /// or a ServerConfig, as tracked by the [`ConfigSide`] type parameter on the various impls of ConfigBuilder.
 ///
@@ -88,7 +88,7 @@ use crate::{ClientConfig, ServerConfig};
 ///
 /// # Types
 ///
-/// ConfigBuilder uses the [typestate] pattern to ensure at compile time that each required
+/// ConfigBuilder uses the type state pattern to ensure at compile time that each required
 /// configuration item is provided exactly once. This is tracked in the `State` type parameter,
 /// which can have these values:
 ///
@@ -111,7 +111,6 @@ use crate::{ClientConfig, ServerConfig};
 /// is used.
 ///
 /// [builder]: https://rust-unofficial.github.io/patterns/patterns/creational/builder.html
-/// [typestate]: http://cliffle.com/blog/rust-typestate/
 /// [`ServerConfig`]: crate::ServerConfig
 /// [`ServerConfig::builder`]: crate::ServerConfig::builder
 /// [`ClientConfig`]: crate::ClientConfig
@@ -123,7 +122,6 @@ use crate::{ClientConfig, ServerConfig};
 /// [`ConfigBuilder<ServerConfig, WantsVerifier>`]: struct.ConfigBuilder.html#impl-6
 /// [`WantsClientCert`]: crate::client::WantsClientCert
 /// [`WantsServerCert`]: crate::server::WantsServerCert
-/// [`CryptoProvider::get_default`]: crate::crypto::CryptoProvider::get_default
 /// [`DangerousClientConfigBuilder::with_custom_certificate_verifier`]: crate::client::danger::DangerousClientConfigBuilder::with_custom_certificate_verifier
 #[derive(Clone)]
 pub struct ConfigBuilder<Side: ConfigSide, State> {
@@ -135,7 +133,7 @@ pub struct ConfigBuilder<Side: ConfigSide, State> {
 
 impl<Side: ConfigSide, State> ConfigBuilder<Side, State> {
     /// Return the crypto provider used to construct this builder.
-    pub fn crypto_provider(&self) -> &Arc<CryptoProvider> {
+    pub fn provider(&self) -> &Arc<CryptoProvider> {
         &self.provider
     }
 }
