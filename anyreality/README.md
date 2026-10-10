@@ -38,8 +38,25 @@ The sample client config uses three top-level sections:
 - `client`: client-only runtime defaults such as `listen`, `serverAddr`,
   and `probeProxy`
 
-The binary now reads runtime values from the config file. The CLI only takes
-`--config` and `--log`.
+The binary reads runtime values from the config file. These command-line options
+override the corresponding config values when supplied:
+
+| Option                      | Config value                  |
+| --------------------------- | ----------------------------- |
+| `--password`                | `anytls.password`             |
+| `--max-streams-per-session` | `anytls.maxStreamsPerSession` |
+| `--listen`                  | `client.listen`               |
+| `--server-addr`             | `client.serverAddr`           |
+
+For example:
+
+```sh
+anyreality-client --config client.toml --password "$ANYTLS_PASSWORD" --listen mixed://127.0.0.1:7080 --server-addr 192.0.2.10:20443
+```
+
+`--config` and `--log` remain available as before. Command-line password values
+may be visible in shell history or process listings; prefer a protected config
+file when that is a concern.
 
 ### AnyTLS settings
 

@@ -65,6 +65,23 @@ struct Args {
     #[arg(short, long, value_name = "FILE")]
     config: PathBuf,
 
+    /// Override anytls.password from the config file.
+    #[arg(short, long, value_name = "PASSWORD")]
+    password: Option<String>,
+
+    /// Override anytls.maxStreamsPerSession from the config file.
+    #[arg(short, long, value_name = "COUNT")]
+    max_streams_per_session: Option<usize>,
+
+    /// Override client.listen from the config file.
+    /// It looks like this: "mixed://127.0.0.1:1080", the scheme can be "mixed", "socks5", "http", etc.
+    #[arg(long, value_name = "URI")]
+    listen: Option<ProxyParameters>,
+
+    /// Override client.serverAddr from the config file. It looks like this: "127.0.0.1:1080".
+    #[arg(short, long, value_name = "ADDR")]
+    server_addr: Option<SocketAddr>,
+
     /// Log filter (off/error/warn/info/debug/trace or env-style spec).
     #[arg(short, long, value_name = "LEVEL", default_value = DEFAULT_LOG_LEVEL)]
     log: log::LevelFilter,
@@ -149,7 +166,7 @@ async fn main() -> Result<()> {
     let log = args.log.to_string();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log)).init();
 
-    let resolved = resolve_client_config(&args.config)?;
+    let resolved = resolve_client_config(&args.config, &args)?;
     let reality = resolved.reality.as_ref().expect("validated reality config");
     let anytls = resolved.anytls.as_ref().expect("validated anytls config");
     let client = resolved.client.as_ref().expect("validated client config");
@@ -496,6 +513,53 @@ mod client_listener_tests {
     use super::*;
 
     #[test]
+    fn cli_values_override_config_values_and_preserve_other_settings() {
+        let args = Args::try_parse_from([
+            "anyreality-client",
+            "--config",
+            "unused.toml",
+            "--password",
+            "cli-password",
+            "--max-streams-per-session",
+            "12",
+            "--listen",
+            "http://127.0.0.1:2080",
+            "--server-addr",
+            "192.0.2.10:20443",
+        ])
+        .unwrap();
+        let mut config: ClientConfigFile = toml::from_str(
+            "[anytls]\npassword = 'config-password'\nmaxStreamsPerSession = 3\n\n[client]\nlisten = 'mixed://127.0.0.1:1080'\nserverAddr = '127.0.0.1:9445'\nprobeProxy = '127.0.0.1:8080'\n",
+        )
+        .unwrap();
+        let no_overrides = Args::try_parse_from(["anyreality-client", "--config", "unused.toml"]).unwrap();
+        let mut unchanged = config.clone();
+        apply_cli_overrides(&mut unchanged, &no_overrides);
+        let unchanged_anytls = unchanged.anytls.unwrap();
+        assert_eq!(unchanged_anytls.password.as_deref(), Some("config-password"));
+        assert_eq!(unchanged_anytls.max_streams_per_session, Some(3));
+        let unchanged_client = unchanged.client.unwrap();
+        assert_eq!(unchanged_client.server_addr, Some("127.0.0.1:9445".parse().unwrap()));
+        assert_eq!(unchanged_client.probe_proxy, Some("127.0.0.1:8080".parse().unwrap()));
+        assert_eq!(
+            local_proxy_mode(unchanged_client.listen.as_ref().unwrap()).unwrap(),
+            LocalProxyMode::Mixed
+        );
+
+        apply_cli_overrides(&mut config, &args);
+
+        let anytls = config.anytls.unwrap();
+        assert_eq!(anytls.password.as_deref(), Some("cli-password"));
+        assert_eq!(anytls.max_streams_per_session, Some(12));
+        let client = config.client.unwrap();
+        assert_eq!(client.server_addr, Some("192.0.2.10:20443".parse().unwrap()));
+        assert_eq!(client.probe_proxy, Some("127.0.0.1:8080".parse().unwrap()));
+        let listen = client.listen.unwrap();
+        assert_eq!(local_proxy_mode(&listen).unwrap(), LocalProxyMode::Http);
+        assert_eq!(listen.addr.unwrap().to_string(), "127.0.0.1:2080");
+    }
+
+    #[test]
     fn listen_proxy_parameters_select_supported_protocols() {
         for (value, expected) in [
             ("socks5://127.0.0.1:1080", LocalProxyMode::Socks5),
@@ -654,8 +718,10 @@ async fn setup_uot_request(stream: &Arc<AnytlsStream>) -> Result<()> {
 
 // === helpers ===
 
-fn resolve_client_config(config_path: &Path) -> Result<ClientConfigFile> {
+fn resolve_client_config(config_path: &Path, args: &Args) -> Result<ClientConfigFile> {
     let mut file_config = load_client_config_file(config_path)?;
+    apply_cli_overrides(&mut file_config, args);
+
     let reality = file_config
         .reality
         .as_ref()
@@ -685,11 +751,11 @@ fn resolve_client_config(config_path: &Path) -> Result<ClientConfigFile> {
     client
         .server_addr
         .as_ref()
-        .ok_or_else(|| anyhow!("client.serverAddr must be set in config"))?;
+        .ok_or_else(|| anyhow!("client.serverAddr must be set in config or with --server-addr"))?;
     let password = anytls
         .password
         .as_deref()
-        .ok_or_else(|| anyhow!("anytls.password must be set in config"))?;
+        .ok_or_else(|| anyhow!("anytls.password must be set in config or with --password"))?;
     if password.is_empty() {
         bail!("anytls.password must not be empty");
     }
@@ -731,6 +797,28 @@ fn resolve_client_config(config_path: &Path) -> Result<ClientConfigFile> {
     }
 
     Ok(file_config)
+}
+
+fn apply_cli_overrides(file_config: &mut ClientConfigFile, args: &Args) {
+    if args.password.is_some() || args.max_streams_per_session.is_some() {
+        let anytls = file_config.anytls.get_or_insert_with(ClientAnytlsConfig::default);
+        if let Some(password) = &args.password {
+            anytls.password = Some(password.clone());
+        }
+        if let Some(max_streams) = args.max_streams_per_session {
+            anytls.max_streams_per_session = Some(max_streams);
+        }
+    }
+
+    if args.listen.is_some() || args.server_addr.is_some() {
+        let client = file_config.client.get_or_insert_with(ClientRuntimeConfig::default);
+        if let Some(listen) = &args.listen {
+            client.listen = Some(listen.clone());
+        }
+        if let Some(server_addr) = args.server_addr {
+            client.server_addr = Some(server_addr);
+        }
+    }
 }
 
 fn build_rustls_client_config(args: &ClientRealityConfig) -> Result<rustls::ClientConfig> {
