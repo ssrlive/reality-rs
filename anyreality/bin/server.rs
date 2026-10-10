@@ -269,14 +269,15 @@ async fn handle_connection(
     })
     .await?;
     let server_hello_template = match server_hello_action {
-        RealityServerHelloAction::UseTemplate(template) => template,
-        RealityServerHelloAction::Fallback { server_name, probe_error } => {
-            if let Some(error) = probe_error {
-                log::debug!(
-                    "REALITY ServerHello probe failed for {:?}: {error}; falling back to target",
-                    server_name
-                );
-            }
+        RealityServerHelloAction::UseTemplate(template) => Some(template),
+        RealityServerHelloAction::Fallback {
+            server_name,
+            probe_error: Some(error),
+        } => {
+            log::warn!("REALITY ServerHello probe failed for {server_name:?}: {error}; using local ServerHello");
+            None
+        }
+        RealityServerHelloAction::Fallback { .. } => {
             return handle_raw_tls_fallback(std_stream, allowed_server_names).await;
         }
         _ => return handle_raw_tls_fallback(std_stream, allowed_server_names).await,
@@ -289,8 +290,10 @@ async fn handle_connection(
         sock.set_read_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
         sock.set_write_timeout(Some(REALITY_HANDSHAKE_TIMEOUT))?;
         let mut conn = ServerConnection::new(reality_config)?;
-        conn.set_reality_server_hello_template(&server_hello_template)
-            .context("install SNI target ServerHello template")?;
+        if let Some(template) = server_hello_template {
+            conn.set_reality_server_hello_template(&template)
+                .context("install SNI target ServerHello template")?;
+        }
         while conn.is_handshaking() {
             complete_io(&mut sock, &mut conn).context("complete REALITY handshake")?;
         }
